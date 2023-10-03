@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>netstandard2.1</TargetFramework>
+		<Nullable>enable</Nullable>
+		<Title>EasyRabbitFlow</Title>
+		<Authors>Juan Carlos Torres Cuervo</Authors>
+		<Description>EasyRabbitFlow - A streamlined .NET RabbitMQ client for seamless messaging integration, simplified configuration, and robust message handling.</Description>
+		<VersionPrefix>1.0.0</VersionPrefix>
+		<PackageTags>rabbitmq, .net, messaging</PackageTags>
+		<PackageProjectUrl>https://github.com/devjuanca/EasyRabbitFlow</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/devjuanca/EasyRabbitFlow</RepositoryUrl>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>$(NoWarn);CS1591</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.AspNetCore.Http.Abstractions" Version="2.2.0" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="7.0.0" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="7.0.1" />
+		<PackageReference Include="RabbitMQ.Client" Version="6.5.0" />
+		<PackageReference Include="System.Text.Json" Version="7.0.3" />
+	</ItemGroup>
+
+</Project>
