@@ -19,30 +19,16 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
 6. [Publishing Messages](#publishing-messages)
 7. [Queue State](#queue-state)
 8. [Configure Temporary Queues](#configure-temporary-queues)
-9. [Examples](#examples)
+9. Configure Deadletter Queues.
+10. [Examples](#examples)
    - [Basic Consumer Setup](#basic-consumer-setup)
    - [Middleware Usage](#middleware-usage)
 
 ### 1. Introduction
 
-Welcome to the documentation for the RabbitFlow library! This comprehensive guide will walk you through the process of configuring and using RabbitMQ consumers in your application using RabbitFlow.
+RabbitFlow is an intuitive library designed to simplify the management of RabbitMQ consumers in your application. This documentation provides step-by-step instructions for setting up, configuring, and using RabbitFlow effectively in your projects.
 
-RabbitFlow is a powerful and intuitive library designed to simplify the management of RabbitMQ consumers in your application. This documentation provides step-by-step instructions for setting up, configuring, and using RabbitFlow effectively in your projects.
-
-RabbitFlow is specifically designed to interact with pre-defined exchanges and queues within RabbitMQ. The rationale behind this approach is to separate the concepts of usage from the creation and configuration of infrastructure.
-
-### Why Pre-defined Exchanges and Queues?
-By interacting with pre-defined exchanges and queues, RabbitFlow allows you to decouple the infrastructure setup from your application's logic. This separation of concerns offers several advantages:
-
-- Clarity and Separation of Roles: It ensures that infrastructure-related tasks, such as defining exchanges and queues and configuring their properties, are handled independently from your application's business logic. This separation makes your codebase more organized and easier to maintain.
-
-- Reusability: You can reuse the same pre-configured exchanges and queues across multiple applications or components. This promotes code reusability and streamlines the deployment process.
-
-- Flexibility: You have the flexibility to configure exchanges and queues according to your specific requirements before integrating them with RabbitFlow. This means you can tailor the RabbitMQ infrastructure to suit your application's needs precisely.
-
- - Maintenance and Scalability: Separating the infrastructure setup allows for easier maintenance and scalability. You can update, modify, or scale your exchanges and queues independently of your application's codebase.
-
-In essence, RabbitFlow simplifies the process of managing RabbitMQ consumers by focusing on the interaction with well-defined infrastructure components. This approach not only enhances the clarity and modularity of your code but also offers flexibility and scalability as your application evolves.
+RabbitFlow is specifically designed to handle two approaches, pre-defined exchanges and queues within RabbitMQ, as well as dynamically create new ones as needed. The rationale behind this approach is to provide flexibility in managing RabbitMQ infrastructure while also offering simplicity in usage.
 
 Now, let's dive into the details of how to set up, configure, and use RabbitFlow effectively in your projects.
 ### 2. Installation
@@ -103,7 +89,7 @@ opt.ConfigureJsonSerializerOptions(jsonSettings =>
 Configuring JSON Serialization Options is optional, if no configuration is provided, the default options will be used.
 
 - #### 3.3 Publisher Options
-Optionally, you may configure the publisher that you intend to use by defining the 'DisposePublisherConnection' variable. This variable determines whether the connection established by the publisher with RabbitMQ should be kept active or terminated upon the completion of the process.
+Optionally, you may configure the publisher that you intend to use by defining the 'DisposePublisherConnection' variable. This variable determines whether the connection established by the publisher with RabbitMQ should be kept alive or terminated upon the completion of the process.
 
 Furthermore, the 'PublishAsync' method of the publisher offers an optional parameter named 'useNewConnection,' which defaults to 'false.' This parameter allows for the explicit control of whether a new connection should be established, irrespective of the global configuration set for the publisher. It is essential to note that the same publisher can be employed to transmit messages to different queues, each with its unique configuration settings.
 ```csharp
@@ -123,7 +109,9 @@ opt.AddConsumer("email-queue", consumerSettings =>
 });
 ```
 #### Consumer Settings
-    - AutoAck: Automatically acknowledge messages after processing.
+    - AutoAckOnError: Gets or sets a value indicating whether messages are automatically acknowledged in case of an error. 
+      Defaults to True (Reject and Dispose) .
+    - AutoGenerate: Set the intention of automatically create the queue + exchange and bind them.
     - PrefetchCount: Limit unacknowledged messages to consume at a time.
     - Timeout: Set maximum processing time for each message.
 
@@ -177,7 +165,9 @@ Use the IRabbitFlowPublisher interface to publish messages to a RabbitMQ exchang
 ```csharp
 public interface IRabbitFlowPublisher
 {
-    Task PublishAsync<T>(T message, string exchangeName, string routingKey, bool useNewConnection = false);
+    Task PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, bool useNewConnection = false);
+
+    Task PublishAsync<TEvent>(TEvent @event, string queueName, bool useNewConnection = false);
 }
 
 ```
@@ -241,8 +231,13 @@ automatically when it detects that in a max period of 5 minutes, no message was 
 
 This means that you can handle the disposal of the service manually or let it dispose by itself.
 
-### 9. Examples
-#### 9.1 Basic Consumer Setup
+### 9. Deadletter Queues
+Configuring dead-letter queues offers various options. If you opt for the approach of creating queues and exchanges using infrastructure first and then binding a specific queue to act as the dead-letter queue for the main queue, the process will function as expected, and failed messages will end up in that dead-letter queue. Additionally, you can manually configure failed messages to be sent to another specific queue using the ConfigureCustomDeadletter method when configuring the Consumer.
+
+Alternatively, if you choose the approach where the application utilizing the library is responsible for creating the queues, exchanges, and binding them, you can utilize the ConfigureAutoGenerate method to select this behavior. In both approaches, ConfigureCustomDeadletter can be configured and will function independently.
+
+### 10. Examples
+#### 10.1 Basic Consumer Setup
 ```csharp
 opt.AddConsumer("whatsapp-queue", consumerSettings =>
 {
@@ -254,7 +249,7 @@ Middleware Usage
 app.UseConsumer<EmailEvent, EmailConsumer>();
 ```
 
-#### 9.2 Consumer Implementation
+#### 10.2 Consumer Implementation
 ```csharp
 public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 {
@@ -265,7 +260,7 @@ public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 }
 ```
 
-#### 9.3 Set Temporary Queues
+#### 10.3 Set Temporary Queues
 ```
 public class TemporaryQueueConsumer
 {
