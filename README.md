@@ -102,7 +102,6 @@ Define and configure consumers for specific queues using the AddConsumer method:
 ```csharp
 opt.AddConsumer("email-queue", consumerSettings =>
 {
-    consumerSettings.AutoAck = true;
     consumerSettings.PrefetchCount = 1;
     // ... other settings ...
     consumerSettings.SetConsumerHandler<EmailConsumer>();
