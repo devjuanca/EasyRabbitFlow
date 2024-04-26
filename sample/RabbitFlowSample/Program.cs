@@ -52,6 +52,11 @@ builder.Services.AddRabbitFlow(settings =>
             opt.AutoDeleteQueue = false;
             opt.GenerateDeadletterQueue = true;
         });
+        consumerSettings.ConfigureCustomDeadletter<WhatsAppConsumer>(opt =>
+        {
+            //In this version.This queue must be previously created!
+            opt.DeadletterQueueName = "custom-whatsapp-errors-queue";
+        });
 
         consumerSettings.SetConsumerHandler<WhatsAppConsumer>();
     });
