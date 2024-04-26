@@ -17,11 +17,19 @@ builder.Services.AddRabbitFlow(settings =>
 
     settings.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = true); // OPTIONAL
 
-    settings.AddConsumer(queueName: "email-queue", consumerSettings =>
+    settings.AddConsumer(queueName: "emails-test-queue", consumerSettings =>
     {
-        consumerSettings.AutoAck = true;
         consumerSettings.PrefetchCount = 5;
         consumerSettings.Timeout = TimeSpan.FromMilliseconds(500);
+        consumerSettings.AutoGenerate = true;
+        consumerSettings.ConfigureAutoGenerate<EmailConsumer>(opt =>
+        {
+            opt.DurableQueue = true;
+            opt.DurableExchange = true;
+            opt.ExclusiveQueue = true;
+            opt.AutoDeleteQueue = false;
+            opt.GenerateDeadletterQueue = true;
+        });
         consumerSettings.ConfigureRetryPolicy<EmailConsumer>(retryPolicy =>
         {
             retryPolicy.MaxRetryCount = 3;
@@ -33,7 +41,21 @@ builder.Services.AddRabbitFlow(settings =>
         consumerSettings.SetConsumerHandler<EmailConsumer>();
     });
 
-    settings.AddConsumer("whatsapp-queue", consumerSettings => consumerSettings.SetConsumerHandler<WhatsAppConsumer>());
+    settings.AddConsumer("whatsapps-test-queue", consumerSettings =>
+    {
+        consumerSettings.AutoGenerate = true;
+        consumerSettings.ConfigureAutoGenerate<EmailConsumer>(opt =>
+        {
+            opt.DurableQueue = true;
+            opt.DurableExchange = true;
+            opt.ExclusiveQueue = true;
+            opt.AutoDeleteQueue = false;
+            opt.GenerateDeadletterQueue = true;
+        });
+
+        consumerSettings.SetConsumerHandler<WhatsAppConsumer>();
+    });
+
 
 });
 
@@ -43,7 +65,7 @@ app.UseConsumer<EmailEvent, EmailConsumer>();
 
 app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
 {
-    opt.PerMessageInstance = true;
+    opt.PerMessageInstance = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer
 });
 
@@ -51,12 +73,12 @@ app.UseHttpsRedirection();
 
 app.MapPost("/email", async (IRabbitFlowPublisher publisher, EmailEvent emailEvent) =>
 {
-    await publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "email");
+    await publisher.PublishAsync(emailEvent, queueName: "emails-test-queue");
 });
 
 app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, WhatsAppEvent whatsAppEvent) =>
 {
-    await publisher.PublishAsync(whatsAppEvent, exchangeName: "notifications", routingKey: "whatsapp");
+    await publisher.PublishAsync(whatsAppEvent, queueName: "whatsapps-test-queue");
 });
 
 app.Run();

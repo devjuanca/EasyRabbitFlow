@@ -1,18 +1,28 @@
-﻿using System;
-using System.Linq;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using RabbitFlow.Services;
+using System;
+using System.Linq;
 
 namespace RabbitFlow.Settings
 {
+
     public class ConsumerSettings
     {
         private readonly IServiceCollection _services;
 
         /// <summary>
-        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption. Defaults to true.
+        /// Gets or sets a value indicating whether messages are automatically acknowledged in case of an error. Defaults to True (Reject and Dispose) 
+        /// message will be lost unless a custom dead-letter queue is configured.
+        /// If False, message will be rejected and sent to the dead-letter queue (if configured). 
+        /// If custom dead-letter queue is also configured message will be sent to both queues.
+        /// In no case the message will be requeued.
         /// </summary>
-        public bool AutoAck { get; set; } = true;
+        public bool AutoAckOnError { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether queue, exchange and binding will be automatically generated.
+        /// </summary>
+        public bool AutoGenerate { get; set; } = false;
 
         /// <summary>
         /// Gets or sets the number of messages that the consumer can prefetch. Defaults to 1.
@@ -33,6 +43,21 @@ namespace RabbitFlow.Settings
         }
 
         /// <summary>
+        /// Sets a custom exchange and routing key to send a message if fails. 
+        /// If AutoAckOnError is True the message will be sent to both configured dead-letter (by infrastructure) and custom dead-letter.
+        /// </summary>
+        /// <typeparam name="TConsumer"></typeparam>
+        /// <param name="settings"></param>
+        public void ConfigureCustomDeadletter<TConsumer>(Action<CustomDeadLetterSettings<TConsumer>> settings) where TConsumer : class
+        {
+            var customDeasLetter = new CustomDeadLetterSettings<TConsumer>();
+
+            settings.Invoke(customDeasLetter);
+
+            _services.AddSingleton(customDeasLetter);
+        }
+
+        /// <summary>
         /// Sets the retry policy for message processing.
         /// </summary>
         /// <param name="settings">A delegate to configure the retry policy.</param>
@@ -43,6 +68,20 @@ namespace RabbitFlow.Settings
             settings.Invoke(retryPolicy);
 
             _services.AddSingleton(retryPolicy);
+        }
+
+        /// <summary>
+        /// Configures auto-generation settings for a specific consumer.
+        /// </summary>
+        /// <typeparam name="TConsumer">Type of the consumer.</typeparam>
+        /// <param name="settings">Action to configure auto-generation settings.</param>
+        public void ConfigureAutoGenerate<TConsumer>(Action<AutoGenerateSettings<TConsumer>> settings) where TConsumer : class
+        {
+            var autoGenerateSettings = new AutoGenerateSettings<TConsumer>();
+
+            settings.Invoke(autoGenerateSettings);
+
+            _services.AddSingleton(autoGenerateSettings);
         }
 
 
@@ -64,7 +103,8 @@ namespace RabbitFlow.Settings
 
                 var opt = new ConsumerSettings<TConsumer>()
                 {
-                    AutoAck = AutoAck,
+                    AutoAckOnError = AutoAckOnError,
+                    AutoGenerate = AutoGenerate,
                     PrefetchCount = PrefetchCount,
                     QueueName = _queueName,
                     Timeout = Timeout
@@ -88,7 +128,12 @@ namespace RabbitFlow.Settings
         /// <summary>
         /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption.
         /// </summary>
-        public bool AutoAck { get; set; } = true;
+        public bool AutoAckOnError { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether exchanges and queues should be created.
+        /// </summary>
+        public bool AutoGenerate { get; set; } = false;
 
         /// <summary>
         /// Gets or sets the number of messages that the consumer can prefetch.

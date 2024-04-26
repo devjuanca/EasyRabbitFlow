@@ -1,6 +1,6 @@
-﻿using System.Text.Json;
-using RabbitFlow.Services;
+﻿using RabbitFlow.Services;
 using RabbitFlowSample.Events;
+using System.Text.Json;
 
 namespace RabbitFlowSample.Consumers;
 

@@ -1,8 +1,8 @@
-﻿using System;
+﻿using RabbitFlow.Settings;
+using RabbitMQ.Client;
+using System;
 using System.Text.Json;
 using System.Threading.Tasks;
-using RabbitFlow.Settings;
-using RabbitMQ.Client;
 
 namespace RabbitFlow.Services
 {
@@ -27,6 +27,16 @@ namespace RabbitFlow.Services
         /// The <paramref name="useNewConnection"/> parameter controls whether to use a new connection for publishing.
         /// </remarks>
         Task PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, bool useNewConnection = false);
+
+        /// <summary>
+        /// Publishes a message to a RabbitMQ queue asynchronously.
+        /// </summary>
+        /// <typeparam name="TEvent"></typeparam>
+        /// <param name="event"></param>
+        /// <param name="queueName"></param>
+        /// <param name="useNewConnection"></param>
+        /// <returns></returns>
+        Task PublishAsync<TEvent>(TEvent @event, string queueName, bool useNewConnection = false);
     }
 
     internal class RabbitFlowPublisher : IRabbitFlowPublisher
@@ -94,5 +104,51 @@ namespace RabbitFlow.Services
                 throw;
             }
         }
+
+        public async Task PublishAsync<TEvent>(TEvent @event, string queueName, bool useNewConnection = false)
+        {
+            try
+            {
+                IConnection connection;
+
+                if (useNewConnection)
+                {
+                    connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
+                }
+                else
+                {
+                    if (_connection == null || !_connection.IsOpen)
+                        connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
+                    else
+                        connection = _connection;
+                }
+
+                using var channel = connection.CreateModel();
+
+                var body = JsonSerializer.SerializeToUtf8Bytes(@event, _jsonOptions);
+
+                var props = channel.CreateBasicProperties();
+
+                channel.BasicPublish("", queueName, props, body); // Empty string for exchange name
+
+                if (useNewConnection || (_publisherOptions.DisposePublisherConnection && connection != null && connection.IsOpen))
+                {
+                    connection.Close();
+                    connection.Dispose();
+                }
+                if (_publisherOptions.DisposePublisherConnection && _connection != null && _connection.IsOpen)
+                {
+                    _connection.Close();
+                    _connection.Dispose();
+                }
+
+                await Task.CompletedTask;
+            }
+            catch
+            {
+                throw;
+            }
+        }
+
     }
 }

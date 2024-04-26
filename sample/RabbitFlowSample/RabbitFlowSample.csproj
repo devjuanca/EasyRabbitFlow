@@ -7,7 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="EasyRabbitFlow" Version="1.0.0" />
+    <ProjectReference Include="..\..\src\RabbitFlow\EasyRabbitFlow.csproj" />
   </ItemGroup>
 
 </Project>
