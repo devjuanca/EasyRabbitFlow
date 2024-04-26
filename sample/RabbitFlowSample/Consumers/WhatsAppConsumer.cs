@@ -1,14 +1,14 @@
-﻿using System.Text.Json;
-using RabbitFlow.Services;
+﻿using RabbitFlow.Services;
 using RabbitFlowSample.Events;
+using System.Text.Json;
 
 namespace RabbitFlowSample.Consumers;
 
 public class WhatsAppConsumer : IRabbitFlowConsumer<WhatsAppEvent>
 {
-    private readonly ILogger<EmailConsumer> _logger;
+    private readonly ILogger<WhatsAppConsumer> _logger;
 
-    public WhatsAppConsumer(ILogger<EmailConsumer> logger)
+    public WhatsAppConsumer(ILogger<WhatsAppConsumer> logger)
     {
         _logger = logger;
     }
