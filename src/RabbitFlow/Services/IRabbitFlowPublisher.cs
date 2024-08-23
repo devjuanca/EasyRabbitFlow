@@ -18,137 +18,163 @@ namespace RabbitFlow.Services
         /// <param name="message">The message to publish.</param>
         /// <param name="exchangeName">The name of the exchange to publish the message to.</param>
         /// <param name="routingKey">The routing key for the message.</param>
-        /// <param name="useNewConnection">Indicates whether to use a new connection for publishing.</param>
-        /// <returns>A task representing the asynchronous publishing process.</returns>
-        /// <remarks>
-        /// Implement this method to define the logic for publishing a message to a RabbitMQ exchange.
-        /// The <paramref name="exchangeName"/> specifies the exchange to publish the message to.
-        /// The <paramref name="routingKey"/> is used to route the message within the exchange.
-        /// The <paramref name="useNewConnection"/> parameter controls whether to use a new connection for publishing.
-        /// </remarks>
-        Task PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, bool useNewConnection = false);
+        /// <param name="publisherId"/> Sets an identifier to the created connection.
+        /// <param name="jsonOptions">If set JsonSerializerOptions will be use over the one configured by default</param>
+        /// <returns>Boolean indicating if the message was published</returns>
+        Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
 
         /// <summary>
         /// Publishes a message to a RabbitMQ queue asynchronously.
         /// </summary>
         /// <typeparam name="TEvent"></typeparam>
-        /// <param name="event"></param>
+        /// <param name="message"></param>
         /// <param name="queueName"></param>
-        /// <param name="useNewConnection"></param>
-        /// <returns></returns>
-        Task PublishAsync<TEvent>(TEvent @event, string queueName, bool useNewConnection = false);
+        /// <param name="publisherId"/> Sets an identifier to the created connection.
+        /// <param name="jsonOptions">If set JsonSerializerOptions will be use over the one configured by default</param>
+        /// <returns>Boolean indicating if the message was published</returns>
+        Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
     }
 
     internal class RabbitFlowPublisher : IRabbitFlowPublisher
     {
-        private readonly ConnectionFactory _connectionFactory;
+        private readonly ConnectionFactory connectionFactory;
 
-        private readonly IConnection _connection;
+        private IConnection? globalConnection = null;
 
-        private readonly JsonSerializerOptions _jsonOptions;
+        private readonly JsonSerializerOptions jsonOptions;
 
-        private readonly PublisherOptions _publisherOptions;
+        private readonly PublisherOptions publisherOptions;
 
-        public string Name { get; set; } = string.Empty;
+        private readonly object lockObject = new object();
 
         public RabbitFlowPublisher(ConnectionFactory connectionFactory, PublisherOptions? publisherOptions = null, JsonSerializerOptions? jsonOptions = null)
         {
-            _connectionFactory = connectionFactory;
-            _jsonOptions = jsonOptions ?? new JsonSerializerOptions();
-            _connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
-            _publisherOptions = publisherOptions ?? new PublisherOptions();
+            this.connectionFactory = connectionFactory;
+
+            this.jsonOptions = jsonOptions ?? new JsonSerializerOptions();
+
+            this.publisherOptions = publisherOptions ?? new PublisherOptions();
         }
 
-        public async Task PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey, bool useNewConnection = false)
+        public Task<bool> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null) where TEvent : class
         {
+            var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+
             try
             {
-                IConnection connection;
-
-                if (useNewConnection)
+                if (@event is null)
                 {
-                    connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
-                }
-                else
-                {
-                    if (_connection == null || !_connection.IsOpen)
-                        connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
-                    else
-
-                        connection = _connection;
+                    throw new ArgumentNullException(nameof(@event));
                 }
 
-                using var channel = connection.CreateModel();
-
-                var body = JsonSerializer.SerializeToUtf8Bytes(@event, _jsonOptions);
-
-                var props = channel.CreateBasicProperties();
-
-                channel.BasicPublish(exchangeName, routingKey, props, body);
-
-                if (useNewConnection || (_publisherOptions.DisposePublisherConnection && connection != null && connection.IsOpen))
+                if (string.IsNullOrEmpty(publisherId))
                 {
-                    connection.Close();
-                    connection.Dispose();
-                }
-                if (_publisherOptions.DisposePublisherConnection && _connection != null && _connection.IsOpen)
-                {
-                    _connection.Close();
-                    _connection.Dispose();
+                    publisherId = string.Concat(exchangeName, "_", routingKey);
                 }
 
-                await Task.CompletedTask;
+                var connection = ResolveConnection(publisherId);
+
+                using (var channel = connection.CreateModel())
+                {
+                    ReadOnlyMemory<byte> body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
+
+                    var props = channel.CreateBasicProperties();
+
+                    channel.BasicPublish(exchangeName, routingKey, props, body);
+                }
+
+                return Task.FromResult(true);
             }
             catch
             {
+                Console.WriteLine("[RABBIT-FLOW]: Error publishing a message");
+
                 throw;
+            }
+            finally
+            {
+
+                if (publisherOptions.DisposePublisherConnection && globalConnection != null)
+                {
+                    DisposeGlobalConnection();
+                }
+
             }
         }
 
-        public async Task PublishAsync<TEvent>(TEvent @event, string queueName, bool useNewConnection = false)
+        public Task<bool> PublishAsync<TEvent>(TEvent @event, string queueName, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null) where TEvent : class
         {
+
+            var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+
             try
             {
-                IConnection connection;
-
-                if (useNewConnection)
+                if (@event is null)
                 {
-                    connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
-                }
-                else
-                {
-                    if (_connection == null || !_connection.IsOpen)
-                        connection = _connectionFactory.CreateConnection($"Publisher-{Guid.NewGuid()}");
-                    else
-                        connection = _connection;
+                    throw new ArgumentNullException(nameof(@event));
                 }
 
-                using var channel = connection.CreateModel();
-
-                var body = JsonSerializer.SerializeToUtf8Bytes(@event, _jsonOptions);
-
-                var props = channel.CreateBasicProperties();
-
-                channel.BasicPublish("", queueName, props, body); // Empty string for exchange name
-
-                if (useNewConnection || (_publisherOptions.DisposePublisherConnection && connection != null && connection.IsOpen))
+                if (string.IsNullOrEmpty(publisherId))
                 {
-                    connection.Close();
-                    connection.Dispose();
-                }
-                if (_publisherOptions.DisposePublisherConnection && _connection != null && _connection.IsOpen)
-                {
-                    _connection.Close();
-                    _connection.Dispose();
+                    publisherId = queueName;
                 }
 
-                await Task.CompletedTask;
+                var connection = ResolveConnection(publisherId);
+
+                using (var channel = connection.CreateModel())
+                {
+                    ReadOnlyMemory<byte> body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
+
+                    var props = channel.CreateBasicProperties();
+
+                    channel.BasicPublish("", queueName, props, body); // Empty string for exchange name
+                }
+
+                return Task.FromResult(true);
             }
-            catch
+            catch (Exception)
             {
+                Console.WriteLine("[RABBIT-FLOW]: Error publishing a message");
+
                 throw;
+            }
+            finally
+            {
+                if (publisherOptions.DisposePublisherConnection && globalConnection != null)
+                {
+                    DisposeGlobalConnection();
+                }
             }
         }
 
+        private IConnection ResolveConnection(string connectionId)
+        {
+            if (globalConnection == null)
+            {
+                lock (lockObject)
+                {
+                    //double-checked locking pattern
+                    globalConnection ??= connectionFactory.CreateConnection($"Publisher_{connectionId}");
+                }
+
+                return globalConnection;
+            }
+            else
+            {
+                return globalConnection;
+            }
+        }
+
+        private void DisposeGlobalConnection()
+        {
+            lock (lockObject)
+            {
+                globalConnection?.Close();
+
+                globalConnection?.Dispose();
+
+                globalConnection = null;
+            }
+        }
     }
 }

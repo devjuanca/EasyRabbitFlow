@@ -1,28 +1,38 @@
-﻿using System;
-using System.Text.Json;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using RabbitFlow.Settings;
 using RabbitMQ.Client;
+using System;
+using System.Text.Json;
 
 namespace RabbitFlow.Services
 {
 
     /// <summary>
-    /// Configures RabbitFlow services and settings.
+    /// Provides methods to configure RabbitFlow services and settings.
+    /// This class is responsible for setting up RabbitMQ connections, 
+    /// message serialization, publisher options, and consumer registration within the application.
     /// </summary>
     public class RabbitFlowConfigurator
     {
         private readonly IServiceCollection _services;
 
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="RabbitFlowConfigurator"/> class.
+        /// </summary>
+        /// <param name="services">The service collection used to register RabbitFlow services.</param>
         public RabbitFlowConfigurator(IServiceCollection services)
         {
             _services = services;
         }
 
+
         /// <summary>
-        /// Configures RabbitMQ settings to the configuration.
+        /// Configures the RabbitMQ host settings for the application.
+        /// This method allows you to specify the RabbitMQ server details such as host, port, credentials, and other connection settings.
         /// </summary>
-        /// <param name="settings">A delegate to configure RabbitMQ host settings.</param>
+        /// <param name="settings">A delegate to configure the <see cref="HostSettings"/>.</param>
         public void ConfigureHost(Action<HostSettings> settings)
         {
             var rabbitHVSettings = new HostSettings();
@@ -44,21 +54,23 @@ namespace RabbitFlow.Services
 
         /// <summary>
         /// Configures JSON serializer options for message serialization.
+        /// This method allows you to customize how messages are serialized and deserialized 
+        /// when being sent to or received from RabbitMQ.
         /// </summary>
-        /// <param name="settings">A delegate to configure JSON serializer options.</param>
+        /// <param name="settings">A delegate to configure the <see cref="JsonSerializerOptions"/>.</param>
         public void ConfigureJsonSerializerOptions(Action<JsonSerializerOptions> settings)
         {
             var jsonOptions = new JsonSerializerOptions();
 
             settings.Invoke(jsonOptions);
 
-            _services.AddSingleton(jsonOptions);
+            _services.TryAddSingleton(jsonOptions);
         }
 
         /// <summary>
         /// Configures publisher options for message publishing.
+        /// This method allows customization of the behavior of message publishers, such as managing RabbitMQ connections.
         /// </summary>
-        /// <param name="settings">A delegate to configure publisher options.</param>
         public void ConfigurePublisher(Action<PublisherOptions>? settings = null)
         {
             var publisherOptions = new PublisherOptions();
@@ -69,13 +81,16 @@ namespace RabbitFlow.Services
         }
 
         /// <summary>
-        /// Adds a consumer with specified settings to the configuration.
+        /// Adds a consumer to the configuration with specified settings.
+        /// This method registers a RabbitMQ consumer that listens to a specified queue, 
+        /// with the ability to configure consumer-specific settings such as retry policies and queue management.
         /// </summary>
-        /// <param name="queueName">The name of the queue to consume from.</param>
-        /// <param name="settings">A delegate to configure consumer settings.</param>
-        public void AddConsumer(string queueName, Action<ConsumerSettings> settings)
+        /// <typeparam name="TConsumer">The type of the consumer to register, which must implement the <see cref="IRabbitFlowConsumer{T}"/> interface.</typeparam>
+        /// <param name="queueName">The name of the RabbitMQ queue to consume messages from.</param>
+        /// <param name="settings">A delegate to configure the <see cref="ConsumerSettings{TConsumer}"/>.</param>
+        public void AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>> settings) where TConsumer : class
         {
-            var consumerSettings = new ConsumerSettings(_services, queueName);
+            var consumerSettings = new ConsumerSettings<TConsumer>(_services, queueName);
 
             settings.Invoke(consumerSettings);
 

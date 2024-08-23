@@ -20,6 +20,8 @@ builder.Services.AddRabbitFlow(settings =>
 
     settings.AddConsumer<EmailConsumer>(queueName: "emails-test-queue", consumerSettings =>
     {
+        consumerSettings.ConsumerId = "Email";
+
         consumerSettings.PrefetchCount = 5;
 
         consumerSettings.Timeout = TimeSpan.FromMilliseconds(500);
@@ -28,12 +30,9 @@ builder.Services.AddRabbitFlow(settings =>
 
         consumerSettings.ConfigureAutoGenerate(opt =>
         {
-            opt.DurableQueue = true;
-            opt.DurableExchange = true;
+            opt.ExchangeName = "notifications";
+            opt.ExchangeType = ExchangeType.Fanout;
             opt.ExclusiveQueue = false;
-            opt.AutoDeleteQueue = false;
-            opt.GenerateDeadletterQueue = true;
-            opt.ExchangeType = ExchangeType.Direct;
         });
         consumerSettings.ConfigureRetryPolicy(retryPolicy =>
         {
@@ -47,16 +46,15 @@ builder.Services.AddRabbitFlow(settings =>
 
     settings.AddConsumer<WhatsAppConsumer>("whatsapps-test-queue", consumerSettings =>
     {
+        consumerSettings.ConsumerId = "WhatsApp";
+
         consumerSettings.AutoGenerate = true;
 
         consumerSettings.ConfigureAutoGenerate(opt =>
         {
-            opt.DurableQueue = true;
-            opt.DurableExchange = true;
+            opt.ExchangeName = "notifications";
+            opt.ExchangeType = ExchangeType.Fanout;
             opt.ExclusiveQueue = false;
-            opt.AutoDeleteQueue = false;
-            opt.GenerateDeadletterQueue = true;
-            opt.ExchangeType = ExchangeType.Direct;
         });
     });
 
@@ -64,9 +62,9 @@ builder.Services.AddRabbitFlow(settings =>
 
 var app = builder.Build();
 
-app.UseConsumer<EmailEvent, EmailConsumer>();
+app.UseConsumer<NotificationEvent, EmailConsumer>();
 
-app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
+app.UseConsumer<NotificationEvent, WhatsAppConsumer>(opt =>
 {
     opt.PerMessageInstance = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer
@@ -74,14 +72,10 @@ app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
 
 app.UseHttpsRedirection();
 
-app.MapPost("/email", async (IRabbitFlowPublisher publisher, EmailEvent emailEvent) =>
+app.MapPost("/notification", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
 {
-    await publisher.PublishAsync(emailEvent, queueName: "emails-test-queue");
+    await publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "");
 });
 
-app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, WhatsAppEvent whatsAppEvent) =>
-{
-    await publisher.PublishAsync(whatsAppEvent, queueName: "whatsapps-test-queue");
-});
 
 app.Run();

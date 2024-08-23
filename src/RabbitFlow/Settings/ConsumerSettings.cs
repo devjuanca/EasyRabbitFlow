@@ -5,63 +5,86 @@ using System.Linq;
 
 namespace RabbitFlow.Settings
 {
-
-    public class ConsumerSettings
+    /// <summary>
+    /// Represents consumer-specific settings for a RabbitMQ consumer.
+    /// This class provides configuration options such as queue name, 
+    /// auto-acknowledgment behavior, message prefetch count, processing timeout, 
+    /// retry policy, and more for a specific consumer type.
+    /// </summary>
+    /// <typeparam name="TConsumer">The type of the consumer that must implement IRabbitFlowConsumer&lt;T&gt;.</typeparam>
+    public class ConsumerSettings<TConsumer> where TConsumer : class
     {
         private readonly IServiceCollection _services;
 
         /// <summary>
-        /// Gets or sets a value indicating whether messages are automatically acknowledged in case of an error. Defaults to True (Reject and Dispose) 
-        /// message will be lost unless a custom dead-letter queue is configured.
-        /// If False, message will be rejected and sent to the dead-letter queue (if configured). 
-        /// If custom dead-letter queue is also configured message will be sent to both queues.
-        /// In no case the message will be requeued.
+        /// Initializes a new instance of the <see cref="ConsumerSettings{TConsumer}"/> class.
+        /// Registers the consumer implementation in the dependency injection container.
+        /// </summary>
+        /// <param name="services">The service collection to which the consumer is registered.</param>
+        /// <param name="queueName">The name of the queue being consumed.</param>
+        /// <exception cref="Exception">Thrown if the consumer does not implement IRabbitFlowConsumer&lt;T&gt;.</exception>
+        public ConsumerSettings(IServiceCollection services, string queueName)
+        {
+            _services = services;
+
+            QueueName = queueName;
+
+            var consumerImplementation = typeof(TConsumer);
+
+            var consumerAbstraction = consumerImplementation.GetInterfaces()
+                                                            .FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>));
+
+            if (consumerAbstraction != null)
+            {
+                _services.AddTransient(consumerAbstraction, consumerImplementation);
+            }
+            else
+            {
+                throw new Exception("Consumer must implement IRabbitFlowConsumer<T>");
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the name of the queue being consumed.
+        /// </summary>
+        public string QueueName { get; private set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the unique identifier for the consumer, which is used to identify the connection associated with the consumer.
+        /// If this property is not provided, the <see cref="QueueName"/> will be used as a fallback for identification purposes.
+        /// </summary>
+        public string? ConsumerId { get; set; }
+
+
+        /// <summary>
+        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption in case of an error.
         /// </summary>
         public bool AutoAckOnError { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating whether queue, exchange and binding will be automatically generated.
+        /// Gets or sets a value indicating whether to automatically generate necessary queue and exchange configurations.
         /// </summary>
         public bool AutoGenerate { get; set; } = false;
 
         /// <summary>
-        /// Gets or sets the number of messages that the consumer can prefetch. Defaults to 1.
+        /// Gets or sets the number of messages that the consumer can prefetch.
+        /// Prefetch count determines how many messages the consumer can hold in memory before processing them.
         /// </summary>
         public ushort PrefetchCount { get; set; } = 1;
 
+
         /// <summary>
-        /// Gets or sets the timeout duration for processing a single message. Defaults to 30 seconds.
+        /// Gets or sets the timeout duration for processing a single message.
         /// </summary>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 
-        private readonly string _queueName;
-
-        public ConsumerSettings(IServiceCollection services, string queueName)
-        {
-            _services = services;
-            _queueName = queueName;
-        }
 
         /// <summary>
-        /// Sets a custom exchange and routing key to send a message if fails. 
-        /// If AutoAckOnError is True the message will be sent to both configured dead-letter (by infrastructure) and custom dead-letter.
+        /// Configures the retry policy for the consumer.
+        /// The retry policy dictates how the system should handle message consumption failures.
         /// </summary>
-        /// <typeparam name="TConsumer"></typeparam>
-        /// <param name="settings"></param>
-        public void ConfigureCustomDeadletter<TConsumer>(Action<CustomDeadLetterSettings<TConsumer>> settings) where TConsumer : class
-        {
-            var customDeasLetter = new CustomDeadLetterSettings<TConsumer>();
-
-            settings.Invoke(customDeasLetter);
-
-            _services.AddSingleton(customDeasLetter);
-        }
-
-        /// <summary>
-        /// Sets the retry policy for message processing.
-        /// </summary>
-        /// <param name="settings">A delegate to configure the retry policy.</param>
-        public void ConfigureRetryPolicy<TConsumer>(Action<RetryPolicy<TConsumer>> settings) where TConsumer : class
+        /// <param name="settings">An action to configure the retry policy.</param>
+        public void ConfigureRetryPolicy(Action<RetryPolicy<TConsumer>> settings)
         {
             var retryPolicy = new RetryPolicy<TConsumer>();
 
@@ -70,12 +93,13 @@ namespace RabbitFlow.Settings
             _services.AddSingleton(retryPolicy);
         }
 
+
         /// <summary>
-        /// Configures auto-generation settings for a specific consumer.
+        /// Configures automatic generation settings for queues and exchanges.
+        /// This configuration is applied when the AutoGenerate property is set to true.
         /// </summary>
-        /// <typeparam name="TConsumer">Type of the consumer.</typeparam>
-        /// <param name="settings">Action to configure auto-generation settings.</param>
-        public void ConfigureAutoGenerate<TConsumer>(Action<AutoGenerateSettings<TConsumer>> settings) where TConsumer : class
+        /// <param name="settings">An action to configure automatic generation settings.</param>
+        public void ConfigureAutoGenerate(Action<AutoGenerateSettings<TConsumer>> settings)
         {
             var autoGenerateSettings = new AutoGenerateSettings<TConsumer>();
 
@@ -85,85 +109,18 @@ namespace RabbitFlow.Settings
         }
 
 
-
         /// <summary>
-        /// Sets the consumer handler implementation for the specified consumer type.
+        /// Configures custom dead-letter settings for the consumer.
+        /// Dead-letter settings allow customization of how messages are handled when they cannot be processed successfully.
         /// </summary>
-        /// <typeparam name="TConsumer">The type of the consumer handler.</typeparam>
-        public void SetConsumerHandler<TConsumer>() where TConsumer : class
+        /// <param name="settings">An action to configure custom dead-letter settings.</param>
+        public void ConfigureCustomDeadletter(Action<CustomDeadLetterSettings<TConsumer>> settings)
         {
-            var consumerImplementation = typeof(TConsumer);
+            var customDeasLetter = new CustomDeadLetterSettings<TConsumer>();
 
-            var consumerAbstraction = consumerImplementation.GetInterfaces()
-                                                            .FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>));
+            settings.Invoke(customDeasLetter);
 
-            if (consumerAbstraction != null)
-            {
-                _services.AddTransient(consumerAbstraction, consumerImplementation);
-
-                var opt = new ConsumerSettings<TConsumer>()
-                {
-                    AutoAckOnError = AutoAckOnError,
-                    AutoGenerate = AutoGenerate,
-                    PrefetchCount = PrefetchCount,
-                    QueueName = _queueName,
-                    Timeout = Timeout
-                };
-
-                _services.AddSingleton(opt);
-            }
-            else
-            {
-                throw new Exception("Consumer must implement IHvBusConsumer<T>");
-            }
+            _services.AddSingleton(customDeasLetter);
         }
-    }
-
-    /// <summary>
-    /// Represents consumer-specific settings for a RabbitMQ consumer.
-    /// </summary>
-    /// <typeparam name="TConsumer">The type of the consumer.</typeparam>
-    public class ConsumerSettings<TConsumer>
-    {
-        /// <summary>
-        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption.
-        /// </summary>
-        public bool AutoAckOnError { get; set; } = true;
-
-        /// <summary>
-        /// Gets or sets a value indicating whether exchanges and queues should be created.
-        /// </summary>
-        public bool AutoGenerate { get; set; } = false;
-
-        /// <summary>
-        /// Gets or sets the number of messages that the consumer can prefetch.
-        /// </summary>
-        public ushort PrefetchCount { get; set; } = 1;
-
-        /// <summary>
-        /// Gets or sets the name of the queue being consumed.
-        /// </summary>
-        public string QueueName { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Gets or sets the timeout duration for processing a single message.
-        /// </summary>
-        public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
-    }
-
-    /// <summary>
-    ///  Represents temporary-consumer specific settings for a RabbitMQ consumer.
-    /// </summary>
-    public class TemporaryConsummerSettings
-    {
-        /// <summary>
-        /// Gets or sets the number of messages that the consumer can prefetch.
-        /// </summary>
-        public ushort PrefetchCount { get; set; } = 1;
-
-        /// <summary>
-        /// Gets or sets the timeout duration for processing a single message.
-        /// </summary>
-        public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
     }
 }
