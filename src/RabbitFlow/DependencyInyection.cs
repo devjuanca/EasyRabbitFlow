@@ -1,6 +1,6 @@
-﻿using System;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using RabbitFlow.Services;
+using System;
 
 namespace RabbitFlow.Configuration
 {
@@ -25,8 +25,6 @@ namespace RabbitFlow.Configuration
             configurator.Invoke(settings);
 
             services.AddSingleton<IRabbitFlowPublisher, RabbitFlowPublisher>();
-
-            services.AddSingleton<IRabbitFlowTemporaryQueue, RabbitFlowTemporaryQueue>();
 
             services.AddSingleton<IRabbitFlowState, RabbitFlowState>();
 

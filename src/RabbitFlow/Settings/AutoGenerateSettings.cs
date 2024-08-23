@@ -11,7 +11,7 @@ namespace RabbitFlow.Settings
         /// <summary>
         /// Gets or sets a value indicating whether to generate an exchange.
         /// </summary>
-        public bool GenerateExchange { get; set; }
+        public bool GenerateExchange { get; set; } = true;
 
         /// <summary>
         /// Gets or sets a value indicating wether to generate and bind a deadletter queue.
@@ -39,17 +39,17 @@ namespace RabbitFlow.Settings
         public bool DurableExchange { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the queue should be durable.
+        /// Should this queue will survive a broker restart?
         /// </summary>
         public bool DurableQueue { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the queue should be exclusive.
+        /// Should this queue use be limited to its declaring connection? Such a queue will be deleted when its declaring connection closes.
         /// </summary>
         public bool ExclusiveQueue { get; set; } = false;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the queue should be auto-deleted.
+        /// Should this queue be auto-deleted when its last consumer (if any) unsubscribes?
         /// </summary>
         public bool AutoDeleteQueue { get; set; } = false;
 

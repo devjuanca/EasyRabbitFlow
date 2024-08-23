@@ -4,7 +4,7 @@ using System.Text.Json;
 
 namespace RabbitFlowSample.Consumers;
 
-public class WhatsAppConsumer : IRabbitFlowConsumer<WhatsAppEvent>
+public class WhatsAppConsumer : IRabbitFlowConsumer<NotificationEvent>
 {
     private readonly ILogger<WhatsAppConsumer> _logger;
 
@@ -13,7 +13,7 @@ public class WhatsAppConsumer : IRabbitFlowConsumer<WhatsAppEvent>
         _logger = logger;
     }
 
-    public async Task HandleAsync(WhatsAppEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
         await Task.CompletedTask;
 

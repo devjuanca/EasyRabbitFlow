@@ -1,6 +1,5 @@
 ﻿using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using RabbitFlow.Services;
 using RabbitFlow.Settings;
 using RabbitMQ.Client;
@@ -35,11 +34,11 @@ namespace RabbitFlow.Configuration
             settings?.Invoke(consumer_settings);
 
             if (!consumer_settings.Active)
+            {
                 return app;
+            }
 
             var appServiceProvider = app.ApplicationServices;
-
-            var consumerLogger = appServiceProvider.GetRequiredService<ILogger<TConsumer>>();
 
             var factory = appServiceProvider.GetRequiredService<ConnectionFactory>() ?? throw new Exception("ConnectionFactory was not found in Service Collection");
 
@@ -54,14 +53,16 @@ namespace RabbitFlow.Configuration
             var consumerType = typeof(TConsumer);
 
             var consumerAbstraction = consumerType.GetInterfaces().FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>)) ??
-                throw new Exception("Consumer must implement IRabbitFlowConsumer<T>");
+                throw new Exception("[RABBIT-FLOW]: Consumer must implement IRabbitFlowConsumer<T>");
 
             var eventType = consumerAbstraction.GetGenericArguments().First();
 
             if (eventType != typeof(TEventType))
-                throw new Exception($"Consumer must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>");
+                throw new Exception($"[RABBIT-FLOW]: Consumer must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>");
 
-            var connection = factory.CreateConnection(typeof(TConsumer).Name);
+            var connectionId = consumerOptions.ConsumerId ?? consumerOptions.QueueName;
+
+            var connection = factory.CreateConnection($"Consumer_{connectionId}");
 
             var channel = connection.CreateModel();
 
@@ -89,9 +90,9 @@ namespace RabbitFlow.Configuration
 
                     var deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
 
-                    channel.QueueDeclare(queue: deadLetterQueueName, durable: true, exclusive: false, autoDelete: false, arguments: null);
+                    channel.QueueDeclare(queue: deadLetterQueueName, durable: autoGenerateSettings.DurableQueue, exclusive: false, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: null);
 
-                    channel.ExchangeDeclare(exchange: deadLetterExchange, type: "direct", durable: true);
+                    channel.ExchangeDeclare(exchange: deadLetterExchange, type: "direct", durable: autoGenerateSettings.DurableExchange);
 
                     channel.QueueBind(queue: deadLetterQueueName, exchange: deadLetterExchange, routingKey: deadLetterRoutingKey);
 
@@ -122,6 +123,7 @@ namespace RabbitFlow.Configuration
                     channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: routingKey);
                 }
             }
+
             var rabbitConsumer = new EventingBasicConsumer(channel);
 
             object? consumerService = null;
@@ -151,7 +153,7 @@ namespace RabbitFlow.Configuration
                 }
                 catch (InvalidOperationException ex)
                 {
-                    throw new Exception("Ensure all services used in the consumer are Singleton when PerMessageInstance is set to false. Alternatively, set PerMessageInstance to true, which is the default behavior.", ex);
+                    throw new Exception("[RABBIT-FLOW]: Ensure all services used in the consumer are Singleton when PerMessageInstance is set to false. Alternatively, set PerMessageInstance to true, which is the default behavior.", ex);
                 }
 
                 var retryCount = retryPolicy.MaxRetryCount;
@@ -174,16 +176,15 @@ namespace RabbitFlow.Configuration
 
                         if (@event == null)
                         {
-                            consumerLogger.LogError("Failed to serialize the message. Check the message format or serialization settings.");
-                            break;
+                            throw new Exception("[RABBIT-FLOW]: Failed to serialize the message. Check the message format or serialization settings.");
                         }
 
                         if (!(consumerService is IRabbitFlowConsumer<TEventType>))
                         {
-                            throw new Exception("Consumer service must implement IRabbitFlowConsumer<TEventType>. Ensure that all consumer services adhere to this interface to maintain the flow. This exception should never be thrown under normal circumstances.");
+                            throw new Exception("[RABBIT-FLOW]: Consumer service must implement IRabbitFlowConsumer<TEventType>. Ensure that all consumer services adhere to this interface to maintain the flow. This exception should never be thrown under normal circumstances.");
                         }
 
-                        await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync((TEventType)@event, cancellationToken);
+                        await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync((TEventType)@event, cancellationToken).ConfigureAwait(false);
 
                         channel.BasicAck(args.DeliveryTag, false);
 
@@ -191,31 +192,31 @@ namespace RabbitFlow.Configuration
                     }
                     catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, consumerLogger, retryCount, channel, message);
+                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
 
                         retryCount--;
                     }
                     catch (TaskCanceledException ex) when (ex.CancellationToken == cancellationToken)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, consumerLogger, retryCount, channel, message);
+                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
 
                         retryCount--;
                     }
-                    catch (TaskCanceledException ex)
+                    catch (TaskCanceledException)
                     {
-                        consumerLogger.LogError(ex, "Task canceled for an unexpected reason while receiving message. Message: {message}", message);
+                        Console.WriteLine("[RABBIT-FLOW]: Task canceled for an unexpected reason while receiving message.");
                         break;
                     }
-                    catch (OperationCanceledException ex)
+                    catch (OperationCanceledException)
                     {
-                        consumerLogger.LogError(ex, "Task canceled for an unexpected reason while receiving message. Message: {message}", message);
+                        Console.WriteLine("[RABBIT-FLOW]: Task canceled for an unexpected reason while receiving message.");
                         break;
                     }
                     catch (Exception ex)
                     {
                         if (shouldDelay)
                         {
-                            cancellationToken = await HandleExceptionRetry(ex, retryPolicy, consumerLogger, retryCount, channel, message);
+                            cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
                         }
                         retryCount--;
                     }
@@ -227,7 +228,7 @@ namespace RabbitFlow.Configuration
 
                 if (retryCount == 0)
                 {
-                    consumerLogger.LogError("Error receiving message. Retry Count: {retry}. Message: {message}", retryCount, message);
+                    Console.WriteLine($"[RABBIT-FLOW]: Error receiving message. Retry Count: {retryCount}.");
 
                     if (consumerOptions.AutoAckOnError)
                     {
@@ -244,7 +245,9 @@ namespace RabbitFlow.Configuration
                         var publisher = appServiceProvider.GetRequiredService<IRabbitFlowPublisher>();
 
                         if (@event != null)
-                            await publisher.PublishAsync<TEventType>((TEventType)@event, "", customDeadletter.DeadletterQueueName, false);
+                        {
+                            await publisher.PublishAsync((TEventType)@event, customDeadletter.DeadletterQueueName, publisherId: "custom-dead-letter");
+                        }
 
                     }
                 }
@@ -255,11 +258,11 @@ namespace RabbitFlow.Configuration
             return app;
         }
 
-        public static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, ILogger consumerLogger, int retryCount, IModel channel, string message) where TConsumer : class
+        public static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IModel channel) where TConsumer : class
         {
             var delay = retryPolicy.ExponentialBackoff && retryCount < retryPolicy.MaxRetryCount ? retryPolicy.RetryInterval * retryPolicy.ExponentialBackoffFactor : retryPolicy.RetryInterval;
 
-            consumerLogger.LogWarning(ex, "Timeout receiving message. Retry Count: {retryCount}. Delay: {delay} ms. Message: {message}", retryCount, delay, message);
+            Console.WriteLine($"[RABBIT-FLOW]: Error processing the message. Retry Count: {retryCount}. Delay: {delay} ms.Exception Message: {ex.Message}");
 
             await Task.Delay(delay, CancellationToken.None);
 
@@ -268,5 +271,4 @@ namespace RabbitFlow.Configuration
             return cancellationToken;
         }
     }
-
 }
