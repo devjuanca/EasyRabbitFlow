@@ -35,6 +35,7 @@ builder.Services.AddRabbitFlow(settings =>
             opt.GenerateDeadletterQueue = true;
             opt.ExchangeType = ExchangeType.Direct;
         });
+
         consumerSettings.ConfigureRetryPolicy(retryPolicy =>
         {
             retryPolicy.MaxRetryCount = 3;
@@ -43,7 +44,7 @@ builder.Services.AddRabbitFlow(settings =>
             retryPolicy.ExponentialBackoffFactor = 2;
         });
 
-    });
+    }).InitializeConsumer<EmailEvent>();
 
     settings.AddConsumer<WhatsAppConsumer>("whatsapps-test-queue", consumerSettings =>
     {
@@ -58,19 +59,20 @@ builder.Services.AddRabbitFlow(settings =>
             opt.GenerateDeadletterQueue = true;
             opt.ExchangeType = ExchangeType.Direct;
         });
-    });
+
+        consumerSettings.ConfigureRetryPolicy(opt =>
+        {
+            opt.RetryInterval = 1000;
+            opt.ExponentialBackoff = true;
+            opt.ExponentialBackoffFactor = 1;
+            opt.MaxRetryCount = 5;
+        });
+
+    }).InitializeConsumer<WhatsAppEvent>();
 
 });
 
 var app = builder.Build();
-
-app.UseConsumer<EmailEvent, EmailConsumer>();
-
-app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
-{
-    opt.PerMessageInstance = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
-    opt.Active = true; // if you want to disable this consumer
-});
 
 app.UseHttpsRedirection();
 

@@ -17,6 +17,9 @@ namespace RabbitFlow.Services
     {
         private readonly IServiceCollection _services;
 
+        public IServiceCollection Services { get { return _services; } }
+
+        public Type? ConsumerType { get; private set; } = null;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RabbitFlowConfigurator"/> class.
@@ -88,13 +91,17 @@ namespace RabbitFlow.Services
         /// <typeparam name="TConsumer">The type of the consumer to register, which must implement the <see cref="IRabbitFlowConsumer{T}"/> interface.</typeparam>
         /// <param name="queueName">The name of the RabbitMQ queue to consume messages from.</param>
         /// <param name="settings">A delegate to configure the <see cref="ConsumerSettings{TConsumer}"/>.</param>
-        public void AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>> settings) where TConsumer : class
+        public RabbitFlowConfigurator AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>> settings) where TConsumer : class
         {
             var consumerSettings = new ConsumerSettings<TConsumer>(_services, queueName);
 
             settings.Invoke(consumerSettings);
 
             _services.AddSingleton(consumerSettings);
+
+            ConsumerType = typeof(TConsumer);
+
+            return this;
         }
     }
 }

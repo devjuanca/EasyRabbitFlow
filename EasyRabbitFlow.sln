@@ -11,8 +11,6 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "sample", "sample", "{EFDEB7
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "RabbitFlowSimpleSample", "sample\RabbitFlowSample\RabbitFlowSimpleSample.csproj", "{234B8148-0ECD-4158-81D9-1F1B7B2D747A}"
 EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "RabbitFlowFanoutSample", "sample\RabbitFlowFanoutSample\RabbitFlowFanoutSample.csproj", "{3064FF1F-75A2-4542-90F8-F0BC44BD7976}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -27,10 +25,6 @@ Global
 		{234B8148-0ECD-4158-81D9-1F1B7B2D747A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{234B8148-0ECD-4158-81D9-1F1B7B2D747A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{234B8148-0ECD-4158-81D9-1F1B7B2D747A}.Release|Any CPU.Build.0 = Release|Any CPU
-		{3064FF1F-75A2-4542-90F8-F0BC44BD7976}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{3064FF1F-75A2-4542-90F8-F0BC44BD7976}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{3064FF1F-75A2-4542-90F8-F0BC44BD7976}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{3064FF1F-75A2-4542-90F8-F0BC44BD7976}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -38,7 +32,6 @@ Global
 	GlobalSection(NestedProjects) = preSolution
 		{03E608AE-035C-444D-AB6F-43B15BFB9BA5} = {FDEA2E38-EAA3-49D4-88A1-5CBA56307D16}
 		{234B8148-0ECD-4158-81D9-1F1B7B2D747A} = {EFDEB7C8-E333-4352-B3FF-BD078BE949C8}
-		{3064FF1F-75A2-4542-90F8-F0BC44BD7976} = {EFDEB7C8-E333-4352-B3FF-BD078BE949C8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {1E9C2B45-68BB-4441-9431-EECABE758759}

@@ -30,7 +30,7 @@
         /// <summary>
         /// Gets or sets the factor by which to multiply the retry interval for each exponential backoff attempt.
         /// This value is used only if <see cref="ExponentialBackoff"/> is set to <c>true</c>.
-        /// The default value is 1, meaning the retry interval will double with each retry.
+        /// The default value is 1, meaning the retry interval will act linear.
         /// </summary>
         public int ExponentialBackoffFactor { get; set; } = 1;
     }

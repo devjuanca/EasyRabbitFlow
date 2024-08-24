@@ -15,6 +15,8 @@ public class WhatsAppConsumer : IRabbitFlowConsumer<WhatsAppEvent>
 
     public async Task HandleAsync(WhatsAppEvent message, CancellationToken cancellationToken)
     {
+        throw new NotImplementedException();
+
         await Task.CompletedTask;
 
         _logger.LogInformation("New whatsapp event received. Event:{event}", JsonSerializer.Serialize(message));
