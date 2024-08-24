@@ -1,11 +1,11 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using EasyRabbitFlow.Settings;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using RabbitFlow.Settings;
 using RabbitMQ.Client;
 using System;
 using System.Text.Json;
 
-namespace RabbitFlow.Services
+namespace EasyRabbitFlow.Services
 {
 
     /// <summary>

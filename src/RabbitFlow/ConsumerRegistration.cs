@@ -1,7 +1,8 @@
-﻿using Microsoft.AspNetCore.Builder;
+﻿using EasyRabbitFlow.Exceptions;
+using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Settings;
 using Microsoft.Extensions.DependencyInjection;
-using RabbitFlow.Services;
-using RabbitFlow.Settings;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System;
@@ -12,7 +13,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace RabbitFlow.Configuration
+namespace EasyRabbitFlow
 {
     /// <summary>
     /// Extension methods for registering RabbitMQ consumers.
@@ -20,14 +21,15 @@ namespace RabbitFlow.Configuration
     public static class ConsumerRegistration
     {
         /// <summary>
-        /// Registers a RabbitMQ consumer for a specific event type and consumer type.
+        /// Initializes and registers a RabbitMQ consumer for the specified event type and consumer.
         /// </summary>
-        /// <typeparam name="TEventType">The type of the event to consume.</typeparam>
-        /// <typeparam name="TConsumer">The type of the consumer.</typeparam>
-        /// <param name="app">The application builder.</param>
-        /// <param name="settings">Options to configure Consumer.</param>
-        /// <returns>The modified application builder.</returns>
-        public static IApplicationBuilder UseConsumer<TEventType, TConsumer>(this IApplicationBuilder app, Action<ConsumerRegisterSettings>? settings = null) where TConsumer : class where TEventType : class
+        /// <typeparam name="TEventType">The type of event the consumer will handle.</typeparam>
+        /// <typeparam name="TConsumer">The type of the consumer handling the event.</typeparam>
+        /// <param name="serviceProvider">The service provider used to resolve dependencies.</param>
+        /// <param name="settings">Optional settings for consumer registration.</param>
+        /// <returns>The service provider.</returns>
+        /// <exception cref="Exception">Thrown if required services are not found in the service provider or if consumer interface contracts are violated.</exception>
+        public static IServiceProvider InitializeConsumer<TEventType, TConsumer>(this IServiceProvider serviceProvider, Action<ConsumerRegisterSettings>? settings = null) where TConsumer : class where TEventType : class
         {
             var consumer_settings = new ConsumerRegisterSettings();
 
@@ -35,30 +37,32 @@ namespace RabbitFlow.Configuration
 
             if (!consumer_settings.Active)
             {
-                return app;
+                return serviceProvider;
             }
 
-            var appServiceProvider = app.ApplicationServices;
+            var logger = serviceProvider.GetRequiredService<ILogger<TConsumer>>();
 
-            var factory = appServiceProvider.GetRequiredService<ConnectionFactory>() ?? throw new Exception("ConnectionFactory was not found in Service Collection");
+            var factory = serviceProvider.GetRequiredService<ConnectionFactory>() ?? throw new Exception("ConnectionFactory was not found in Service Collection");
 
-            var jsonSerializerOption = appServiceProvider.GetService<JsonSerializerOptions>() ?? new JsonSerializerOptions();
+            var jsonSerializerOption = serviceProvider.GetService<JsonSerializerOptions>() ?? new JsonSerializerOptions();
 
-            var consumerOptions = appServiceProvider.GetRequiredService<ConsumerSettings<TConsumer>>() ?? throw new Exception("ConsummerOptions was not found in Service Collection");
+            var consumerOptions = serviceProvider.GetRequiredService<ConsumerSettings<TConsumer>>() ?? throw new Exception("ConsummerOptions was not found in Service Collection");
 
-            var retryPolicy = appServiceProvider.GetService<RetryPolicy<TConsumer>>() ?? new RetryPolicy<TConsumer> { MaxRetryCount = 1 };
+            var retryPolicy = serviceProvider.GetService<RetryPolicy<TConsumer>>() ?? new RetryPolicy<TConsumer> { MaxRetryCount = 1 };
 
-            var customDeadletter = appServiceProvider.GetService<CustomDeadLetterSettings<TConsumer>>() ?? null;
+            var customDeadletter = serviceProvider.GetService<CustomDeadLetterSettings<TConsumer>>() ?? null;
 
             var consumerType = typeof(TConsumer);
 
             var consumerAbstraction = consumerType.GetInterfaces().FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>)) ??
-                throw new Exception("[RABBIT-FLOW]: Consumer must implement IRabbitFlowConsumer<T>");
+                throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<T> to be registered as a consumer.");
 
             var eventType = consumerAbstraction.GetGenericArguments().First();
 
             if (eventType != typeof(TEventType))
-                throw new Exception($"[RABBIT-FLOW]: Consumer must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>");
+            {
+                throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>.");
+            }
 
             var connectionId = consumerOptions.ConsumerId ?? consumerOptions.QueueName;
 
@@ -72,7 +76,7 @@ namespace RabbitFlow.Configuration
 
             if (consumerOptions.AutoGenerate)
             {
-                var autoGenerateSettings = appServiceProvider.GetService<AutoGenerateSettings<TConsumer>>() ?? new AutoGenerateSettings<TConsumer>();
+                var autoGenerateSettings = serviceProvider.GetService<AutoGenerateSettings<TConsumer>>() ?? new AutoGenerateSettings<TConsumer>();
 
                 var exchangeName = autoGenerateSettings.ExchangeName ?? $"{consumerOptions.QueueName}-exchange";
 
@@ -138,9 +142,9 @@ namespace RabbitFlow.Configuration
 
                 try
                 {
-                    if (consumer_settings.PerMessageInstance)
+                    if (consumer_settings.CreateNewInstancePerMessage)
                     {
-                        scope = app.ApplicationServices.CreateScope();
+                        scope = serviceProvider.CreateScope();
 
                         var scopedServiceProvider = scope.ServiceProvider;
 
@@ -148,12 +152,12 @@ namespace RabbitFlow.Configuration
                     }
                     else
                     {
-                        consumerService = appServiceProvider.GetRequiredService(consumerAbstraction) ?? throw new Exception("Consumer was not found in Service Collection");
+                        consumerService = serviceProvider.GetRequiredService(consumerAbstraction) ?? throw new Exception("Consumer was not found in Service Collection");
                     }
                 }
                 catch (InvalidOperationException ex)
                 {
-                    throw new Exception("[RABBIT-FLOW]: Ensure all services used in the consumer are Singleton when PerMessageInstance is set to false. Alternatively, set PerMessageInstance to true, which is the default behavior.", ex);
+                    throw new RabbitFlowException("[RABBIT-FLOW]: Failed to resolve consumer service. Ensure all dependencies are correctly registered and configured. If PerMessageInstance is set to false, all services must be Singleton.", ex);
                 }
 
                 var retryCount = retryPolicy.MaxRetryCount;
@@ -176,12 +180,12 @@ namespace RabbitFlow.Configuration
 
                         if (@event == null)
                         {
-                            throw new Exception("[RABBIT-FLOW]: Failed to serialize the message. Check the message format or serialization settings.");
+                            throw new RabbitFlowException("[RABBIT-FLOW]: Message deserialization failed. Ensure the message format is valid and matches the expected type.");
                         }
 
                         if (!(consumerService is IRabbitFlowConsumer<TEventType>))
                         {
-                            throw new Exception("[RABBIT-FLOW]: Consumer service must implement IRabbitFlowConsumer<TEventType>. Ensure that all consumer services adhere to this interface to maintain the flow. This exception should never be thrown under normal circumstances.");
+                            throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer service does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>. This is likely due to a misconfiguration.");
                         }
 
                         await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync((TEventType)@event, cancellationToken).ConfigureAwait(false);
@@ -192,33 +196,38 @@ namespace RabbitFlow.Configuration
                     }
                     catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
+                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
 
                         retryCount--;
                     }
                     catch (TaskCanceledException ex) when (ex.CancellationToken == cancellationToken)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
+                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
 
                         retryCount--;
                     }
-                    catch (TaskCanceledException)
+                    catch (TaskCanceledException ex)
                     {
-                        Console.WriteLine("[RABBIT-FLOW]: Task canceled for an unexpected reason while receiving message.");
+                        logger.LogError(ex, "[RABBIT-FLOW]: Task was unexpectedly canceled while processing the message. This may indicate a timeout or other issue.");
                         break;
                     }
-                    catch (OperationCanceledException)
+                    catch (OperationCanceledException ex)
                     {
-                        Console.WriteLine("[RABBIT-FLOW]: Task canceled for an unexpected reason while receiving message.");
+                        logger.LogError(ex, "[RABBIT-FLOW]: Operation was unexpectedly canceled while processing the message. Investigate the root cause to determine if it's due to a timeout or cancellation token.");
                         break;
                     }
-                    catch (Exception ex)
+                    catch (TranscientException ex)
                     {
                         if (shouldDelay)
                         {
-                            cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel);
+                            cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
                         }
                         retryCount--;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler logic is resilient.");
+                        break;
                     }
                     finally
                     {
@@ -228,7 +237,8 @@ namespace RabbitFlow.Configuration
 
                 if (retryCount == 0)
                 {
-                    Console.WriteLine($"[RABBIT-FLOW]: Error receiving message. Retry Count: {retryCount}.");
+
+                    logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
 
                     if (consumerOptions.AutoAckOnError)
                     {
@@ -242,7 +252,7 @@ namespace RabbitFlow.Configuration
 
                     if (customDeadletter != null)
                     {
-                        var publisher = appServiceProvider.GetRequiredService<IRabbitFlowPublisher>();
+                        var publisher = serviceProvider.GetRequiredService<IRabbitFlowPublisher>();
 
                         if (@event != null)
                         {
@@ -255,20 +265,29 @@ namespace RabbitFlow.Configuration
 
             channel.BasicConsume(queue: consumerOptions.QueueName, autoAck: false, consumer: rabbitConsumer);
 
-            return app;
+            return serviceProvider;
         }
 
-        public static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IModel channel) where TConsumer : class
+        public static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IModel channel, ILogger<TConsumer> logger) where TConsumer : class
         {
-            var delay = retryPolicy.ExponentialBackoff && retryCount < retryPolicy.MaxRetryCount ? retryPolicy.RetryInterval * retryPolicy.ExponentialBackoffFactor : retryPolicy.RetryInterval;
+            var maxRetryCount = retryPolicy.MaxRetryCount;
 
-            Console.WriteLine($"[RABBIT-FLOW]: Error processing the message. Retry Count: {retryCount}. Delay: {delay} ms.Exception Message: {ex.Message}");
+            var remainingRetries = maxRetryCount - retryCount;
+
+            var delay = retryPolicy.RetryInterval;
+
+            if (retryPolicy.ExponentialBackoff && remainingRetries > 0)
+            {
+                delay = retryPolicy.RetryInterval * (int)Math.Pow(retryPolicy.ExponentialBackoffFactor, remainingRetries);
+            }
+
+            logger.LogWarning("[RABBIT-FLOW]: Error processing the message. Retry Count: {retryCount}. Delay: {delay} ms. Exception Message: {message}", retryCount, delay, ex.Message);
 
             await Task.Delay(delay, CancellationToken.None);
 
-            var cancellationToken = new CancellationTokenSource(channel.ContinuationTimeout).Token;
+            using var cts = new CancellationTokenSource(channel.ContinuationTimeout);
 
-            return cancellationToken;
+            return cts.Token;
         }
     }
 }

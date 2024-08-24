@@ -1,6 +1,6 @@
 ﻿using RabbitMQ.Client;
 
-namespace RabbitFlow.Services
+namespace EasyRabbitFlow.Services
 {
     public interface IRabbitFlowState
     {

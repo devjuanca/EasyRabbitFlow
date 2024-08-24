@@ -1,6 +1,6 @@
 ﻿using System.Collections.Generic;
 
-namespace RabbitFlow.Settings
+namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Class to generate settings for auto-generation of queues and exchanges for a consumer.

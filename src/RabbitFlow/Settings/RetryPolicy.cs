@@ -1,4 +1,4 @@
-﻿namespace RabbitFlow.Settings
+﻿namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Represents the retry policy settings for handling message processing retries in the RabbitFlow consumer.

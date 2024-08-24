@@ -1,6 +1,6 @@
 ﻿using System.Text.Json.Serialization;
 
-namespace RabbitFlowSample.Events;
+namespace RabbitFlowFanoutSample.Events;
 
 public class NotificationEvent
 {

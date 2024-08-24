@@ -1,7 +1,7 @@
 ﻿using System.Threading;
 using System.Threading.Tasks;
 
-namespace RabbitFlow.Services
+namespace EasyRabbitFlow.Services
 {
 
     /// <summary>

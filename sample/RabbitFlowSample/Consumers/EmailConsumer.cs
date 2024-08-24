@@ -1,22 +1,26 @@
-﻿using RabbitFlow.Services;
-using RabbitFlowSample.Events;
+﻿using EasyRabbitFlow.Services;
+using RabbitFlowSimpleSample.Events;
 using System.Text.Json;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSimpleSample.Consumers;
 
 public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 {
     private readonly ILogger<EmailConsumer> _logger;
 
-    public EmailConsumer(ILogger<EmailConsumer> logger)
+    private readonly GuidSevice _guidSevice;
+
+    public EmailConsumer(ILogger<EmailConsumer> logger, GuidSevice guidSevice)
     {
+        _guidSevice = guidSevice;
+
         _logger = logger;
     }
 
-    public async Task HandleAsync(EmailEvent message, CancellationToken cancellationToken)
+    public Task HandleAsync(EmailEvent message, CancellationToken cancellationToken)
     {
-        await Task.CompletedTask;
+        _logger.LogInformation("New email event received. Event:{event}. Id: {id}", JsonSerializer.Serialize(message), _guidSevice.Guid);
 
-        _logger.LogInformation("New email event received. Event:{event}", JsonSerializer.Serialize(message));
+        return Task.CompletedTask;
     }
 }

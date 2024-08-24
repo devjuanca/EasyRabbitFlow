@@ -1,5 +1,5 @@
 ﻿using RabbitMQ.Client;
-namespace RabbitFlow.Settings
+namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Represents the configuration settings for connecting to a RabbitMQ host.
