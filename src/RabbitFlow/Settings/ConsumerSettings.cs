@@ -1,9 +1,9 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-using RabbitFlow.Services;
+﻿using EasyRabbitFlow.Services;
+using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Linq;
 
-namespace RabbitFlow.Settings
+namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Represents consumer-specific settings for a RabbitMQ consumer.

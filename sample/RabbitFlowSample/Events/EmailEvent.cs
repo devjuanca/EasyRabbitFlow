@@ -1,6 +1,6 @@
 ﻿using System.Text.Json.Serialization;
 
-namespace RabbitFlowSample.Events;
+namespace RabbitFlowSimpleSample.Events;
 
 public class EmailEvent
 {

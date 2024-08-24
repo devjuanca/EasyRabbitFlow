@@ -1,4 +1,4 @@
-﻿namespace RabbitFlow.Settings
+﻿namespace EasyRabbitFlow.Settings
 {
 
     /// <summary>

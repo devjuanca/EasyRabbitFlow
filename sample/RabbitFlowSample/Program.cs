@@ -1,10 +1,13 @@
-using RabbitFlow.Configuration;
-using RabbitFlow.Services;
-using RabbitFlow.Settings;
-using RabbitFlowSample.Consumers;
-using RabbitFlowSample.Events;
+using EasyRabbitFlow;
+using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Settings;
+using RabbitFlowSimpleSample;
+using RabbitFlowSimpleSample.Consumers;
+using RabbitFlowSimpleSample.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddScoped<GuidSevice>();
 
 builder.Services.AddRabbitFlow(settings =>
 {
@@ -64,11 +67,11 @@ builder.Services.AddRabbitFlow(settings =>
 
 var app = builder.Build();
 
-app.UseConsumer<EmailEvent, EmailConsumer>();
+app.Services.InitializeConsumer<EmailEvent, EmailConsumer>();
 
-app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
+app.Services.InitializeConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
 {
-    opt.PerMessageInstance = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
+    opt.CreateNewInstancePerMessage = false; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer
 });
 

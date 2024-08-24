@@ -1,8 +1,8 @@
-﻿using RabbitFlow.Services;
-using RabbitFlowSample.Events;
+﻿using EasyRabbitFlow.Services;
+using RabbitFlowFanoutSample.Events;
 using System.Text.Json;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowFanoutSample.Consumers;
 
 public class EmailConsumer : IRabbitFlowConsumer<NotificationEvent>
 {
@@ -13,10 +13,10 @@ public class EmailConsumer : IRabbitFlowConsumer<NotificationEvent>
         _logger = logger;
     }
 
-    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
+    public Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
-        await Task.CompletedTask;
-
         _logger.LogInformation("New email event received. Event:{event}", JsonSerializer.Serialize(message));
+
+        return Task.CompletedTask;
     }
 }

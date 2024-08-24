@@ -1,4 +1,4 @@
-﻿namespace RabbitFlow.Settings
+﻿namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Represents options for configuring the behavior of the RabbitFlow publisher service.

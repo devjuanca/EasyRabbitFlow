@@ -1,18 +1,21 @@
-﻿namespace RabbitFlow.Settings
+﻿namespace EasyRabbitFlow.Settings
 {
     public class ConsumerRegisterSettings
     {
         /// <summary>
-        /// Gets or sets a value indicating whether a new consumer instance should be created for each message.
-        /// When set to <c>true</c>, a fresh instance of the consumer will be created for every message received.
-        /// This can be useful for ensuring isolated processing but may have performance implications. The default value is <c>true</c>.
+        /// Gets or sets a value indicating whether a new instance of the consumer should be created for each message.
+        /// When set to <c>true</c>, a fresh instance of the consumer will be instantiated for every received message.
+        /// This ensures isolated processing of messages, with each instance operating within its own scope.
+        /// While this approach can enhance the reliability and independence of message processing, it may also introduce
+        /// additional overhead due to the creation of new instances and scopes for each message. The default value is <c>true</c>.
         /// </summary>
-        public bool PerMessageInstance { get; set; } = true;
+        public bool CreateNewInstancePerMessage { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the consumer is active.
-        /// An active consumer will be able to receive and process messages. 
-        /// If set to <c>false</c>, the consumer will be registered but not actively consume messages. The default value is <c>true</c>.
+        /// Gets or sets a value indicating whether the consumer is active and capable of processing messages.
+        /// When set to <c>true</c>, the consumer will be actively receiving and processing messages from the queue.
+        /// If set to <c>false</c>, the consumer will be registered in the system but will not consume any messages,
+        /// effectively pausing its operation without removing its configuration. The default value is <c>true</c>.
         /// </summary>
         public bool Active { get; set; } = true;
     }

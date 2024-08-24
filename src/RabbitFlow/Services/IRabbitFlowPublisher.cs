@@ -1,10 +1,11 @@
-﻿using RabbitFlow.Settings;
+﻿using EasyRabbitFlow.Settings;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using System;
 using System.Text.Json;
 using System.Threading.Tasks;
 
-namespace RabbitFlow.Services
+namespace EasyRabbitFlow.Services
 {
     /// <summary>
     /// Represents a publisher for sending RabbitMQ messages.
@@ -45,10 +46,14 @@ namespace RabbitFlow.Services
 
         private readonly PublisherOptions publisherOptions;
 
+        private readonly ILogger<RabbitFlowPublisher> logger;
+
         private readonly object lockObject = new object();
 
-        public RabbitFlowPublisher(ConnectionFactory connectionFactory, PublisherOptions? publisherOptions = null, JsonSerializerOptions? jsonOptions = null)
+        public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherOptions? publisherOptions = null, JsonSerializerOptions? jsonOptions = null)
         {
+            this.logger = logger;
+
             this.connectionFactory = connectionFactory;
 
             this.jsonOptions = jsonOptions ?? new JsonSerializerOptions();
@@ -83,11 +88,13 @@ namespace RabbitFlow.Services
                     channel.BasicPublish(exchangeName, routingKey, props, body);
                 }
 
+                logger.LogInformation("Message of type: {messageType} was published.", typeof(TEvent).FullName);
+
                 return Task.FromResult(true);
             }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine("[RABBIT-FLOW]: Error publishing a message");
+                logger.LogError(ex, "[RABBIT-FLOW]: Error publishing a message");
 
                 throw;
             }
@@ -130,11 +137,13 @@ namespace RabbitFlow.Services
                     channel.BasicPublish("", queueName, props, body); // Empty string for exchange name
                 }
 
+                logger.LogInformation("Message of type: {messageType} was published.", typeof(TEvent).FullName);
+
                 return Task.FromResult(true);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                Console.WriteLine("[RABBIT-FLOW]: Error publishing a message");
+                logger.LogError(ex, "[RABBIT-FLOW]: Error publishing a message");
 
                 throw;
             }
