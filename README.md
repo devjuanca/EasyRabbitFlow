@@ -5,33 +5,32 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
 ### Table of Contents
 
 1. [Introduction](#introduction)
-2. [Configuration](#installation)
+2. [Install](#install)
 3. [Configuration](#configuration)
    - [Host Configuration](#host-configuration)
    - [JSON Serialization Options](#json-serialization-options)
    - [Publisher Options](#publisher-options)
 4. [Consumers](#consumers)
-   - [Creating Consumers](#creating-consumers)
+   - [Adding Consumers](#adding-consumers)
    - [Retry Policies](#retry-policies)
-   - [Consumer Interface](#consumer-interface)
-5. [Use Consumers](#use-consumers)
+   - [Consumer Interface Implementation](#consumer-interface-implementation)
+5. [Initialize Consumers](#initialize-consumers)
 6. [Publishing Messages](#publishing-messages)
-7. [Other Services](#other-services)
-8. [Configure Temporary Queues](#configure-temporary-queues)
+7. [Queue State](#queue-state)
 
 
 ### 1. Introduction
 
-RabbitFlow is an intuitive library designed to simplify the management of RabbitMQ consumers in your application. This documentation provides step-by-step instructions for setting up, configuring, and using RabbitFlow effectively in your projects.
+RabbitFlow is an intuitive library designed to simplify the management of RabbitMQ consumers within your application. This documentation provides step-by-step instructions for setting up, configuring, and using RabbitFlow effectively in your projects.
 
-RabbitFlow is specifically designed to handle two approaches, pre-defined exchanges and queues within RabbitMQ, as well as dynamically create new ones as needed. The rationale behind this approach is to provide flexibility in managing RabbitMQ infrastructure while also offering simplicity in usage.
+RabbitFlow is specifically designed to handle two approaches: pre-defined exchanges and queues within RabbitMQ, as well as the dynamic creation of new ones as needed. The rationale behind this approach is to offer flexibility in managing RabbitMQ infrastructure while maintaining simplicity in usage.
 
-Now, let's dive into the details of how to set up, configure, and use RabbitFlow effectively in your projects.
-### 2. Installation
+Now, let's dive into the details of setting up, configuring, and using RabbitFlow in your projects.
+### 2. Install
 
-To integrate the **RabbitFlow** library into your project, you can use the NuGet package manager:
+To install the **RabbitFlow** library into your project, you can use the NuGet package manager:
 
-```
+```bash
 dotnet add package EasyRabbitFlow
 ```
 
@@ -48,7 +47,7 @@ builder.Services.AddRabbitFlow(opt =>
         hostSettings.Password = "guest";
     });
 
-    // Configure JSON serialization options
+    // Configure JSON serialization options. [OPTIONAL]
     opt.ConfigureJsonSerializerOptions(jsonSettings =>
     {
         jsonSettings.PropertyNameCaseInsensitive = true;
@@ -56,8 +55,11 @@ builder.Services.AddRabbitFlow(opt =>
         jsonSettings.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
     });
 
+    // Configure Publisher. [OPTIONAL]
+    opt.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = false);
+
     // Add and configure consumers
-    // ...
+     settings.AddConsumer<TConsumer>(consumer=>{...});
 });
 ```
 
@@ -73,7 +75,7 @@ opt.ConfigureHost(hostSettings =>
 ```
 
 - #### 3.2 JSON Serialization Options
-To configure RabbitFlow in your application, use the AddRabbitFlow method:
+This option allows you to globally configure how JSON serialization should be handled. This configuration is optional; if not provided, the default JsonSerializerOptions will be used.
 ```csharp
 opt.ConfigureJsonSerializerOptions(jsonSettings =>
 {
@@ -82,18 +84,25 @@ opt.ConfigureJsonSerializerOptions(jsonSettings =>
     jsonSettings.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
 });
 ```
-Configuring JSON Serialization Options is optional, if no configuration is provided, the default options will be used.
+
 
 - #### 3.3 Publisher Options
-Optionally, you may configure the publisher that you intend to use by defining the 'DisposePublisherConnection' variable. This variable determines whether the connection established by the publisher with RabbitMQ should be kept alive or terminated upon the completion of the process.
-Default value is set to false.
+Optionally, you may configure the publisher that you intend to use by defining the 'DisposePublisherConnection' variable. 
+
+This variable determines whether the connection established by the publisher with RabbitMQ should be kept alive or terminated upon the completion of the process.
+The default value is false.
 ```csharp
  opt.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = true);
 ```
 
 ### 4. Consumers
-- #### 4.1 Creating Consumers
+- #### 4.1 Adding Consumers
 Define and configure consumers for specific queues using the AddConsumer method:
+
+All consumers must implement the interface `IRabbitFlowConsumer<TEvent>` where TEvent us the event or message model.
+
+Using the `AddConsumer` method, all required services and configurations will be created and registered into the DI container, ready for use.
+
 ```csharp
 opt.AddConsumer<EmailConsumer>("email-queue", consumerSettings =>
 {
@@ -115,7 +124,7 @@ opt.AddConsumer<EmailConsumer>("email-queue", consumerSettings =>
 #### 4.2 Retry Policies
 Configure a retry policy for handling message processing failures:
 
-```
+```csharp
 consumerSettings.ConfigureRetryPolicy(retryPolicy =>
 {
     retryPolicy.MaxRetryCount = 3;
@@ -123,10 +132,11 @@ consumerSettings.ConfigureRetryPolicy(retryPolicy =>
     retryPolicy.ExponentialBackoff = true;
     retryPolicy.ExponentialBackoffFactor = 2;
 });
-
 ```
 
-#### 4.3 Consumer Interface
+#### 4.3 Consumer Interface Implementation
+
+Consumers must implement the `IRabbitFlowConsumer<TEvent>` interface:
 
 ```csharp
 // Consumers must implement the IRabbitFlowConsumer<TEvent> interface:
@@ -159,43 +169,49 @@ public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 ```
 
 
-### 5. Use Consumers
-Use the UseConsumer extension method to efficiently process messages using registered consumers:
-```
-app.UseConsumer<EmailEvent, EmailConsumer>();
+### 5. Initialize Consumers
+Use the `InitializeConsumer` extension method to efficiently process messages using registered consumers.
 
-app.UseConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
+This method is an extension of `IServiceProvider`. It is intended for use when the application's ServiceProvider is already built, ensuring no second container is created to handle incoming messages.
+
+This method resolves all required services and configurations, starting the message listener for the queue.
+
+You can configure whether the consumer will be active and whether a new instance of the consumer should be created for each message. This ensures isolated processing in a scoped environment or a single instance for all incoming messages. Use this feature according to your needs.
+
+```
+var app = builder.Build();
+
+app.Services.InitializeConsumer<EmailEvent, EmailConsumer>();
+
+app.Services.InitializeConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
 {
     opt.PerMessageInstance = true;
     opt.Active = false;
 });
 ```
-####  Options
-Use the ConsumerRegisterSettings class to configure the middleware:
-
-- Active: If set to true, the middleware will be enabled. If set to false, the middleware will be disabled, meaning the consumer won't process any message from the queue.
-- PerMessageInstance: If set to true, a new instance of the consumer service handler will be created for each message. If set to false, the same instance of the service will be used for all messages.
-If set tu false every service injected in the consumer should be Singleton.
-Default is set to false.
 
 ### 6. Publishing Messages
 Publisher Interface
 
-Use the IRabbitFlowPublisher interface to publish messages to a RabbitMQ exchange:
+Use the IRabbitFlowPublisher interface to publish messages to a RabbitMQ:
+
+`JsonSerializerOptions` can be overridden from global settings.
+
+The `publisherId` parameter is intended to identify the connection created with RabbitMQ.
+
 ```csharp
 public interface IRabbitFlowPublisher
 {
-  Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
+    Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
 
-  Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
+    Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
 }
 
 ```
 
 ### 7. Queue State
-Queue State Interface
+The `IRabbitFlowState` interface allows you to access queue status information:
 
-The IRabbitFlowState interface provides methods to query queue status:
 ```csharp
 public interface IRabbitFlowState
 {
