@@ -122,7 +122,11 @@ opt.AddConsumer<EmailConsumer>("email-queue", consumerSettings =>
 ```
 
 #### 4.2 Retry Policies
-Configure a retry policy for handling message processing failures:
+You can configure a retry policy to handle message processing failures effectively. 
+
+By default, all exceptions related to timeout issues will be automatically retried if the retry mechanism is enabled.
+
+Additionally, you can customize the retry logic by defining your own rules for handling specific use cases using the `TranscientException`  class from the `EasyRabbitFlow.Exceptions` namespace.
 
 ```csharp
 consumerSettings.ConfigureRetryPolicy(retryPolicy =>
