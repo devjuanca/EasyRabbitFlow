@@ -15,5 +15,26 @@
         /// </summary>
 
         public bool DisposePublisherConnection { get; set; } = false;
+
+
+        /// <summary>
+        /// Gets or sets the mode in which the RabbitMQ channel will operate.
+        /// This property determines how messages are confirmed after being published.
+        /// <list type="bullet">
+        /// <item><c>Transactional</c>: The channel will operate in transactional mode, where messages are only considered published after a transaction is committed. This ensures reliability but can introduce performance overhead.</item>
+        /// <item><c>Confirm</c>: The channel will use publisher confirms, where the broker sends a confirmation to indicate that the message was received. This mode offers a balance between reliability and performance.</item>
+        /// </list>
+        /// Default value is <c>Confirm</c>.
+        /// </summary>
+        public ChannelMode ChannelMode { get; set; } = ChannelMode.Confirm;
+    }
+
+    /// <summary>
+    /// Specifies the mode in which the RabbitMQ channel operates for message publishing.
+    /// </summary>
+    public enum ChannelMode
+    {
+        Transactional,
+        Confirm
     }
 }

@@ -7,85 +7,105 @@ using System.Threading.Tasks;
 
 namespace EasyRabbitFlow.Services
 {
+
     /// <summary>
-    /// Represents a publisher for sending RabbitMQ messages.
+    /// Defines methods for publishing messages to RabbitMQ exchanges or queues.
     /// </summary>
     public interface IRabbitFlowPublisher
     {
         /// <summary>
-        /// Publishes a message to a RabbitMQ exchange asynchronously.
+        /// Asynchronously publishes a message to a RabbitMQ exchange.
         /// </summary>
         /// <typeparam name="TEvent">The type of the message to publish.</typeparam>
         /// <param name="message">The message to publish.</param>
         /// <param name="exchangeName">The name of the exchange to publish the message to.</param>
         /// <param name="routingKey">The routing key for the message.</param>
-        /// <param name="publisherId"/> Sets an identifier to the created connection.
-        /// <param name="jsonOptions">If set JsonSerializerOptions will be use over the one configured by default</param>
-        /// <returns>Boolean indicating if the message was published</returns>
-        Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
+        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
+        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="confirmModeTimeSpan">Optional timeout duration for waiting for message confirms in confirm mode.</param>
+        /// <returns>A task representing the asynchronous operation. The task result is <c>true</c> if the message was published successfully; otherwise, <c>false</c>.</returns>
+        Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null, TimeSpan? confirmModeTimeSpan = null) where TEvent : class;
+
 
         /// <summary>
-        /// Publishes a message to a RabbitMQ queue asynchronously.
+        /// Asynchronously publishes a message to a RabbitMQ queue.
         /// </summary>
-        /// <typeparam name="TEvent"></typeparam>
-        /// <param name="message"></param>
-        /// <param name="queueName"></param>
-        /// <param name="publisherId"/> Sets an identifier to the created connection.
-        /// <param name="jsonOptions">If set JsonSerializerOptions will be use over the one configured by default</param>
-        /// <returns>Boolean indicating if the message was published</returns>
-        Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
+        /// <typeparam name="TEvent">The type of the message to publish.</typeparam>
+        /// <param name="message">The message to publish.</param>
+        /// <param name="queueName">The name of the queue to publish the message to.</param>
+        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
+        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="confirmModeTimeSpan">Optional timeout duration for waiting for message confirms in confirm mode.</param>
+        /// <returns>A task representing the asynchronous operation. The task result is <c>true</c> if the message was published successfully; otherwise, <c>false</c>.</returns>
+        Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null, TimeSpan? confirmModeTimeSpan = null) where TEvent : class;
     }
 
     internal class RabbitFlowPublisher : IRabbitFlowPublisher
     {
         private readonly ConnectionFactory connectionFactory;
-
-        private IConnection? globalConnection = null;
-
         private readonly JsonSerializerOptions jsonOptions;
-
         private readonly PublisherOptions publisherOptions;
-
         private readonly ILogger<RabbitFlowPublisher> logger;
-
+        private IConnection? globalConnection;
         private readonly object lockObject = new object();
 
         public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherOptions? publisherOptions = null, JsonSerializerOptions? jsonOptions = null)
         {
-            this.logger = logger;
-
             this.connectionFactory = connectionFactory;
-
+            this.logger = logger;
             this.jsonOptions = jsonOptions ?? new JsonSerializerOptions();
-
             this.publisherOptions = publisherOptions ?? new PublisherOptions();
         }
 
-        public Task<bool> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null) where TEvent : class
+        public async Task<bool> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, TimeSpan? confirmModeTimeSpan = null) where TEvent : class
         {
+            return await PublishMessageAsync(@event, exchangeName, routingKey, publisherId, jsonSerializerOptions, isQueue: false, confirmModeTimeSpan);
+        }
+
+        public async Task<bool> PublishAsync<TEvent>(TEvent @event, string queueName, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, TimeSpan? confirmModeTimeSpan = null) where TEvent : class
+        {
+            return await PublishMessageAsync(@event, queueName, "", publisherId, jsonSerializerOptions, isQueue: true, confirmModeTimeSpan);
+        }
+
+        private Task<bool> PublishMessageAsync<TEvent>(TEvent @event, string destination, string routingKey, string publisherId, JsonSerializerOptions? jsonSerializerOptions, bool isQueue, TimeSpan? confirmModeTimeSpan = null) where TEvent : class
+        {
+            if (@event is null)
+            {
+                throw new ArgumentNullException(nameof(@event));
+            }
+
+            publisherId ??= isQueue ? destination : string.Concat(destination, "_", routingKey);
+
+            var connection = ResolveConnection(publisherId);
+
             var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+
+            using var channel = connection.CreateModel();
 
             try
             {
-                if (@event is null)
+                if (publisherOptions.ChannelMode == ChannelMode.Transactional)
                 {
-                    throw new ArgumentNullException(nameof(@event));
+                    channel.TxSelect();
+
+                    Publish(channel, @event, destination, routingKey, serializerOptions, isQueue);
+
+                    channel.TxCommit();
                 }
-
-                if (string.IsNullOrEmpty(publisherId))
+                else
                 {
-                    publisherId = string.Concat(exchangeName, "_", routingKey);
-                }
+                    channel.ConfirmSelect();
 
-                var connection = ResolveConnection(publisherId);
+                    Publish(channel, @event, destination, routingKey, serializerOptions, isQueue);
 
-                using (var channel = connection.CreateModel())
-                {
-                    ReadOnlyMemory<byte> body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
+                    confirmModeTimeSpan ??= TimeSpan.FromSeconds(5);
 
-                    var props = channel.CreateBasicProperties();
+                    bool result = channel.WaitForConfirms(confirmModeTimeSpan.Value, out bool timedOut);
 
-                    channel.BasicPublish(exchangeName, routingKey, props, body);
+                    if (timedOut)
+                    {
+                        return Task.FromResult(false);
+                    }
                 }
 
                 logger.LogInformation("Message of type: {messageType} was published.", typeof(TEvent).FullName);
@@ -94,65 +114,37 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
+                if (publisherOptions.ChannelMode == ChannelMode.Transactional)
+                {
+                    channel.TxRollback();
+                }
+
                 logger.LogError(ex, "[RABBIT-FLOW]: Error publishing a message");
 
-                throw;
+                return Task.FromResult(false);
             }
             finally
             {
-
                 if (publisherOptions.DisposePublisherConnection && globalConnection != null)
                 {
                     DisposeGlobalConnection();
                 }
-
             }
         }
 
-        public Task<bool> PublishAsync<TEvent>(TEvent @event, string queueName, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null) where TEvent : class
+        private void Publish<TEvent>(IModel channel, TEvent @event, string destination, string routingKey, JsonSerializerOptions serializerOptions, bool isQueue) where TEvent : class
         {
+            var body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
 
-            var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+            var props = channel.CreateBasicProperties();
 
-            try
+            if (isQueue)
             {
-                if (@event is null)
-                {
-                    throw new ArgumentNullException(nameof(@event));
-                }
-
-                if (string.IsNullOrEmpty(publisherId))
-                {
-                    publisherId = queueName;
-                }
-
-                var connection = ResolveConnection(publisherId);
-
-                using (var channel = connection.CreateModel())
-                {
-                    ReadOnlyMemory<byte> body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
-
-                    var props = channel.CreateBasicProperties();
-
-                    channel.BasicPublish("", queueName, props, body); // Empty string for exchange name
-                }
-
-                logger.LogInformation("Message of type: {messageType} was published.", typeof(TEvent).FullName);
-
-                return Task.FromResult(true);
+                channel.BasicPublish("", destination, props, body);
             }
-            catch (Exception ex)
+            else
             {
-                logger.LogError(ex, "[RABBIT-FLOW]: Error publishing a message");
-
-                throw;
-            }
-            finally
-            {
-                if (publisherOptions.DisposePublisherConnection && globalConnection != null)
-                {
-                    DisposeGlobalConnection();
-                }
+                channel.BasicPublish(destination, routingKey, props, body);
             }
         }
 
@@ -162,16 +154,10 @@ namespace EasyRabbitFlow.Services
             {
                 lock (lockObject)
                 {
-                    //double-checked locking pattern
                     globalConnection ??= connectionFactory.CreateConnection($"Publisher_{connectionId}");
                 }
-
-                return globalConnection;
             }
-            else
-            {
-                return globalConnection;
-            }
+            return globalConnection;
         }
 
         private void DisposeGlobalConnection()
@@ -179,9 +165,7 @@ namespace EasyRabbitFlow.Services
             lock (lockObject)
             {
                 globalConnection?.Close();
-
                 globalConnection?.Dispose();
-
                 globalConnection = null;
             }
         }

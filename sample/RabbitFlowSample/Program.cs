@@ -19,7 +19,12 @@ builder.Services.AddRabbitFlow(settings =>
         hostSettings.Port = 5672; // Default Port. OPTIONAL
     });
 
-    settings.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = false); // OPTIONAL
+    // OPTIONAL
+    settings.ConfigurePublisher(publisherSettings =>
+    {
+        publisherSettings.DisposePublisherConnection = false;
+        publisherSettings.ChannelMode = ChannelMode.Confirm;
+    });
 
     settings.AddConsumer<EmailConsumer>(queueName: "emails-test-queue", consumerSettings =>
     {
