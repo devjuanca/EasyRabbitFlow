@@ -58,18 +58,6 @@ builder.Services.AddRabbitFlow(settings =>
         });
     });
 
-    settings.AddConsumer<VolatileConsumer>("volatile-queue", consumerSettings =>
-    {
-        consumerSettings.AutoGenerate = true;
-
-        consumerSettings.ConfigureAutoGenerate(opt =>
-        {
-            opt.AutoDeleteQueue = true;
-            opt.DurableQueue = false;
-            opt.ExclusiveQueue = true;
-        });
-    });
-
 });
 
 var app = builder.Build();
@@ -81,7 +69,6 @@ app.Services.InitializeConsumer<NotificationEvent, WhatsAppConsumer>(opt =>
     opt.CreateNewInstancePerMessage = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer
 });
-
 
 app.UseHttpsRedirection();
 
@@ -98,23 +85,41 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
 
     }).ToArray();
 
-    rabbitFlowTemporary.RunAsync(events, async (@event) =>
+    rabbitFlowTemporary.RunAsync(events,
+       onMessageReceived: async @event =>
          {
-             logger.LogWarning("[{Timestamp}] - Procesando: {@e}", DateTime.Now, @event.Id);
+             logger.LogWarning("[{Timestamp}] - P1 Procesando: {@e}", DateTime.Now, @event.Id);
 
-             await Task.Delay((int)TimeSpan.FromSeconds(10).TotalMilliseconds);
+             await Task.Delay((int)TimeSpan.FromSeconds(5).TotalMilliseconds);
 
-             logger.LogWarning("[{Timestamp}] - Completado: {@e}", DateTime.Now, @event.Id);
+             logger.LogWarning("[{Timestamp}] - P1 Completado: {@e}", DateTime.Now, @event.Id);
 
          },
-            prefetchCount: 5,
-            onCompleted: (processed) =>
+        onCompleted: (totalProcessed, errors) =>
             {
-                logger.LogWarning("[{Timestamp}] - Se han completado: {processed}", DateTime.Now, processed);
+                logger.LogWarning("[{Timestamp}] - P1 Se han completado: {processed}", DateTime.Now, totalProcessed);
             },
-         cancellationToken: cancellationToken).ContinueWith(t =>
-         { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-});
+         prefetchCount: 5,
+         cancellationToken: cancellationToken)
+    .ContinueWith(t => { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 
+    rabbitFlowTemporary.RunAsync(events,
+     onMessageReceived: async @event =>
+     {
+         logger.LogWarning("[{Timestamp}] - P1 Procesando: {@e}", DateTime.Now, @event.Id);
+
+         await Task.Delay((int)TimeSpan.FromSeconds(5).TotalMilliseconds);
+
+         logger.LogWarning("[{Timestamp}] - P1 Completado: {@e}", DateTime.Now, @event.Id);
+
+     },
+      onCompleted: (totalProcessed, errors) =>
+      {
+          logger.LogWarning("[{Timestamp}] - P1 Se han completado: {processed}. Errors: {errors}", DateTime.Now, totalProcessed, errors);
+      },
+       prefetchCount: 5,
+       cancellationToken: cancellationToken)
+  .ContinueWith(t => { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+});
 
 app.Run();
