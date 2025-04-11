@@ -58,6 +58,18 @@ builder.Services.AddRabbitFlow(settings =>
         });
     });
 
+    settings.AddConsumer<VolatileConsumer>("volatile-queue", consumerSettings =>
+    {
+        consumerSettings.AutoGenerate = true;
+
+        consumerSettings.ConfigureAutoGenerate(opt =>
+        {
+            opt.AutoDeleteQueue = true;
+            opt.DurableQueue = false;
+            opt.ExclusiveQueue = true;
+        });
+    });
+
 });
 
 var app = builder.Build();
@@ -70,11 +82,33 @@ app.Services.InitializeConsumer<NotificationEvent, WhatsAppConsumer>(opt =>
     opt.Active = true; // if you want to disable this consumer
 });
 
+
 app.UseHttpsRedirection();
 
 app.MapPost("/notification", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
 {
     await publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "");
+});
+
+app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger, VolatileEvent emailEvent, CancellationToken cancellationToken) =>
+{
+    var events = Enumerable.Range(0, 10).Select(i => new VolatileEvent
+    {
+        Id = Guid.NewGuid()
+
+    }).ToArray();
+
+    rabbitFlowTemporary.RunAsync(events, async (@event) =>
+         {
+             logger.LogWarning("Procesando: {@e}", @event);
+
+             await Task.Delay((int)TimeSpan.FromSeconds(10).TotalMilliseconds);
+
+             logger.LogWarning("Completado: {@e}", @event);
+
+         },
+         cancellationToken: cancellationToken).ContinueWith(t =>
+         { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 });
 
 

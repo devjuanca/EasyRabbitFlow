@@ -28,6 +28,9 @@ namespace EasyRabbitFlow
 
             services.AddSingleton<IRabbitFlowState, RabbitFlowState>();
 
+            services.AddSingleton<IRabbitFlowTemporary, RabbitFlowTemporary>();
+
+
             return services;
         }
     }
