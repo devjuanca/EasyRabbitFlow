@@ -100,16 +100,17 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
 
     rabbitFlowTemporary.RunAsync(events, async (@event) =>
          {
-             logger.LogWarning("Procesando: {@e}", @event);
+             logger.LogWarning("[{Timestamp}] - Procesando: {@e}", DateTime.Now, @event.Id);
 
              await Task.Delay((int)TimeSpan.FromSeconds(10).TotalMilliseconds);
 
-             logger.LogWarning("Completado: {@e}", @event);
+             logger.LogWarning("[{Timestamp}] - Completado: {@e}", DateTime.Now, @event.Id);
 
          },
+            prefetchCount: 5,
             onCompleted: (processed) =>
             {
-                logger.LogWarning("Completado: {processed}", processed);
+                logger.LogWarning("[{Timestamp}] - Se han completado: {processed}", DateTime.Now, processed);
             },
          cancellationToken: cancellationToken).ContinueWith(t =>
          { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);

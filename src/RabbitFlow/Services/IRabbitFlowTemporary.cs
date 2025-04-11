@@ -17,10 +17,11 @@ public interface IRabbitFlowTemporary
     /// <typeparam name="T">Represents the type of messages being processed, constrained to reference types.</typeparam>
     /// <param name="messagesToPublish">Contains the collection of messages that will be processed asynchronously.</param>
     /// <param name="onMessage">Defines the asynchronous function to execute for each message in the collection.</param>
+    /// <param name="prefetchCount"></param>
     /// <param name="onCompleted">An optional action that is invoked when the processing of all messages is completed.</param>
     /// <param name="cancellationToken">Allows for the operation to be canceled if needed.</param>
     /// <returns>Returns a task that resolves to the count of messages processed.</returns>
-    Task<int> RunAsync<T>(IReadOnlyList<T> messagesToPublish, Func<T, Task> onMessage, Action<int>? onCompleted = null, CancellationToken cancellationToken = default) where T : class;
+    Task<int> RunAsync<T>(IReadOnlyList<T> messagesToPublish, Func<T, Task> onMessage, ushort prefetchCount = 1, Action<int>? onCompleted = null, CancellationToken cancellationToken = default) where T : class;
 }
 
 public class RabbitFlowTemporary : IRabbitFlowTemporary
@@ -39,6 +40,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
     public async Task<int> RunAsync<T>(
         IReadOnlyList<T> messagesToPublish,
         Func<T, Task> onMessage,
+        ushort prefetchCount = 1,
         Action<int>? onCompleted = null,
         CancellationToken cancellationToken = default) where T : class
     {
@@ -60,6 +62,8 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
         channel.QueueBind(_queue, _exchange, _routingKey);
 
+        channel.BasicQos(prefetchSize: 0, prefetchCount: prefetchCount, global: false);
+
         var processed = 0;
 
         var tcs = new TaskCompletionSource<bool>();
@@ -78,26 +82,33 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
                 {
                     await onMessage(message);
                 }
+
+
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[TempChannel] Error procesando mensaje.");
             }
 
-            Interlocked.Increment(ref processed);
+            finally
+            {
+                channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+            }
 
-            if (maxMessages > 0 && processed >= maxMessages)
+            if (Interlocked.Increment(ref processed) >= maxMessages)
             {
                 tcs.TrySetResult(true);
             }
         };
 
-        var consumerTag = channel.BasicConsume(_queue, autoAck: true, consumer);
+        var consumerTag = channel.BasicConsume(_queue, autoAck: false, consumer);
 
         foreach (var msg in messagesToPublish)
         {
             var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
+
             var props = channel.CreateBasicProperties();
+
             props.Persistent = false;
 
             channel.BasicPublish(_exchange, _routingKey, props, body);
