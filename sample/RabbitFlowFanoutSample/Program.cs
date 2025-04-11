@@ -107,6 +107,10 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
              logger.LogWarning("Completado: {@e}", @event);
 
          },
+            onCompleted: (processed) =>
+            {
+                logger.LogWarning("Completado: {processed}", processed);
+            },
          cancellationToken: cancellationToken).ContinueWith(t =>
          { }, cancellationToken, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 });
