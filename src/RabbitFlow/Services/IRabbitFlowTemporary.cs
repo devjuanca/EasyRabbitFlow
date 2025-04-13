@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using EasyRabbitFlow.Settings;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System;
@@ -7,37 +8,53 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using ExchangeType = RabbitMQ.Client.ExchangeType;
 
 
 public interface IRabbitFlowTemporary
 {
     /// <summary>
-    /// Executes an asynchronous operation on a list of messages, processing them with the provided function.
-    /// After processing, it publishes the messages to a temporary RabbitMQ exchange and acknowledges them.
+    /// Publishes a collection of messages to a temporary RabbitMQ exchange and consumes them asynchronously.
+    /// Each message is processed using the provided handler function, with support for cancellation and per-message timeout.
+    /// An optional completion callback can be invoked once all messages have been processed.
     /// </summary>
-    /// <typeparam name="T">The type of messages being processed, constrained to reference types.</typeparam>
-    /// <param name="messages">The collection of messages to be processed asynchronously.</param>
-    /// <param name="onMessageReceived">An asynchronous function that processes each message in the collection. It is called once for each message received from the queue.</param>
-    /// <param name="prefetchCount">The number of messages to prefetch at once. Determines how many messages the consumer will fetch from the queue before processing the next batch.</param>
+    /// <typeparam name="T">The type of messages to process. Must be a reference type.</typeparam>
+    /// <param name="messages">The collection of messages to publish and process.</param>
+    /// <param name="onMessageReceived">
+    /// An asynchronous function invoked for each received message.
+    /// Supports cancellation via the provided <see cref="CancellationToken"/>.
+    /// </param>
     /// <param name="onCompleted">
-    /// An optional action that is invoked after all messages have been processed. 
+    /// An optional callback executed after all messages have been processed.
     /// <br/>
     /// <ul>
     /// <li><b>First parameter:</b> The number of successfully processed messages.</li>
-    /// <br/>
-    /// <li><b>Second parameter:</b> The number of messages that resulted in an error.</li>
+    /// <li><b>Second parameter:</b> The number of messages that encountered errors.</li>
     /// </ul>
     /// </param>
-    /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation if needed.</param>
-    /// <returns>Returns a task that resolves to the number of messages that were successfully processed.</returns>
-    /// <remarks>
-    /// This method processes each message asynchronously, acknowledging each one after processing.
-    /// Once all messages are processed, the onCompleted action (if provided) is executed with two integers:
-    /// the number of successfully processed messages and the number of messages that encountered errors.
-    /// The method ensures that the messages are processed in the order they were published, and each message is acknowledged after successful processing.
-    /// </remarks>
+    /// <param name="options">Optional configuration settings for the temporary queue behavior.</param>
+    /// <param name="cancellationToken">
+    /// A token that can be used to cancel the overall operation early. This will cancel the consumption process and stop waiting for message completion.
+    /// <br/>
+    /// <b>When triggered, it will:</b>
+    /// <ul>
+    ///   <li>Abort waiting for all messages to be processed.</li>
+    ///   <li>Cancel any in-progress message handlers.</li>
+    ///   <li>Stop consuming further messages from the temporary queue.</li>
+    /// </ul>
+    /// This token is typically used to propagate shutdown signals or client-side timeouts.
+    /// <br/><br/>
+    /// <b>If no cancellation token is provided:</b>
+    /// <ul>
+    ///   <li>The process will continue running until all messages are processed from the queue.</li>
+    ///   <li>A per-message timeout (if configured via <see cref="RunTemporaryOptions.Timeout"/>) will still apply using an internal cancellation token for each message handler.</li>
+    /// </ul>
+    /// </param>
 
-    Task<int> RunAsync<T>(IReadOnlyList<T> messages, Func<T, Task> onMessageReceived, Action<int, int>? onCompleted = null, ushort prefetchCount = 1, CancellationToken cancellationToken = default) where T : class;
+    /// <returns>The number of successfully processed messages.</returns>
+
+    Task<int> RunAsync<T>(IReadOnlyList<T> messages, Func<T, CancellationToken, Task> onMessageReceived, Action<int, int>? onCompleted = null, RunTemporaryOptions? options = null, CancellationToken cancellationToken = default) where T : class;
+
 }
 
 public class RabbitFlowTemporary : IRabbitFlowTemporary
@@ -55,16 +72,30 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
     public async Task<int> RunAsync<T>(
         IReadOnlyList<T> messages,
-        Func<T, Task> onMessageReceived,
+        Func<T, CancellationToken, Task> onMessageReceived,
         Action<int, int>? onCompleted = null,
-        ushort prefetchCount = 1,
-        CancellationToken cancellationToken = default) where T : class
+        RunTemporaryOptions? options = null, CancellationToken cancellationToken = default) where T : class
     {
+        if (messages is null || messages.Count == 0)
+        {
+            return 0;
+        }
+
+        options ??= new RunTemporaryOptions();
+
+        var correlationId = options.CorrelationId;
+
+        var prefetchCount = options.Prefetch;
+
+        var timeout = options.Timeout;
+
+        var queuePrefixName = options.QueuePrefixName;
+
         var eventName = typeof(T).Name.ToLower();
 
         var _exchange = $"{eventName}-temp-exchange";
 
-        var _queue = $"{eventName}-temp-queue-{Guid.NewGuid():N}";
+        var _queue = $"{queuePrefixName ?? eventName}-temp-queue-{Guid.NewGuid():N}";
 
         var _routingKey = $"{eventName}-temp-routing-key";
 
@@ -98,18 +129,54 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
                 var message = JsonSerializer.Deserialize<T>(json);
 
-                if (message != null)
+                if (message is null)
                 {
-                    await onMessageReceived(message);
+                    _logger.LogWarning("[RabbitFlowTemporary] Message is null. CorrelationId: {correlationId}", correlationId);
+
+                    Interlocked.Increment(ref errors);
+
+                    return;
                 }
+
+                using var timeoutCts = timeout.HasValue ? new CancellationTokenSource(timeout.Value) : null;
+
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts?.Token ?? CancellationToken.None);
+
+                try
+                {
+                    await onMessageReceived(message, linkedCts.Token).ConfigureAwait(false);
+                }
+                catch (TaskCanceledException) when (timeoutCts != null && timeoutCts.Token.IsCancellationRequested)
+                {
+                    Interlocked.Increment(ref errors);
+
+                    _logger.LogError("[RabbitFlowTemporary] Message processing timed out after {Timeout}.  CorrelationId: {correlationId}", timeout, correlationId);
+                }
+                catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    Interlocked.Increment(ref errors);
+
+                    _logger.LogError("[RabbitFlowTemporary] Message processing was canceled by main Cancellation Token. CorrelationId: {correlationId}", correlationId);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    Interlocked.Increment(ref errors);
+                    _logger.LogError("[RabbitFlowTemporary] Message processing was canceled. CorrelationId: {correlationId}", correlationId);
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref errors);
+
+                    _logger.LogError(ex, "[RabbitFlowTemporary] Error while processing the message.  CorrelationId: {correlationId}", correlationId);
+                }
+
             }
             catch (Exception ex)
             {
-                errors++;
+                Interlocked.Increment(ref errors);
 
-                _logger.LogError(ex, "[RabbitFlowTemporary] Error while processing the message.");
+                _logger.LogError(ex, "[RabbitFlowTemporary] Error while processing the message. CorrelationId: {correlationId}", correlationId);
             }
-
             finally
             {
                 if (channel.IsOpen)
@@ -128,20 +195,45 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
         foreach (var msg in messages)
         {
-            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
+            try
+            {
+                var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
 
-            var props = channel.CreateBasicProperties();
+                var props = channel.CreateBasicProperties();
 
-            props.Persistent = false;
+                props.Persistent = false;
 
-            channel.BasicPublish(_exchange, _routingKey, props, body);
+                channel.BasicPublish(_exchange, _routingKey, props, body);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref errors);
+
+                _logger.LogError(ex, "[RabbitFlowTemporary] Error publishing message to exchange. CorrelationId: {correlationId}", correlationId);
+            }
         }
 
-        using var reg = cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
+        using var _ = cancellationToken.Register(() =>
+        {
+            tcs.TrySetCanceled(cancellationToken);
+        });
 
-        await tcs.Task;
-
-        channel.BasicCancel(consumerTag);
+        try
+        {
+            await tcs.Task.ConfigureAwait(false);
+        }
+        catch (TaskCanceledException)
+        {
+            _logger.LogError("[RabbitFlowTemporary] Task was canceled by main Cancellation Token. CorrelationId: {correlationId}", correlationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[RabbitFlowTemporary] Error while waiting for messages to be processed. CorrelationId: {correlationId}", correlationId);
+        }
+        finally
+        {
+            channel.BasicCancel(consumerTag);
+        }
 
         try
         {
@@ -149,9 +241,10 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[RabbitFlowTemporary] Error while executing the onCompleted callback.");
+            _logger.LogError(ex, "[RabbitFlowTemporary:{CorrelationId}] Error while processing the message.", correlationId);
         }
 
         return processed;
     }
+
 }
