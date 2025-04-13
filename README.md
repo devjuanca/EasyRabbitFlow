@@ -17,6 +17,7 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
 5. [Initialize Consumers](#initialize-consumers)
 6. [Publishing Messages](#publishing-messages)
 7. [Queue State](#queue-state)
+8. [Temporary Queue Processing](#temporary-message-processing)
 
 
 ### 1. Introduction
@@ -226,3 +227,88 @@ public interface IRabbitFlowState
 }
 
 ```
+
+### 8. Temporary Message Processing
+
+`IRabbitFlowTemporary` is a utility designed to simplify **fire-and-forget style workflows** where a batch of messages is sent to RabbitMQ, processed by handlers, and discarded — all within a **temporary queue**.
+
+This is ideal for:
+- **Background jobs** that need to process large collections of data (e.g., generating PDFs, sending emails, calculating reports), where you want to **free up the main thread or HTTP request quickly** and continue processing in the background.
+- **Ephemeral tasks** that don't need long-term queues or persistent consumers.
+- **One-time batch processing**, such as database cleanup, syncing remote systems, or running onboarding flows.
+
+This approach lets you **publish the work and return immediately**, while the internal RabbitMQ mechanism ensures each message is processed asynchronously and independently — with timeout and cancellation support.
+
+---
+
+### ✨ How It Works
+
+- A **temporary, exclusive queue** and exchange are created automatically for the message type.
+- All messages are published to this queue and immediately consumed by an internal async handler.
+- The temporary queue and exchange are deleted automatically after the process completes.
+- You can specify:
+  - Per-message timeout.
+  - Degree of parallelism via prefetch.
+  - A callback on completion.
+  - A global cancellation token.
+
+---
+
+### 🔧 API Overview
+
+```csharp
+Task<int> RunAsync<T>(
+    IReadOnlyList<T> messages,
+    Func<T, CancellationToken, Task> onMessageReceived,
+    Action<int, int>? onCompleted = null,
+    RunTemporaryOptions? options = null,
+    CancellationToken cancellationToken = default
+) where T : class;
+```
+
+Sample
+```csharp
+public record InvoiceToProcess(string InvoiceId, decimal Amount);
+
+public class InvoiceService
+{
+    private readonly IRabbitFlowTemporary _rabbitFlow;
+
+    public InvoiceService(IRabbitFlowTemporary rabbitFlow)
+    {
+        _rabbitFlow = rabbitFlow;
+    }
+
+    public async Task StartBatchProcessingAsync(List<InvoiceToProcess> invoices)
+    {
+        _ = _rabbitFlow.RunAsync(
+            invoices,
+            async (invoice, ct) =>
+            {
+                Console.WriteLine($"Processing invoice {invoice.InvoiceId}...");
+
+                // Simulate long-running processing
+                await Task.Delay(1000, ct);
+
+                // You could do: Save to DB, call APIs, generate PDFs, etc.
+                Console.WriteLine($"Finished invoice {invoice.InvoiceId}");
+            },
+            onCompleted: (success, errors) =>
+            {
+                Console.WriteLine($"Invoice batch complete. ✅ {success}, ❌ {errors}");
+            },
+            options: new RunTemporaryOptions
+            {
+                Timeout = TimeSpan.FromSeconds(5),
+                Prefetch = 5,
+                QueuePrefixName = "invoice",
+                CorrelationId = Guid.NewGuid().ToString()
+            }
+        );
+
+        Console.WriteLine("Batch dispatch complete — processing will continue in background.");
+    }
+}
+
+```
+
