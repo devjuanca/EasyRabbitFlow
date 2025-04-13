@@ -17,7 +17,7 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
 5. [Initialize Consumers](#initialize-consumers)
 6. [Publishing Messages](#publishing-messages)
 7. [Queue State](#queue-state)
-8. [Temporary Queue Processing](#Temporary Message Processing with `IRabbitFlowTemporary`)
+8. [Temporary Queue Processing](#temporary-message-processing)
 
 
 ### 1. Introduction
@@ -228,7 +228,7 @@ public interface IRabbitFlowState
 
 ```
 
-### 8. Temporary Message Processing with `IRabbitFlowTemporary`
+### 8. Temporary Message Processing
 
 `IRabbitFlowTemporary` is a utility designed to simplify **fire-and-forget style workflows** where a batch of messages is sent to RabbitMQ, processed by handlers, and discarded — all within a **temporary queue**.
 
