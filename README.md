@@ -17,6 +17,7 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
 5. [Initialize Consumers](#initialize-consumers)
 6. [Publishing Messages](#publishing-messages)
 7. [Queue State](#queue-state)
+8. [Temporary Queue Processing](#Temporary Message Processing with `IRabbitFlowTemporary`)
 
 
 ### 1. Introduction
@@ -226,3 +227,39 @@ public interface IRabbitFlowState
 }
 
 ```
+
+### 8. Temporary Message Processing with `IRabbitFlowTemporary`
+
+`IRabbitFlowTemporary` is a utility designed to simplify **fire-and-forget style workflows** where a batch of messages is sent to RabbitMQ, processed by handlers, and discarded — all within a **temporary queue**.
+
+This is ideal for:
+- Testing or debugging pipelines.
+- One-time batch processing jobs.
+- Ephemeral tasks that don’t require long-term persistence or consumer infrastructure.
+
+---
+
+### ✨ How It Works
+
+- A **temporary, exclusive queue** and exchange are created automatically for the message type.
+- All messages are published to this queue and immediately consumed by an internal async handler.
+- The temporary queue and exchange are deleted automatically after the process completes.
+- You can specify:
+  - Per-message timeout.
+  - Degree of parallelism via prefetch.
+  - A callback on completion.
+  - A global cancellation token.
+
+---
+
+### 🔧 API Overview
+
+```csharp
+Task<int> RunAsync<T>(
+    IReadOnlyList<T> messages,
+    Func<T, CancellationToken, Task> onMessageReceived,
+    Action<int, int>? onCompleted = null,
+    RunTemporaryOptions? options = null,
+    CancellationToken cancellationToken = default
+) where T : class;
+
