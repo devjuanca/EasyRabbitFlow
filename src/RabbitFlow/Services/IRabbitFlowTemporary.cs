@@ -85,7 +85,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var correlationId = options.CorrelationId;
 
-        var prefetchCount = options.Prefetch;
+        var prefetchCount = options.PrefetchCount;
 
         var timeout = options.Timeout;
 

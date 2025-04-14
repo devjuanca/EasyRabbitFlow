@@ -100,7 +100,7 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
 
             }, new RunTemporaryOptions
             {
-                Prefetch = 1,
+                PrefetchCount = 1,
                 Timeout = TimeSpan.FromSeconds(30),
                 QueuePrefixName = "volatile",
             }, cancellationToken: CancellationToken.None)

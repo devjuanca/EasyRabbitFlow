@@ -16,7 +16,7 @@ namespace EasyRabbitFlow.Settings
         /// The number of unacknowledged messages that can be pre-fetched by the consumer at a time.
         /// Default is 1.
         /// </summary>
-        public ushort Prefetch { get; set; } = 1;
+        public ushort PrefetchCount { get; set; } = 1;
 
         /// <summary>
         /// Optional timeout duration applied to the processing of each individual message.
@@ -29,5 +29,4 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         public string? QueuePrefixName { get; set; }
     }
-
 }
