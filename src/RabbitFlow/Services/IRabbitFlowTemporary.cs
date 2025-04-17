@@ -57,7 +57,7 @@ public interface IRabbitFlowTemporary
 
 }
 
-public class RabbitFlowTemporary : IRabbitFlowTemporary
+internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 {
     private readonly ConnectionFactory _connectionFactory;
 

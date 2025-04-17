@@ -9,17 +9,17 @@ namespace EasyRabbitFlow.Settings
     public class AutoGenerateSettings<TConsumer> where TConsumer : class
     {
         /// <summary>
-        /// Gets or sets a value indicating whether to generate an exchange.
+        /// Gets or sets a value indicating whether to generate an exchange. Default is true.
         /// </summary>
         public bool GenerateExchange { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating wether to generate and bind a deadletter queue.
+        /// Gets or sets a value indicating wether to generate and bind a deadletter queue. Default is true.
         /// </summary>
         public bool GenerateDeadletterQueue { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the type of exchange to be generated.
+        /// Gets or sets the type of exchange to be generated. Default is <see cref="ExchangeType.Direct"/>.
         /// </summary>
         public ExchangeType ExchangeType { get; set; } = ExchangeType.Direct;
 
@@ -34,27 +34,27 @@ namespace EasyRabbitFlow.Settings
         public string? RoutingKey { get; set; } = null;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the exchange should be durable.
+        /// Gets or sets a value indicating whether the exchange should be durable. Default is true.
         /// </summary>
         public bool DurableExchange { get; set; } = true;
 
         /// <summary>
-        /// Should this queue will survive a broker restart?
+        /// Should this queue will survive a broker restart? Default is true.
         /// </summary>
         public bool DurableQueue { get; set; } = true;
 
         /// <summary>
-        /// Should this queue use be limited to its declaring connection? Such a queue will be deleted when its declaring connection closes.
+        /// Should this queue use be limited to its declaring connection? Such a queue will be deleted when its declaring connection closes. Default is false.
         /// </summary>
         public bool ExclusiveQueue { get; set; } = false;
 
         /// <summary>
-        /// Should this queue be auto-deleted when its last consumer (if any) unsubscribes?
+        /// Should this queue be auto-deleted when its last consumer (if any) unsubscribes? Default is false.
         /// </summary>
         public bool AutoDeleteQueue { get; set; } = false;
 
         /// <summary>
-        /// Gets or sets additional arguments for the queue or exchange.
+        /// Gets or sets additional arguments for the queue or exchange. Default is null.
         /// </summary>
         public IDictionary<string, object?>? Args { get; set; } = null;
     }

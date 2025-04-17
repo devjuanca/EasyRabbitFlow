@@ -34,6 +34,8 @@ builder.Services.AddRabbitFlow(settings =>
 
         consumerSettings.AutoGenerate = true;
 
+        consumerSettings.ExtendDeadletterMessage = true;
+
         consumerSettings.ConfigureAutoGenerate(opt =>
         {
             opt.DurableQueue = true;
@@ -83,7 +85,7 @@ await app.Services.InitializeConsumerAsync<WhatsAppEvent, WhatsAppConsumer>(opt 
 
 app.UseHttpsRedirection();
 
-app.MapPost("/email", async (IRabbitFlowPublisher publisher, EmailEvent emailEvent, CancellationToken cancellationToken) =>
+app.MapPost("/email", async (IRabbitFlowPublisher publisher, IRabbitFlowPurger purger, EmailEvent emailEvent, CancellationToken cancellationToken) =>
 {
     await publisher.PublishAsync(emailEvent, queueName: "emails-test-queue", cancellationToken: cancellationToken);
 });

@@ -6,7 +6,7 @@
 		<Title>EasyRabbitFlow</Title>
 		<Authors>Juan Carlos Torres Cuervo</Authors>
 		<Description>EasyRabbitFlow - A streamlined .NET RabbitMQ client for seamless messaging integration, simplified configuration, and robust message handling.</Description>
-		<VersionPrefix>3.0.0</VersionPrefix>
+		<VersionPrefix>3.0.1</VersionPrefix>
 		<PackageTags>rabbitmq, .net, messaging</PackageTags>
 		<PackageProjectUrl>https://github.com/devjuanca/EasyRabbitFlow</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/devjuanca/EasyRabbitFlow</RepositoryUrl>

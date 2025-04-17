@@ -1,4 +1,5 @@
 ﻿using RabbitMQ.Client;
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -39,7 +40,7 @@ namespace EasyRabbitFlow.Services
         Task<bool> HasConsumersAsync(string queueName, CancellationToken cancellationToken = default);
     }
 
-    internal class RabbitFlowState : IRabbitFlowState
+    internal sealed class RabbitFlowState : IRabbitFlowState
     {
         private readonly ConnectionFactory _connectionFactory;
 
@@ -50,7 +51,7 @@ namespace EasyRabbitFlow.Services
 
         public async Task<uint> GetQueueLengthAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection", cancellationToken);
+            using var connection = await _connectionFactory.CreateConnectionAsync($"state-connection-{Guid.NewGuid():N}", cancellationToken);
 
             using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
@@ -60,7 +61,7 @@ namespace EasyRabbitFlow.Services
 
         public async Task<bool> IsEmptyQueueAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection", cancellationToken);
+            using var connection = await _connectionFactory.CreateConnectionAsync($"state-connection-{Guid.NewGuid():N}", cancellationToken);
 
             using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
@@ -71,7 +72,7 @@ namespace EasyRabbitFlow.Services
 
         public async Task<uint> GetConsumersCountAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync($"state-connection-{Guid.NewGuid():N}");
 
             using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
@@ -80,7 +81,7 @@ namespace EasyRabbitFlow.Services
 
         public async Task<bool> HasConsumersAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync($"state-connection-{Guid.NewGuid():N}");
 
             using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 

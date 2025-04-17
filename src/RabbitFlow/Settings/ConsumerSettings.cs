@@ -57,24 +57,29 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption in case of an error. Default value is false.
+        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption in case of an error. Default is false.
         /// </summary>
         public bool AutoAckOnError { get; set; } = false;
 
         /// <summary>
-        /// Gets or sets a value indicating whether to automatically generate necessary queue and exchange configurations.
+        /// Gets or sets a value indicating whether to automatically generate necessary queue and exchange configurations. Default is false.
         /// </summary>
         public bool AutoGenerate { get; set; } = false;
 
         /// <summary>
+        ///  Gets or sets a value indicating whether to extend the dead-letter message with exception details. Default is false.
+        /// </summary>
+        public bool ExtendDeadletterMessage { get; set; } = false;
+
+        /// <summary>
         /// Gets or sets the number of messages that the consumer can prefetch.
-        /// Prefetch count determines how many messages the consumer can hold in memory before processing them.
+        /// Prefetch count determines how many messages the consumer can hold in memory before processing them. Default is 1.
         /// </summary>
         public ushort PrefetchCount { get; set; } = 1;
 
 
         /// <summary>
-        /// Gets or sets the timeout duration for processing a single message.
+        /// Gets or sets the timeout duration for processing a single message. Default is 30 seconds.
         /// </summary>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 

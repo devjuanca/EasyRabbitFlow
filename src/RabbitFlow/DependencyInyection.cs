@@ -30,6 +30,7 @@ namespace EasyRabbitFlow
 
             services.AddSingleton<IRabbitFlowTemporary, RabbitFlowTemporary>();
 
+            services.AddSingleton<IRabbitFlowPurger, RabbitFlowPurger>();
 
             return services;
         }

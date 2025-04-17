@@ -55,6 +55,8 @@ namespace EasyRabbitFlow
 
             var consumerType = typeof(TConsumer);
 
+            string deadLetterQueueName = string.Empty;
+
             var consumerAbstraction = consumerType.GetInterfaces().FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>)) ??
                 throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<T> to be registered as a consumer.");
 
@@ -89,7 +91,7 @@ namespace EasyRabbitFlow
 
                 if (autoGenerateSettings.GenerateDeadletterQueue)
                 {
-                    var deadLetterQueueName = $"{queueName}-deadletter";
+                    deadLetterQueueName = $"{queueName}-deadletter";
 
                     var deadLetterExchange = $"{queueName}-deadletter-exchange";
 
@@ -201,7 +203,7 @@ namespace EasyRabbitFlow
                     }
                     catch (TaskCanceledException ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: Task was unexpectedly canceled while processing the message. This may indicate a timeout or other issue.");
 
@@ -209,7 +211,7 @@ namespace EasyRabbitFlow
                     }
                     catch (OperationCanceledException ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: Operation was unexpectedly canceled while processing the message. Investigate the root cause to determine if it's due to a timeout or cancellation token.");
 
@@ -225,7 +227,7 @@ namespace EasyRabbitFlow
                     }
                     catch (Exception ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler implementation is resilient.");
 
@@ -242,7 +244,7 @@ namespace EasyRabbitFlow
 
                     logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
 
-                    await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+                    await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, cancellationToken: cancellationToken);
 
                     if (customDeadletter != null)
                     {
@@ -284,7 +286,15 @@ namespace EasyRabbitFlow
             return cts.Token;
         }
 
-        private static async Task HandleErrorAsync(bool autoAck, IChannel channel, ulong deliveryTag, CancellationToken cancellationToken)
+        private static async Task HandleErrorAsync<TEventType>(
+            bool autoAck,
+            IChannel channel,
+            ulong deliveryTag,
+            bool extendDeadletterMessage = false,
+            string deadletterQueue = "",
+            TEventType? @event = null,
+            Exception? exception = null,
+            CancellationToken cancellationToken = default) where TEventType : class
         {
             if (autoAck)
             {
@@ -292,7 +302,26 @@ namespace EasyRabbitFlow
             }
             else
             {
-                await channel.BasicNackAsync(deliveryTag, false, false, cancellationToken);
+                if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
+                {
+                    var extendedMessage = new
+                    {
+                        messageType = typeof(TEventType).Name,
+                        messageData = @event,
+                        exceptionType = exception?.GetType().Name,
+                        errorMessage = exception?.Message,
+                        stackTrace = exception?.StackTrace,
+                        source = exception?.Source,
+                    };
+
+                    await channel.BasicPublishAsync(exchange: "", routingKey: deadletterQueue, body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage)), cancellationToken: cancellationToken);
+
+                    await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
+                }
+                else
+                {
+                    await channel.BasicNackAsync(deliveryTag, false, false, cancellationToken);
+                }
             }
         }
     }

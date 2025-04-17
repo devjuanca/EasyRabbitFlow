@@ -41,7 +41,7 @@ namespace EasyRabbitFlow.Services
         Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null, CancellationToken cancellationToken = default) where TEvent : class;
     }
 
-    internal class RabbitFlowPublisher : IRabbitFlowPublisher
+    internal sealed class RabbitFlowPublisher : IRabbitFlowPublisher
     {
         private readonly ConnectionFactory connectionFactory;
         private readonly JsonSerializerOptions jsonOptions;
