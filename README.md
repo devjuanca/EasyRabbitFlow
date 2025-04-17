@@ -300,7 +300,7 @@ public class InvoiceService
             options: new RunTemporaryOptions
             {
                 Timeout = TimeSpan.FromSeconds(5),
-                Prefetch = 5,
+                PrefetchCount = 5,
                 QueuePrefixName = "invoice",
                 CorrelationId = Guid.NewGuid().ToString()
             }
