@@ -27,9 +27,10 @@ namespace EasyRabbitFlow
         /// <typeparam name="TConsumer">The type of the consumer handling the event.</typeparam>
         /// <param name="serviceProvider">The service provider used to resolve dependencies.</param>
         /// <param name="settings">Optional settings for consumer registration.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>The service provider.</returns>
         /// <exception cref="Exception">Thrown if required services are not found in the service provider or if consumer interface contracts are violated.</exception>
-        public static IServiceProvider InitializeConsumer<TEventType, TConsumer>(this IServiceProvider serviceProvider, Action<ConsumerRegisterSettings>? settings = null) where TConsumer : class where TEventType : class
+        public static async Task<IServiceProvider> InitializeConsumerAsync<TEventType, TConsumer>(this IServiceProvider serviceProvider, Action<ConsumerRegisterSettings>? settings = null, CancellationToken cancellationToken = default) where TConsumer : class where TEventType : class
         {
             var consumer_settings = new ConsumerRegisterSettings();
 
@@ -66,13 +67,13 @@ namespace EasyRabbitFlow
 
             var connectionId = consumerOptions.ConsumerId ?? consumerOptions.QueueName;
 
-            var connection = factory.CreateConnection($"Consumer_{connectionId}");
+            var connection = await factory.CreateConnectionAsync($"Consumer_{connectionId}", cancellationToken);
 
-            var channel = connection.CreateModel();
+            var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
             channel.ContinuationTimeout = consumerOptions.Timeout;
 
-            channel.BasicQos(prefetchSize: 0, prefetchCount: consumerOptions.PrefetchCount, global: false);
+            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: consumerOptions.PrefetchCount, global: false, cancellationToken);
 
             if (consumerOptions.AutoGenerate)
             {
@@ -94,51 +95,43 @@ namespace EasyRabbitFlow
 
                     var deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
 
-                    channel.QueueDeclare(queue: deadLetterQueueName, durable: autoGenerateSettings.DurableQueue, exclusive: false, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: null);
+                    await channel.QueueDeclareAsync(queue: deadLetterQueueName, durable: autoGenerateSettings.DurableQueue, exclusive: false, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: null, cancellationToken: cancellationToken);
 
-                    channel.ExchangeDeclare(exchange: deadLetterExchange, type: "direct", durable: autoGenerateSettings.DurableExchange);
+                    await channel.ExchangeDeclareAsync(exchange: deadLetterExchange, type: "direct", durable: autoGenerateSettings.DurableExchange, cancellationToken: cancellationToken);
 
-                    channel.QueueBind(queue: deadLetterQueueName, exchange: deadLetterExchange, routingKey: deadLetterRoutingKey);
+                    await channel.QueueBindAsync(queue: deadLetterQueueName, exchange: deadLetterExchange, routingKey: deadLetterRoutingKey);
 
-                    if (args is null)
-                    {
-                        args = new Dictionary<string, object>
-                        {
-                            {"x-dead-letter-exchange", deadLetterExchange},
-                            {"x-dead-letter-routing-key", deadLetterRoutingKey}
-                        };
-                    }
-                    else
-                    {
-                        args.Add("x-dead-letter-exchange", deadLetterExchange);
-                        args.Add("x-dead-letter-routing-key", deadLetterRoutingKey);
-                    }
+                    args ??= new Dictionary<string, object?>();
+
+                    args["x-dead-letter-exchange"] = deadLetterExchange;
+
+                    args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
                 }
 
                 // Declare queue
-                channel.QueueDeclare(queue: queueName, durable: autoGenerateSettings.DurableQueue, exclusive: autoGenerateSettings.ExclusiveQueue, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: args);
+                await channel.QueueDeclareAsync(queue: queueName, durable: autoGenerateSettings.DurableQueue, exclusive: autoGenerateSettings.ExclusiveQueue, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: args);
 
                 if (autoGenerateSettings.GenerateExchange)
                 {
                     // Declare exchange
-                    channel.ExchangeDeclare(exchange: exchangeName, type: autoGenerateSettings.ExchangeType.ToString().ToLower(), durable: autoGenerateSettings.DurableExchange);
+                    await channel.ExchangeDeclareAsync(exchange: exchangeName, type: autoGenerateSettings.ExchangeType.ToString().ToLower(), durable: autoGenerateSettings.DurableExchange);
 
                     // Bind queue to exchange
-                    channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: routingKey);
+                    await channel.QueueBindAsync(queue: queueName, exchange: exchangeName, routingKey: routingKey);
                 }
             }
 
-            var rabbitConsumer = new EventingBasicConsumer(channel);
+            var rabbitConsumer = new AsyncEventingBasicConsumer(channel);
 
             object? consumerService = null;
 
-            rabbitConsumer.Received += async (sender, args) =>
+            rabbitConsumer.ReceivedAsync += async (sender, args) =>
             {
                 IServiceScope scope = default!;
 
                 using var cancelationSource = new CancellationTokenSource(channel.ContinuationTimeout);
 
-                var cancellationToken = cancelationSource.Token;
+                var ct = cancelationSource.Token;
 
                 try
                 {
@@ -188,45 +181,54 @@ namespace EasyRabbitFlow
                             throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer service does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>. This is likely due to a misconfiguration.");
                         }
 
-                        await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync((TEventType)@event, cancellationToken).ConfigureAwait(false);
+                        await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync((TEventType)@event, ct).ConfigureAwait(false);
 
-                        channel.BasicAck(args.DeliveryTag, false);
+                        await channel.BasicAckAsync(args.DeliveryTag, false);
 
                         break;
                     }
-                    catch (OperationCanceledException ex) when (ex.CancellationToken == cancellationToken)
+                    catch (OperationCanceledException ex) when (ex.CancellationToken == ct)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                        ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
 
                         retryCount--;
                     }
-                    catch (TaskCanceledException ex) when (ex.CancellationToken == cancellationToken)
+                    catch (TaskCanceledException ex) when (ex.CancellationToken == ct)
                     {
-                        cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                        ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
 
                         retryCount--;
                     }
                     catch (TaskCanceledException ex)
                     {
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+
                         logger.LogError(ex, "[RABBIT-FLOW]: Task was unexpectedly canceled while processing the message. This may indicate a timeout or other issue.");
+
                         break;
                     }
                     catch (OperationCanceledException ex)
                     {
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+
                         logger.LogError(ex, "[RABBIT-FLOW]: Operation was unexpectedly canceled while processing the message. Investigate the root cause to determine if it's due to a timeout or cancellation token.");
+
                         break;
                     }
                     catch (TranscientException ex)
                     {
                         if (shouldDelay)
                         {
-                            cancellationToken = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                            ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
                         }
                         retryCount--;
                     }
                     catch (Exception ex)
                     {
-                        logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler logic is resilient.");
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
+
+                        logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler implementation is resilient.");
+
                         break;
                     }
                     finally
@@ -240,15 +242,7 @@ namespace EasyRabbitFlow
 
                     logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
 
-                    if (consumerOptions.AutoAckOnError)
-                    {
-                        channel.BasicAck(args.DeliveryTag, false);
-
-                    }
-                    else
-                    {
-                        channel.BasicNack(args.DeliveryTag, false, false);
-                    }
+                    await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, cancellationToken);
 
                     if (customDeadletter != null)
                     {
@@ -263,12 +257,12 @@ namespace EasyRabbitFlow
                 }
             };
 
-            channel.BasicConsume(queue: consumerOptions.QueueName, autoAck: false, consumer: rabbitConsumer);
+            await channel.BasicConsumeAsync(queue: consumerOptions.QueueName, autoAck: false, consumer: rabbitConsumer, cancellationToken);
 
             return serviceProvider;
         }
 
-        public static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IModel channel, ILogger<TConsumer> logger) where TConsumer : class
+        private static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IChannel channel, ILogger<TConsumer> logger) where TConsumer : class
         {
             var maxRetryCount = retryPolicy.MaxRetryCount;
 
@@ -288,6 +282,18 @@ namespace EasyRabbitFlow
             using var cts = new CancellationTokenSource(channel.ContinuationTimeout);
 
             return cts.Token;
+        }
+
+        private static async Task HandleErrorAsync(bool autoAck, IChannel channel, ulong deliveryTag, CancellationToken cancellationToken)
+        {
+            if (autoAck)
+            {
+                await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
+            }
+            else
+            {
+                await channel.BasicNackAsync(deliveryTag, false, false, cancellationToken);
+            }
         }
     }
 }

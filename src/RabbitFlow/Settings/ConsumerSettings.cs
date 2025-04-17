@@ -57,9 +57,9 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption in case of an error.
+        /// Gets or sets a value indicating whether messages are automatically acknowledged after consumption in case of an error. Default value is false.
         /// </summary>
-        public bool AutoAckOnError { get; set; } = true;
+        public bool AutoAckOnError { get; set; } = false;
 
         /// <summary>
         /// Gets or sets a value indicating whether to automatically generate necessary queue and exchange configurations.

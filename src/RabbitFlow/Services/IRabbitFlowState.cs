@@ -1,4 +1,6 @@
 ﻿using RabbitMQ.Client;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace EasyRabbitFlow.Services
 {
@@ -8,29 +10,33 @@ namespace EasyRabbitFlow.Services
         /// Checks if a specific queue is empty.
         /// </summary>
         /// <param name="queueName">The name of the queue to check.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>True if the queue is empty, False if it contains messages.</returns>
-        bool IsEmptyQueue(string queueName);
+        Task<bool> IsEmptyQueueAsync(string queueName, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Gets the number of messages in a specific queue.
         /// </summary>
         /// <param name="queueName">The name of the queue to get the message count from.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>The number of messages in the queue.</returns>
-        uint GetQueueLength(string queueName);
+        Task<uint> GetQueueLengthAsync(string queueName, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Gets the number of consumers for a specific queue.
         /// </summary>
         /// <param name="queueName">The name of the queue to get the consumers count from.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>The number of consumers for the queue.</returns>
-        uint GetConsumersCount(string queueName);
+        Task<uint> GetConsumersCountAsync(string queueName, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Checks if a specific queue has consumers.
         /// </summary>
         /// <param name="queueName">The name of the queue to check.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>True if the queue has consumers, False otherwise.</returns>
-        bool QueueHasConsumers(string queueName);
+        Task<bool> HasConsumersAsync(string queueName, CancellationToken cancellationToken = default);
     }
 
     internal class RabbitFlowState : IRabbitFlowState
@@ -42,48 +48,45 @@ namespace EasyRabbitFlow.Services
             _connectionFactory = connectionFactory;
         }
 
-        public uint GetQueueLength(string queueName)
+        public async Task<uint> GetQueueLengthAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = _connectionFactory.CreateConnection("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection", cancellationToken);
 
-            using var channel = connection.CreateModel();
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            var queueInfo = channel.QueueDeclarePassive(queueName);
+            return await channel.MessageCountAsync(queueName, cancellationToken: cancellationToken);
 
-            return queueInfo.MessageCount;
         }
 
-        public bool IsEmptyQueue(string queueName)
+        public async Task<bool> IsEmptyQueueAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = _connectionFactory.CreateConnection("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection", cancellationToken);
 
-            using var channel = connection.CreateModel();
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            var queueInfo = channel.QueueDeclarePassive(queueName);
+            var messagesCount = await channel.MessageCountAsync(queueName, cancellationToken: cancellationToken);
 
-            return queueInfo.MessageCount == 0;
+            return messagesCount == 0;
         }
 
-        public uint GetConsumersCount(string queueName)
+        public async Task<uint> GetConsumersCountAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = _connectionFactory.CreateConnection("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection");
 
-            using var channel = connection.CreateModel();
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            var queueInfo = channel.QueueDeclarePassive(queueName);
-
-            return queueInfo.ConsumerCount;
+            return await channel.ConsumerCountAsync(queueName, cancellationToken: cancellationToken);
         }
 
-        public bool QueueHasConsumers(string queueName)
+        public async Task<bool> HasConsumersAsync(string queueName, CancellationToken cancellationToken = default)
         {
-            using var connection = _connectionFactory.CreateConnection("state-connection");
+            using var connection = await _connectionFactory.CreateConnectionAsync("state-connection");
 
-            using var channel = connection.CreateModel();
+            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            var queueInfo = channel.QueueDeclarePassive(queueName);
+            var consumersCount = await channel.ConsumerCountAsync(queueName, cancellationToken: cancellationToken);
 
-            return queueInfo.ConsumerCount > 0;
+            return consumersCount > 0;
         }
 
     }

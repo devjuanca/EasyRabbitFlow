@@ -56,7 +56,7 @@ namespace EasyRabbitFlow.Settings
         /// <summary>
         /// Gets or sets additional arguments for the queue or exchange.
         /// </summary>
-        public IDictionary<string, object>? Args { get; set; } = null;
+        public IDictionary<string, object?>? Args { get; set; } = null;
     }
 
     /// <summary>

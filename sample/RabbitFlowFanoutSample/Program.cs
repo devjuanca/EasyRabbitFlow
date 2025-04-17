@@ -62,9 +62,9 @@ builder.Services.AddRabbitFlow(settings =>
 
 var app = builder.Build();
 
-app.Services.InitializeConsumer<NotificationEvent, EmailConsumer>();
+await app.Services.InitializeConsumerAsync<NotificationEvent, EmailConsumer>();
 
-app.Services.InitializeConsumer<NotificationEvent, WhatsAppConsumer>(opt =>
+await app.Services.InitializeConsumerAsync<NotificationEvent, WhatsAppConsumer>(opt =>
 {
     opt.CreateNewInstancePerMessage = true; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer

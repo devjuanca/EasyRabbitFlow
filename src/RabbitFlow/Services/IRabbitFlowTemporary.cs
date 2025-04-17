@@ -99,19 +99,19 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var _routingKey = $"{eventName}-temp-routing-key";
 
-        using var connection = _connectionFactory.CreateConnection($"{_queue}");
+        using var connection = await _connectionFactory.CreateConnectionAsync($"{_queue}", cancellationToken);
 
-        using var channel = connection.CreateModel();
+        using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
         var maxMessages = messages.Count;
 
-        channel.ExchangeDeclare(_exchange, ExchangeType.Direct, durable: false, autoDelete: true);
+        await channel.ExchangeDeclareAsync(_exchange, ExchangeType.Direct, durable: false, autoDelete: true, cancellationToken: cancellationToken);
 
-        channel.QueueDeclare(_queue, durable: false, exclusive: true, autoDelete: true);
+        await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, cancellationToken: cancellationToken);
 
-        channel.QueueBind(_queue, _exchange, _routingKey);
+        await channel.QueueBindAsync(_queue, _exchange, _routingKey);
 
-        channel.BasicQos(prefetchSize: 0, prefetchCount: prefetchCount, global: false);
+        await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetchCount, global: false, cancellationToken: cancellationToken);
 
         var processed = 0;
 
@@ -119,9 +119,9 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var tcs = new TaskCompletionSource<bool>();
 
-        var consumer = new EventingBasicConsumer(channel);
+        var consumer = new AsyncEventingBasicConsumer(channel);
 
-        consumer.Received += async (model, ea) =>
+        consumer.ReceivedAsync += async (model, ea) =>
         {
             try
             {
@@ -181,7 +181,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 if (channel.IsOpen)
                 {
-                    channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                    await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
                 }
             }
 
@@ -191,7 +191,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
             }
         };
 
-        var consumerTag = channel.BasicConsume(_queue, autoAck: false, consumer);
+        var consumerTag = await channel.BasicConsumeAsync(_queue, autoAck: false, consumer);
 
         foreach (var msg in messages)
         {
@@ -199,11 +199,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
 
-                var props = channel.CreateBasicProperties();
-
-                props.Persistent = false;
-
-                channel.BasicPublish(_exchange, _routingKey, props, body);
+                await channel.BasicPublishAsync(_exchange, _routingKey, body);
             }
             catch (Exception ex)
             {
@@ -232,7 +228,7 @@ public class RabbitFlowTemporary : IRabbitFlowTemporary
         }
         finally
         {
-            channel.BasicCancel(consumerTag);
+            await channel.BasicCancelAsync(consumerTag, cancellationToken: cancellationToken);
         }
 
         try

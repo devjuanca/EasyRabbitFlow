@@ -45,7 +45,7 @@ builder.Services.AddRabbitFlow(settings =>
         });
         consumerSettings.ConfigureRetryPolicy(retryPolicy =>
         {
-            retryPolicy.MaxRetryCount = 3;
+            retryPolicy.MaxRetryCount = 2;
             retryPolicy.RetryInterval = 1000;
             retryPolicy.ExponentialBackoff = true;
             retryPolicy.ExponentialBackoffFactor = 2;
@@ -72,24 +72,25 @@ builder.Services.AddRabbitFlow(settings =>
 
 var app = builder.Build();
 
-app.Services.InitializeConsumer<EmailEvent, EmailConsumer>();
+await app.Services.InitializeConsumerAsync<EmailEvent, EmailConsumer>(cancellationToken: app.Lifetime.ApplicationStopping);
 
-app.Services.InitializeConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
+await app.Services.InitializeConsumerAsync<WhatsAppEvent, WhatsAppConsumer>(opt =>
 {
     opt.CreateNewInstancePerMessage = false; // A new scope of services is created. Required if you are using Scoped or Transcient services.
     opt.Active = true; // if you want to disable this consumer
-});
+
+}, cancellationToken: app.Lifetime.ApplicationStopping);
 
 app.UseHttpsRedirection();
 
-app.MapPost("/email", async (IRabbitFlowPublisher publisher, EmailEvent emailEvent) =>
+app.MapPost("/email", async (IRabbitFlowPublisher publisher, EmailEvent emailEvent, CancellationToken cancellationToken) =>
 {
-    await publisher.PublishAsync(emailEvent, queueName: "emails-test-queue");
+    await publisher.PublishAsync(emailEvent, queueName: "emails-test-queue", cancellationToken: cancellationToken);
 });
 
-app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, WhatsAppEvent whatsAppEvent) =>
+app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, WhatsAppEvent whatsAppEvent, CancellationToken cancellationToken) =>
 {
-    await publisher.PublishAsync(whatsAppEvent, queueName: "whatsapps-test-queue");
+    await publisher.PublishAsync(whatsAppEvent, queueName: "whatsapps-test-queue", cancellationToken: cancellationToken);
 });
 
 app.Run();
