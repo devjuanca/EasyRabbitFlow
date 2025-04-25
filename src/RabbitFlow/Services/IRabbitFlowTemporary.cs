@@ -95,11 +95,11 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var eventName = typeof(T).Name.ToLower();
 
-        var _exchange = $"{eventName}-temp-exchange-{executionId}";
+        var _exchange = $"{queuePrefixName ?? eventName}-temp-exchange-{executionId}";
 
         var _queue = $"{queuePrefixName ?? eventName}-temp-queue-{executionId}";
 
-        var _routingKey = $"{eventName}-temp-routing-key-{executionId}";
+        var _routingKey = $"{queuePrefixName ?? eventName}-temp-routing-key-{executionId}";
 
         using var connection = await _connectionFactory.CreateConnectionAsync($"{_queue}", cancellationToken);
 
