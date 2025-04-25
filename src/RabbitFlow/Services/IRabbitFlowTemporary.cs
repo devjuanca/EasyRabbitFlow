@@ -8,7 +8,6 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using ExchangeType = RabbitMQ.Client.ExchangeType;
 
 
 public interface IRabbitFlowTemporary
@@ -95,11 +94,7 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var eventName = typeof(T).Name.ToLower();
 
-        var _exchange = $"{queuePrefixName ?? eventName}-temp-exchange-{executionId}";
-
         var _queue = $"{queuePrefixName ?? eventName}-temp-queue-{executionId}";
-
-        var _routingKey = $"{queuePrefixName ?? eventName}-temp-routing-key-{executionId}";
 
         using var connection = await _connectionFactory.CreateConnectionAsync($"{_queue}", cancellationToken);
 
@@ -107,11 +102,7 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var maxMessages = messages.Count;
 
-        await channel.ExchangeDeclareAsync(_exchange, ExchangeType.Direct, durable: false, autoDelete: true, cancellationToken: cancellationToken);
-
         await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, cancellationToken: cancellationToken);
-
-        await channel.QueueBindAsync(_queue, _exchange, _routingKey);
 
         await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetchCount, global: false, cancellationToken: cancellationToken);
 
@@ -201,7 +192,7 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
 
-                await channel.BasicPublishAsync(_exchange, _routingKey, body);
+                await channel.BasicPublishAsync("", _queue, body);
             }
             catch (Exception ex)
             {

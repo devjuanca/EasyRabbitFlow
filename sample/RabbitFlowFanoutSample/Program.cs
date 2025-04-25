@@ -85,6 +85,12 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
 
     }).ToArray();
 
+    var events2 = Enumerable.Range(0, 5).Select(i => new VolatileEvent
+    {
+        Id = Guid.NewGuid()
+
+    }).ToArray();
+
 
     rabbitFlowTemporary.RunAsync(events, onMessageReceived: async (@event, ct) =>
          {
@@ -105,6 +111,26 @@ app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Prog
                 QueuePrefixName = "volatile",
             }, cancellationToken: CancellationToken.None)
     .ContinueWith(t => { }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
+    rabbitFlowTemporary.RunAsync(events2, onMessageReceived: async (@event, ct) =>
+    {
+        logger.LogWarning("[{Timestamp}] - P2 Procesando: {@e}", DateTime.Now, @event.Id);
+
+        await Task.Delay((int)TimeSpan.FromSeconds(20).TotalMilliseconds, ct);
+
+        logger.LogWarning("[{Timestamp}] - P2 Completado: {@e}", DateTime.Now, @event.Id);
+
+    }, onCompleted: (totalProcessed, errors) =>
+    {
+        logger.LogWarning("[{Timestamp}] - P2 Se han completado: {processed}", DateTime.Now, totalProcessed);
+
+    }, new RunTemporaryOptions
+    {
+        PrefetchCount = 1,
+        Timeout = TimeSpan.FromSeconds(30),
+        QueuePrefixName = "volatile",
+    }, cancellationToken: CancellationToken.None)
+.ContinueWith(t => { }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 
 });
 

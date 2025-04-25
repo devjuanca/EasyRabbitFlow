@@ -19,8 +19,6 @@ public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 
     public Task HandleAsync(EmailEvent message, CancellationToken cancellationToken)
     {
-        throw new NotImplementedException("This is a test consumer. You can implement your logic here.");
-
         _logger.LogInformation("New email event received. Event:{event}. Id: {id}", JsonSerializer.Serialize(message), _guidSevice.Guid);
 
         return Task.CompletedTask;
