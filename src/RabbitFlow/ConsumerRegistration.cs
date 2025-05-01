@@ -203,7 +203,7 @@ namespace EasyRabbitFlow
                     }
                     catch (TaskCanceledException ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: Task was unexpectedly canceled while processing the message. This may indicate a timeout or other issue.");
 
@@ -211,7 +211,7 @@ namespace EasyRabbitFlow
                     }
                     catch (OperationCanceledException ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: Operation was unexpectedly canceled while processing the message. Investigate the root cause to determine if it's due to a timeout or cancellation token.");
 
@@ -227,7 +227,7 @@ namespace EasyRabbitFlow
                     }
                     catch (Exception ex)
                     {
-                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, cancellationToken: cancellationToken);
+                        await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler implementation is resilient.");
 
@@ -244,7 +244,7 @@ namespace EasyRabbitFlow
 
                     logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
 
-                    await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, cancellationToken: cancellationToken);
+                    await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, serializerOptions: jsonSerializerOption, cancellationToken: cancellationToken);
 
                     if (customDeadletter != null)
                     {
@@ -294,6 +294,7 @@ namespace EasyRabbitFlow
             string deadletterQueue = "",
             TEventType? @event = null,
             Exception? exception = null,
+            JsonSerializerOptions? serializerOptions = null,
             CancellationToken cancellationToken = default) where TEventType : class
         {
             if (autoAck)
@@ -304,17 +305,38 @@ namespace EasyRabbitFlow
             {
                 if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
                 {
+                    var innerExceptions = new List<Exception>();
+
+                    var tempException = exception;
+
+                    const int MaxInnerExceptionDepth = 10;
+
+                    while (tempException?.InnerException != null && innerExceptions.Count < MaxInnerExceptionDepth)
+                    {
+                        innerExceptions.Add(tempException.InnerException);
+
+                        tempException = tempException.InnerException;
+                    }
+
                     var extendedMessage = new
                     {
+                        dateUtc = DateTime.UtcNow,
                         messageType = typeof(TEventType).Name,
                         messageData = @event,
                         exceptionType = exception?.GetType().Name,
                         errorMessage = exception?.Message,
                         stackTrace = exception?.StackTrace,
                         source = exception?.Source,
+                        innerExceptions = innerExceptions.Select(e => new
+                        {
+                            exceptionType = e.GetType().Name,
+                            errorMessage = e.Message,
+                            stackTrace = e.StackTrace,
+                            source = e.Source
+                        }).ToList()
                     };
 
-                    await channel.BasicPublishAsync(exchange: "", routingKey: deadletterQueue, body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage)), cancellationToken: cancellationToken);
+                    await channel.BasicPublishAsync(exchange: "", routingKey: deadletterQueue, body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, options: serializerOptions)), cancellationToken: cancellationToken);
 
                     await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
                 }
