@@ -64,7 +64,7 @@ namespace EasyRabbitFlow.Services
 
             settings.Invoke(jsonOptions);
 
-            _services.TryAddSingleton(jsonOptions);
+            _services.TryAddKeyedSingleton("RabbitFlowJsonSerializer", jsonOptions);
         }
 
         /// <summary>

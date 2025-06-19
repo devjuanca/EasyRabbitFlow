@@ -1,4 +1,5 @@
 ﻿using EasyRabbitFlow.Settings;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using System;
@@ -50,11 +51,11 @@ namespace EasyRabbitFlow.Services
         private IConnection? globalConnection;
         private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
 
-        public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherOptions? publisherOptions = null, JsonSerializerOptions? jsonOptions = null)
+        public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherOptions? publisherOptions = null, [FromKeyedServices("RabbitFlowJsonSerializer")] JsonSerializerOptions? jsonOptions = null)
         {
             this.connectionFactory = connectionFactory;
             this.logger = logger;
-            this.jsonOptions = jsonOptions ?? new JsonSerializerOptions();
+            this.jsonOptions = jsonOptions ?? JsonSerializerOptions.Web;
             this.publisherOptions = publisherOptions ?? new PublisherOptions();
         }
 
@@ -98,7 +99,7 @@ namespace EasyRabbitFlow.Services
                     await PublishInternalAsync(channel, @event, destination, routingKey, serializerOptions, isQueue, cancellationToken);
                 }
 
-                logger.LogInformation("Message of type: {messageType} was published.", typeof(TEvent).FullName);
+                logger.LogDebug("Message of type: {messageType} was published.", typeof(TEvent).FullName);
 
                 return true;
             }

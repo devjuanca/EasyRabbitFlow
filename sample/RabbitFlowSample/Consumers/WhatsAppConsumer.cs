@@ -1,26 +1,22 @@
 ﻿using EasyRabbitFlow.Services;
-using RabbitFlowSimpleSample.Events;
+using RabbitFlowSample.Events;
 using System.Text.Json;
 
-namespace RabbitFlowSimpleSample.Consumers;
+namespace RabbitFlowSample.Consumers;
 
-public class WhatsAppConsumer : IRabbitFlowConsumer<WhatsAppEvent>
+public class WhatsAppConsumer : IRabbitFlowConsumer<NotificationEvent>
 {
     private readonly ILogger<WhatsAppConsumer> _logger;
 
-    private readonly GuidSevice _guidSevice;
-
-    public WhatsAppConsumer(ILogger<WhatsAppConsumer> logger, GuidSevice guidSevice)
+    public WhatsAppConsumer(ILogger<WhatsAppConsumer> logger)
     {
         _logger = logger;
-
-        _guidSevice = guidSevice;
     }
 
-    public Task HandleAsync(WhatsAppEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("New whatsapp event received. Event:{event} Id: {id}", JsonSerializer.Serialize(message), _guidSevice.Guid);
+        _logger.LogInformation("New whatsapp event received. Event:{event}", JsonSerializer.Serialize(message));
 
-        return Task.CompletedTask;
+        await Task.Delay(1000, cancellationToken);
     }
 }

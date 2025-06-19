@@ -1,4 +1,4 @@
-﻿namespace RabbitFlowFanoutSample.Events;
+﻿namespace RabbitFlowSample.Events;
 
 public class VolatileEvent
 {
