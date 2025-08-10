@@ -6,24 +6,24 @@ namespace EasyRabbitFlow.Exceptions
     /// Represents transient errors that occur during the RabbitMQ flow processing within the EasyRabbitFlow framework.
     /// This exception type indicates that the error is temporary and may succeed if retried.
     /// </summary>
-    public class TranscientException : Exception
+    public class RabbitFlowTransientException : Exception
     {
         /// <summary>
-        /// Initializes a new instance of the <see cref="TranscientException"/> class.
+        /// Initializes a new instance of the <see cref="RabbitFlowTransientException"/> class.
         /// </summary>
-        public TranscientException() : base() { }
+        public RabbitFlowTransientException() : base() { }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="TranscientException"/> class with a specified error message.
+        /// Initializes a new instance of the <see cref="RabbitFlowTransientException"/> class with a specified error message.
         /// </summary>
         /// <param name="message">The message that describes the error.</param>
-        public TranscientException(string message) : base(message) { }
+        public RabbitFlowTransientException(string message) : base(message) { }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="TranscientException"/> class with a specified error message and a reference to the inner exception that is the cause of this exception.
+        /// Initializes a new instance of the <see cref="RabbitFlowTransientException"/> class with a specified error message and a reference to the inner exception that is the cause of this exception.
         /// </summary>
         /// <param name="message">The message that describes the error.</param>
         /// <param name="innerException">The exception that is the cause of the current exception, or a null reference if no inner exception is specified.</param>
-        public TranscientException(string message, Exception innerException) : base(message, innerException) { }
+        public RabbitFlowTransientException(string message, Exception innerException) : base(message, innerException) { }
     }
 }

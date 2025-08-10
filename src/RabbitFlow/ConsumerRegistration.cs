@@ -142,14 +142,10 @@ namespace EasyRabbitFlow
 
                 object? consumerService = null;
 
-                var cancelationSource = new CancellationTokenSource(channel.ContinuationTimeout);
-
-                var ct = cancelationSource.Token;
+                Exception? lastException = null;
 
                 int retryCount = retryPolicy.MaxRetryCount;
-
-                bool shouldDelay = retryCount > 1;
-
+                
                 var processingTask = Task.Run(async () =>
                 {
                     try
@@ -176,30 +172,38 @@ namespace EasyRabbitFlow
 
                         while (retryCount > 0)
                         {
+                            using var attemptCts = new CancellationTokenSource(channel.ContinuationTimeout);
+
+                            var attemptCt = attemptCts.Token;
+                            
                             try
                             {
-
                                 if (!(consumerService is IRabbitFlowConsumer<TEventType>))
                                 {
                                     throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer service does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>. This is likely due to a misconfiguration.");
                                 }
 
-                                await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync(@event, ct).ConfigureAwait(false);
-
+           
+                                await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync(@event, attemptCt).ConfigureAwait(false);
+                                
                                 await channel.BasicAckAsync(args.DeliveryTag, false);
-
+                                
                                 break;
                             }
-                            catch (OperationCanceledException ex) when (ex.CancellationToken == ct)
+                            catch (OperationCanceledException ex) when (ex.CancellationToken == attemptCt)
                             {
-                                ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
-
+                                lastException = ex;
+                                
+                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                                
                                 retryCount--;
                             }
-                            catch (TaskCanceledException ex) when (ex.CancellationToken == ct)
+                            catch (TaskCanceledException ex) when (ex.CancellationToken == attemptCt)
                             {
-                                ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
-
+                                lastException = ex;
+                                
+                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                                
                                 retryCount--;
                             }
                             catch (TaskCanceledException ex)
@@ -218,9 +222,9 @@ namespace EasyRabbitFlow
 
                                 break;
                             }
-                            catch (TranscientException ex)
+                            catch (RabbitFlowTransientException ex)
                             {
-                                ct = await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
+                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
 
                                 retryCount--;
                             }
@@ -228,22 +232,31 @@ namespace EasyRabbitFlow
                             {
                                 await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
 
-                                logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. Ensure the handler implementation is resilient.");
+                                logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. To enable automatic retry for specific errors, catch them in your handler and throw a RabbitFlowTransientException instead.");
 
                                 break;
                             }
                             finally
                             {
-                                scope?.Dispose();
+                                scope?.Dispose();   
                             }
                         }
 
                         if (retryCount == 0)
                         {
-
                             logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
 
-                            await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, serializerOptions: jsonSerializerOption, cancellationToken: cancellationToken);
+                            var exception = new RabbitFlowOverRetriesException(retryPolicy.MaxRetryCount, lastException);
+                           
+                            await HandleErrorAsync(
+                                consumerOptions.AutoAckOnError, 
+                                channel, args.DeliveryTag, 
+                                consumerOptions.ExtendDeadletterMessage, 
+                                deadLetterQueueName, 
+                                (TEventType?)@event,
+                                exception: exception, 
+                                serializerOptions: jsonSerializerOption, 
+                                cancellationToken: cancellationToken);
 
                             if (customDeadletter != null)
                             {
@@ -285,9 +298,15 @@ namespace EasyRabbitFlow
         }
 
 
-        private static async Task<CancellationToken> HandleExceptionRetry<TConsumer>(Exception ex, RetryPolicy<TConsumer> retryPolicy, int retryCount, IChannel channel, ILogger<TConsumer> logger) where TConsumer : class
+        private static async Task HandleExceptionRetry<TConsumer>(
+            Exception ex, 
+            RetryPolicy<TConsumer> retryPolicy, 
+            int retryCount, 
+            IChannel channel, 
+            ILogger<TConsumer> logger) where TConsumer : class
         {
             var currentAttempt = retryPolicy.MaxRetryCount - retryCount + 1;
+
             var delay = retryPolicy.RetryInterval;
 
             if (retryPolicy.ExponentialBackoff && currentAttempt > 1)
@@ -298,11 +317,7 @@ namespace EasyRabbitFlow
             logger.LogWarning("[RABBIT-FLOW]: Error processing the message. Attempt: {currentAttempt}/{maxRetryCount}. Delay: {delay} ms. Exception Message: {message}",
                 currentAttempt, retryPolicy.MaxRetryCount, delay, ex.Message);
 
-            await Task.Delay(delay, CancellationToken.None);
-
-            using var cts = new CancellationTokenSource(channel.ContinuationTimeout);
-
-            return cts.Token;
+            await Task.Delay(delay, CancellationToken.None);    
         }
 
         private static async Task HandleErrorAsync<TEventType>(

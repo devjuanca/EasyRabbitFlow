@@ -69,6 +69,13 @@ builder.Services.AddRabbitFlow(settings =>
         consumerSettings.PrefetchCount = 5;
 
         consumerSettings.ExtendDeadletterMessage = true;
+
+        consumerSettings.Timeout = TimeSpan.FromSeconds(10);
+
+        consumerSettings.ConfigureRetryPolicy(retryPolicy =>
+        {
+            retryPolicy.MaxRetryCount = 2;
+        });
     });
 
 });
