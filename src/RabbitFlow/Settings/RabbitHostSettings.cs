@@ -1,4 +1,6 @@
 ﻿using RabbitMQ.Client;
+using System;
+
 namespace EasyRabbitFlow.Settings
 {
     /// <summary>
@@ -10,35 +12,80 @@ namespace EasyRabbitFlow.Settings
     {
         /// <summary>
         /// Gets or sets the hostname or IP address of the RabbitMQ host.
-        /// This is the address where the RabbitMQ server is running. The default value is "localhost".
+        /// This is the address where the RabbitMQ server is running. The default value is <see langword="localhost"/>.
         /// </summary>
         public string Host { get; set; } = "localhost";
 
         /// <summary>
         /// Gets or sets the port number for connecting to the RabbitMQ host.
-        /// This is the port on which the RabbitMQ server is listening. The default value is 5672, 
+        /// This is the port on which the RabbitMQ server is listening. 
+        /// The default value is <see langword="5672"/>, 
         /// which is the standard port for RabbitMQ as specified by the AMQP protocol.
         /// </summary>
         public int Port { get; set; } = Protocols.DefaultProtocol.DefaultPort;
 
         /// <summary>
         /// Gets or sets the username used for authenticating with the RabbitMQ host.
-        /// This is the username that will be used to log in to the RabbitMQ server. The default value is "guest".
+        /// This is the username that will be used to log in to the RabbitMQ server.
+        /// The default value is <see langword="guest"/>.
         /// </summary>
         public string Username { get; set; } = "guest";
 
         /// <summary>
         /// Gets or sets the password used for authenticating with the RabbitMQ host.
-        /// This is the password that corresponds to the specified username for logging in to the RabbitMQ server. The default value is "guest".
+        /// This is the password that corresponds to the specified username for logging in to the RabbitMQ server. 
+        /// The default value is <see langword="guest"/>.
         /// </summary>
         public string Password { get; set; } = "guest";
 
         /// <summary>
         /// Gets or sets the virtual host to connect to on the RabbitMQ host.
         /// A virtual host in RabbitMQ is a logical grouping of resources like exchanges, queues, and bindings. 
-        /// The default value is "/", which is the default virtual host in RabbitMQ.
+        /// The default value is <see langword="/"/>, which is the default virtual host in RabbitMQ.
         /// </summary>
         public string VirtualHost { get; set; } = "/";
 
+        /// <summary>
+        /// Gets or sets a value indicating whether automatic connection recovery is enabled.
+        /// </summary>
+        /// <remarks>
+        /// When enabled, the client will automatically attempt to reconnect to the RabbitMQ broker after a network
+        /// failure or unexpected connection loss. This helps maintain connection stability in production environments
+        /// with transient network issues. 
+        /// The default value is <see langword="true"/>.
+        /// </remarks>
+        public bool AutomaticRecoveryEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether automatic topology recovery is enabled after a network failure.
+        /// </summary>
+        /// <remarks>
+        /// When enabled, the system will attempt to restore connections and recover topology
+        /// information automatically if a network interruption occurs. Disabling this property may require manual
+        /// intervention to re-establish connections and recover state.
+        /// The default value is <see langword="true"/>.
+        /// </remarks>
+        public bool TopologyRecoveryEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the interval to wait between attempts to recover a lost network connection.
+        /// </summary>
+        /// <remarks>
+        /// Specify a duration that determines how long the system waits before retrying network
+        /// recovery after a failure. Adjust this value based on expected network conditions and recovery
+        /// requirements.
+        /// The default value is <see langword="10"/> seconds.
+        /// </remarks>
+        public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>
+        /// Gets or sets the interval at which heartbeat signals are requested from the connection.
+        /// </summary>
+        /// <remarks>
+        /// Adjusting this value can affect connection monitoring and responsiveness. A shorter
+        /// interval may provide faster detection of connection issues but can increase network traffic.
+        /// The default value is <see langword="30"/> seconds.
+        /// </remarks>
+        public TimeSpan RequestedHeartbeat { get; set; } = TimeSpan.FromSeconds(30);
     }
 }

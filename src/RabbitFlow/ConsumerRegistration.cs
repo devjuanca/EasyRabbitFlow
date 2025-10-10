@@ -18,6 +18,19 @@ namespace EasyRabbitFlow
 {
     public static class ConsumerRegistration
     {
+        /// <summary>
+        /// Registers and starts a RabbitMQ consumer of type <typeparamref name="TConsumer"/> for messages of type <typeparamref name="TEventType"/>.
+        /// </summary>
+        /// <typeparam name="TEventType">The type of the message payload the consumer handles.</typeparam>
+        /// <typeparam name="TConsumer">The consumer implementation that processes incoming messages.</typeparam>
+        /// <param name="rootServiceProvider">The root service provider used to resolve dependencies.</param>
+        /// <param name="settings">Optional action to configure consumer registration settings.</param>
+        /// <param name="cancellationToken">A cancellation token for graceful shutdown.</param>
+        /// <returns>The original <see cref="IServiceProvider"/> instance, allowing fluent chaining.</returns>
+        /// <remarks>
+        /// This method establishes a connection and channel, declares queues and exchanges if configured,
+        /// and begins consuming messages asynchronously with retry, DLQ, and error handling support.
+        /// </remarks>
         public static async Task<IServiceProvider> InitializeConsumerAsync<TEventType, TConsumer>(
             this IServiceProvider rootServiceProvider,
             Action<ConsumerRegisterSettings>? settings = null,
@@ -25,25 +38,20 @@ namespace EasyRabbitFlow
             where TConsumer : class
             where TEventType : class
         {
-            var consumer_settings = new ConsumerRegisterSettings();
+            var consumerSettings = new ConsumerRegisterSettings();
 
-            settings?.Invoke(consumer_settings);
+            settings?.Invoke(consumerSettings);
 
-            if (!consumer_settings.Active) return rootServiceProvider;
+            if (!consumerSettings.Active)
+            {
+                return rootServiceProvider;
+            }
 
             var logger = rootServiceProvider.GetRequiredService<ILogger<TConsumer>>();
 
             var factory = rootServiceProvider.GetRequiredService<ConnectionFactory>()
                           ?? throw new Exception("ConnectionFactory was not found in Service Collection");
 
-            if (!factory.AutomaticRecoveryEnabled)
-            {
-                factory.AutomaticRecoveryEnabled = true;
-            }
-            if (!factory.TopologyRecoveryEnabled)
-            {
-                factory.TopologyRecoveryEnabled = true;
-            }
 
             var jsonSerializerOption = rootServiceProvider.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer")
                                         ?? JsonSerializerOptions.Web;
@@ -63,15 +71,20 @@ namespace EasyRabbitFlow
                 ?? throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<T> to be registered as a consumer.");
 
             var eventType = consumerAbstraction.GetGenericArguments().First();
+
             if (eventType != typeof(TEventType))
+            {
                 throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>.");
+            }
 
             if (string.IsNullOrWhiteSpace(consumerOptions.QueueName))
+            {
                 throw new RabbitFlowException("[RABBIT-FLOW]: QueueName cannot be null or empty.");
+            }
 
             var connectionId = consumerOptions.ConsumerId ?? consumerOptions.QueueName;
 
-            var connection = await factory.CreateConnectionAsync($"Consumer_{connectionId}", cancellationToken);
+            var connection = await factory.CreateConnectionAsync($"consumer_{connectionId}", cancellationToken);
 
             var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
@@ -193,10 +206,12 @@ namespace EasyRabbitFlow
 
             var semaphore = new SemaphoreSlim(consumerOptions.PrefetchCount);
 
-            consumer.ReceivedAsync += async (sender, ea) =>
+            consumer.ReceivedAsync += async (sender, args) =>
             {
                 if (cancellationToken.IsCancellationRequested)
+                {
                     return;
+                }
 
                 try
                 {
@@ -207,7 +222,7 @@ namespace EasyRabbitFlow
                     return;
                 }
 
-                _ = ProcessMessageAsync(ea);
+                _ = ProcessMessageAsync(args);
             };
 
             async Task ProcessMessageAsync(BasicDeliverEventArgs args)
@@ -239,10 +254,12 @@ namespace EasyRabbitFlow
                             cancellationToken: cancellationToken);
 
                         logger.LogError(ex, "[RABBIT-FLOW]: Deserialization failed.");
+
                         return;
                     }
 
                     Exception? lastException = null;
+
                     var remainingAttempts = retryPolicy.MaxRetryCount;
 
                     while (remainingAttempts > 0 && !cancellationToken.IsCancellationRequested)
@@ -255,7 +272,7 @@ namespace EasyRabbitFlow
 
                         IServiceScope? scope = null;
 
-                        object? consumerService = null;
+                        TConsumer? consumerService = null;
 
                         try
                         {
@@ -380,22 +397,6 @@ namespace EasyRabbitFlow
             }
         }
 
-        private static async Task SafeNackAsync<TConsumer>(IChannel channel, ulong deliveryTag, bool requeue, ILogger<TConsumer> logger, CancellationToken ct)
-        {
-            try
-            {
-                await channel.BasicNackAsync(deliveryTag, false, requeue, ct);
-            }
-            catch (AlreadyClosedException ex)
-            {
-                logger.LogWarning(ex, "[RABBIT-FLOW]: Channel closed before NACK. Broker will decide requeue behavior (likely requeue).");
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "[RABBIT-FLOW]: Unexpected error while NACKing message.");
-            }
-        }
-
         private static async Task HandleExceptionRetry<TConsumer>(
             Exception ex,
             RetryPolicy<TConsumer> retryPolicy,
@@ -404,14 +405,17 @@ namespace EasyRabbitFlow
             CancellationToken ct) where TConsumer : class
         {
             var attemptIndex = retryPolicy.MaxRetryCount - remainingAttempts + 1;
+
             var baseDelay = retryPolicy.RetryInterval;
 
             long delay = baseDelay;
+
             if (retryPolicy.ExponentialBackoff && attemptIndex > 1)
             {
                 try
                 {
                     var computed = checked(baseDelay * (long)Math.Pow(retryPolicy.ExponentialBackoffFactor, attemptIndex - 1));
+
                     delay = Math.Min(computed, 60_000);
                 }
                 catch (OverflowException)
@@ -420,9 +424,7 @@ namespace EasyRabbitFlow
                 }
             }
 
-            logger.LogWarning(
-                "[RABBIT-FLOW]: Attempt {Attempt}/{Max}. Waiting {Delay} ms. Exception: {Message}",
-                attemptIndex, retryPolicy.MaxRetryCount, delay, ex.Message);
+            logger.LogWarning("[RABBIT-FLOW]: Attempt {Attempt}/{Max}. Waiting {Delay} ms. Exception: {Message}", attemptIndex, retryPolicy.MaxRetryCount, delay, ex.Message);
 
             try
             {
@@ -430,6 +432,7 @@ namespace EasyRabbitFlow
             }
             catch (OperationCanceledException)
             {
+                // do nothing, cancellation requested
             }
         }
 
@@ -451,18 +454,24 @@ namespace EasyRabbitFlow
                     await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
                 }
                 catch (AlreadyClosedException) { /* back to queue */ }
+
                 return;
             }
 
             if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
             {
                 var innerExceptions = new List<object>();
+                
                 const int MaxDepth = 10;
+                
                 var temp = exception;
+                
                 var depth = 0;
+                
                 while (temp?.InnerException != null && depth < MaxDepth)
                 {
                     temp = temp.InnerException;
+                    
                     if (temp != null)
                     {
                         innerExceptions.Add(new
@@ -473,6 +482,7 @@ namespace EasyRabbitFlow
                             source = temp.Source
                         });
                     }
+                    
                     depth++;
                 }
 
@@ -491,10 +501,12 @@ namespace EasyRabbitFlow
                 try
                 {
                     var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, serializerOptions));
+
                     await channel.BasicPublishAsync(exchange: "",
                         routingKey: deadletterQueue,
                         body: bytes,
                         cancellationToken: cancellationToken);
+
                     await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
                 }
                 catch (AlreadyClosedException)
@@ -510,7 +522,7 @@ namespace EasyRabbitFlow
                 }
                 catch (AlreadyClosedException)
                 {
-                    // Closed channel -> broker automatically requeues (similar to no explicit ack).
+                    // Closed channel. Broker automatically requeues (similar to no explicit ack).
                 }
             }
         }

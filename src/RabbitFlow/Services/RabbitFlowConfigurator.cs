@@ -35,21 +35,21 @@ namespace EasyRabbitFlow.Services
         /// <param name="settings">A delegate to configure the <see cref="HostSettings"/>.</param>
         public void ConfigureHost(Action<HostSettings> settings)
         {
-            var rabbitHVSettings = new HostSettings();
+            var hostSettings = new HostSettings();
 
-            settings.Invoke(rabbitHVSettings);
+            settings.Invoke(hostSettings);
 
             var factory = new ConnectionFactory()
             {
-                HostName = rabbitHVSettings.Host,
-                Port = rabbitHVSettings.Port,
-                UserName = rabbitHVSettings.Username,
-                Password = rabbitHVSettings.Password,
-                VirtualHost = rabbitHVSettings.VirtualHost,
-                AutomaticRecoveryEnabled = true,
+                HostName = hostSettings.Host,
+                Port = hostSettings.Port,
+                UserName = hostSettings.Username,
+                Password = hostSettings.Password,
+                VirtualHost = hostSettings.VirtualHost,
+                AutomaticRecoveryEnabled = hostSettings.AutomaticRecoveryEnabled,
                 TopologyRecoveryEnabled = true,
-                NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
-                RequestedHeartbeat = TimeSpan.FromSeconds(30)
+                NetworkRecoveryInterval = hostSettings.NetworkRecoveryInterval,
+                RequestedHeartbeat = hostSettings.RequestedHeartbeat
             };
 
             _services.AddSingleton(factory);
