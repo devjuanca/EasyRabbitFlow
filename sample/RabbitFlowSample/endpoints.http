@@ -18,6 +18,44 @@ Accept-Language: en-US,en;q=0.5
 
 ###
 
+POST https://localhost:5001/email
+Content-Type: application/json
+Accept-Language: en-US,en;q=0.5
+
+{
+
+  "emailData":{  
+    "email": "test@test.com",
+    "subject": "Some Subject",
+    "body": "Some Body"
+  },
+  "whatsappData":{
+    "phoneNumber": "00000000",
+    "message": "Some Whatsapp"
+  }
+}
+
+###
+
+POST https://localhost:5001/whatsapp
+Content-Type: application/json
+Accept-Language: en-US,en;q=0.5
+
+{
+
+  "emailData":{  
+    "email": "test@test.com",
+    "subject": "Some Subject",
+    "body": "Some Body"
+  },
+  "whatsappData":{
+    "phoneNumber": "00000000",
+    "message": "Some Whatsapp"
+  }
+}
+
+###
+
 POST https://localhost:5001/service-lifetime-test
 Content-Type: application/json
 Accept-Language: en-US,en;q=0.5

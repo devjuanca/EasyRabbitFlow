@@ -98,8 +98,18 @@ app.UseHttpsRedirection();
 
 app.MapPost("/notification", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
 {
-    await Task.WhenAll(Enumerable.Range(0, 20).Select(i => publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "")));
+    await Task.WhenAll(Enumerable.Range(0, 1).Select(i => publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "")));
 
+});
+
+app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
+{
+    await  publisher.PublishAsync(emailEvent, "whatsapps-test-queue");
+});
+
+app.MapPost("/email", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
+{
+    await publisher.PublishAsync(emailEvent, "emails-test-queue");
 });
 
 app.MapPost("/service-lifetime-test", async (IRabbitFlowPublisher publisher, ILogger<Program> logger) =>

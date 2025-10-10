@@ -40,11 +40,5 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         public string VirtualHost { get; set; } = "/";
 
-        /// <summary>
-        /// Gets or sets a value indicating whether automatic recovery is enabled.
-        /// When enabled, the client will automatically attempt to recover from network failures or other issues 
-        /// that cause the connection to drop. The default value is <c>true</c>.
-        /// </summary>
-        public bool AutomaticRecoveryEnabled { get; set; } = true;
     }
 }
