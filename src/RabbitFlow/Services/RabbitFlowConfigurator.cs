@@ -46,7 +46,10 @@ namespace EasyRabbitFlow.Services
                 UserName = rabbitHVSettings.Username,
                 Password = rabbitHVSettings.Password,
                 VirtualHost = rabbitHVSettings.VirtualHost,
-                AutomaticRecoveryEnabled = rabbitHVSettings.AutomaticRecoveryEnabled
+                AutomaticRecoveryEnabled = true,
+                TopologyRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
+                RequestedHeartbeat = TimeSpan.FromSeconds(30)
             };
 
             _services.AddSingleton(factory);

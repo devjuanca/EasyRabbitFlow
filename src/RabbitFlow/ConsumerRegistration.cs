@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -15,57 +16,58 @@ using System.Threading.Tasks;
 
 namespace EasyRabbitFlow
 {
-    /// <summary>
-    /// Extension methods for registering RabbitMQ consumers.
-    /// </summary>
     public static class ConsumerRegistration
     {
-        /// <summary>
-        /// Initializes and registers a RabbitMQ consumer for the specified event type and consumer.
-        /// </summary>
-        /// <typeparam name="TEventType">The type of event the consumer will handle.</typeparam>
-        /// <typeparam name="TConsumer">The type of the consumer handling the event.</typeparam>
-        /// <param name="rootServiceProvider">The service provider used to resolve dependencies.</param>
-        /// <param name="settings">Optional settings for consumer registration.</param>
-        /// <param name="cancellationToken"></param>
-        /// <returns>The service provider.</returns>
-        /// <exception cref="Exception">Thrown if required services are not found in the service provider or if consumer interface contracts are violated.</exception>
-        public static async Task<IServiceProvider> InitializeConsumerAsync<TEventType, TConsumer>(this IServiceProvider rootServiceProvider, Action<ConsumerRegisterSettings>? settings = null, CancellationToken cancellationToken = default) where TConsumer : class where TEventType : class
+        public static async Task<IServiceProvider> InitializeConsumerAsync<TEventType, TConsumer>(
+            this IServiceProvider rootServiceProvider,
+            Action<ConsumerRegisterSettings>? settings = null,
+            CancellationToken cancellationToken = default)
+            where TConsumer : class
+            where TEventType : class
         {
             var consumer_settings = new ConsumerRegisterSettings();
 
             settings?.Invoke(consumer_settings);
 
-            if (!consumer_settings.Active)
-            {
-                return rootServiceProvider;
-            }
+            if (!consumer_settings.Active) return rootServiceProvider;
 
             var logger = rootServiceProvider.GetRequiredService<ILogger<TConsumer>>();
 
-            var factory = rootServiceProvider.GetRequiredService<ConnectionFactory>() ?? throw new Exception("ConnectionFactory was not found in Service Collection");
+            var factory = rootServiceProvider.GetRequiredService<ConnectionFactory>()
+                          ?? throw new Exception("ConnectionFactory was not found in Service Collection");
 
-            var jsonSerializerOption = rootServiceProvider.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? JsonSerializerOptions.Web;
+            if (!factory.AutomaticRecoveryEnabled)
+            {
+                factory.AutomaticRecoveryEnabled = true;
+            }
+            if (!factory.TopologyRecoveryEnabled)
+            {
+                factory.TopologyRecoveryEnabled = true;
+            }
 
-            var consumerOptions = rootServiceProvider.GetRequiredService<ConsumerSettings<TConsumer>>() ?? throw new Exception("ConsummerOptions was not found in Service Collection");
+            var jsonSerializerOption = rootServiceProvider.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer")
+                                        ?? JsonSerializerOptions.Web;
 
-            var retryPolicy = rootServiceProvider.GetService<RetryPolicy<TConsumer>>() ?? new RetryPolicy<TConsumer> { MaxRetryCount = 1 };
+            var consumerOptions = rootServiceProvider.GetRequiredService<ConsumerSettings<TConsumer>>()
+                                  ?? throw new Exception("ConsummerOptions was not found in Service Collection");
 
-            var customDeadletter = rootServiceProvider.GetService<CustomDeadLetterSettings<TConsumer>>() ?? null;
+            var retryPolicy = rootServiceProvider.GetService<RetryPolicy<TConsumer>>()
+                              ?? new RetryPolicy<TConsumer> { MaxRetryCount = 1 };
+
+            var customDeadletter = rootServiceProvider.GetService<CustomDeadLetterSettings<TConsumer>>();
 
             var consumerType = typeof(TConsumer);
 
-            string deadLetterQueueName = string.Empty;
-
-            var consumerAbstraction = consumerType.GetInterfaces().FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>)) ??
-                throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<T> to be registered as a consumer.");
+            var consumerAbstraction = consumerType.GetInterfaces()
+                .FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>))
+                ?? throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<T> to be registered as a consumer.");
 
             var eventType = consumerAbstraction.GetGenericArguments().First();
-
             if (eventType != typeof(TEventType))
-            {
                 throw new RabbitFlowException($"[RABBIT-FLOW]: {consumerType.Name} must implement IRabbitFlowConsumer<{typeof(TEventType).Name}>.");
-            }
+
+            if (string.IsNullOrWhiteSpace(consumerOptions.QueueName))
+                throw new RabbitFlowException("[RABBIT-FLOW]: QueueName cannot be null or empty.");
 
             var connectionId = consumerOptions.ConsumerId ?? consumerOptions.QueueName;
 
@@ -73,251 +75,362 @@ namespace EasyRabbitFlow
 
             var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
+            connection.ConnectionShutdownAsync += (sender, args) =>
+            {
+                logger.LogWarning("[RABBIT-FLOW]: Connection shutdown. ReplyCode: {code}, ReplyText: {text}", args.ReplyCode, args.ReplyText);
+                return Task.CompletedTask;
+            };
+
+            connection.CallbackExceptionAsync += (sender, args) =>
+            {
+                logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection callback exception.");
+                return Task.CompletedTask;
+            };
+
+            connection.RecoverySucceededAsync += (sender, args) =>
+            {
+                logger.LogInformation("[RABBIT-FLOW]: Connection recovery succeeded.");
+                return Task.CompletedTask;
+            };
+
+            connection.ConnectionRecoveryErrorAsync += (sender, args) =>
+            {
+                logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection recovery error.");
+                return Task.CompletedTask;
+            };
+
+            connection.ConnectionBlockedAsync += (sender, args) =>
+            {
+                logger.LogWarning("[RABBIT-FLOW]: Connection blocked. Reason: {reason}", args.Reason);
+                return Task.CompletedTask;
+            };
+
+            connection.ConnectionUnblockedAsync += (sender, args) =>
+            {
+                logger.LogInformation("[RABBIT-FLOW]: Connection unblocked.");
+                return Task.CompletedTask;
+            };
+
+            channel.CallbackExceptionAsync += (sender, args) =>
+            {
+                logger.LogWarning(args.Exception, "[RABBIT-FLOW]: Channel callback exception.");
+                return Task.CompletedTask;
+            };
+
+            channel.ChannelShutdownAsync += (sender, args) =>
+            {
+                logger.LogWarning("[RABBIT-FLOW]: Channel shutdown. ReplyCode: {code}, ReplyText: {text}", args.ReplyCode, args.ReplyText);
+                return Task.CompletedTask;
+            };
+
             channel.ContinuationTimeout = consumerOptions.Timeout;
 
-            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: consumerOptions.PrefetchCount, global: false, cancellationToken);
+            await channel.BasicQosAsync(prefetchSize: 0,
+                prefetchCount: consumerOptions.PrefetchCount,
+                global: false,
+                cancellationToken);
+
+            string deadLetterQueueName = string.Empty;
 
             if (consumerOptions.AutoGenerate)
             {
-                var autoGenerateSettings = rootServiceProvider.GetService<AutoGenerateSettings<TConsumer>>() ?? new AutoGenerateSettings<TConsumer>();
+                var autoGenerateSettings = rootServiceProvider.GetService<AutoGenerateSettings<TConsumer>>()
+                                           ?? new AutoGenerateSettings<TConsumer>();
 
                 var exchangeName = autoGenerateSettings.ExchangeName ?? $"{consumerOptions.QueueName}-exchange";
-
+                
                 var queueName = consumerOptions.QueueName;
-
+                
                 var args = autoGenerateSettings.Args;
-
+                
                 var routingKey = autoGenerateSettings.RoutingKey ?? $"{consumerOptions.QueueName}-routing-key";
 
                 if (autoGenerateSettings.GenerateDeadletterQueue)
                 {
                     deadLetterQueueName = $"{queueName}-deadletter";
-
+                    
                     var deadLetterExchange = $"{queueName}-deadletter-exchange";
-
+                    
                     var deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
 
-                    await channel.QueueDeclareAsync(queue: deadLetterQueueName, durable: autoGenerateSettings.DurableQueue, exclusive: false, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: null, cancellationToken: cancellationToken);
+                    await channel.QueueDeclareAsync(deadLetterQueueName,
+                        durable: autoGenerateSettings.DurableQueue,
+                        exclusive: false,
+                        autoDelete: autoGenerateSettings.AutoDeleteQueue,
+                        arguments: null,
+                        cancellationToken: cancellationToken);
 
-                    await channel.ExchangeDeclareAsync(exchange: deadLetterExchange, type: "direct", durable: autoGenerateSettings.DurableExchange, cancellationToken: cancellationToken);
+                    await channel.ExchangeDeclareAsync(deadLetterExchange, "direct",
+                        durable: autoGenerateSettings.DurableExchange,
+                        cancellationToken: cancellationToken);
 
-                    await channel.QueueBindAsync(queue: deadLetterQueueName, exchange: deadLetterExchange, routingKey: deadLetterRoutingKey);
+                    await channel.QueueBindAsync(deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
 
                     args ??= new Dictionary<string, object?>();
-
+                    
                     args["x-dead-letter-exchange"] = deadLetterExchange;
-
+                    
                     args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
                 }
 
-                // Declare queue
-                await channel.QueueDeclareAsync(queue: queueName, durable: autoGenerateSettings.DurableQueue, exclusive: autoGenerateSettings.ExclusiveQueue, autoDelete: autoGenerateSettings.AutoDeleteQueue, arguments: args);
+                await channel.QueueDeclareAsync(queueName,
+                    durable: autoGenerateSettings.DurableQueue,
+                    exclusive: autoGenerateSettings.ExclusiveQueue,
+                    autoDelete: autoGenerateSettings.AutoDeleteQueue,
+                    arguments: args);
 
                 if (autoGenerateSettings.GenerateExchange)
                 {
-                    // Declare exchange
-                    await channel.ExchangeDeclareAsync(exchange: exchangeName, type: autoGenerateSettings.ExchangeType.ToString().ToLower(), durable: autoGenerateSettings.DurableExchange);
+                    await channel.ExchangeDeclareAsync(exchangeName,
+                        type: autoGenerateSettings.ExchangeType.ToString().ToLowerInvariant(),
+                        durable: autoGenerateSettings.DurableExchange);
 
-                    // Bind queue to exchange
-                    await channel.QueueBindAsync(queue: queueName, exchange: exchangeName, routingKey: routingKey);
+                    await channel.QueueBindAsync(queueName, exchangeName, routingKey);
                 }
             }
 
-            var rabbitConsumer = new AsyncEventingBasicConsumer(channel);
+            var consumer = new AsyncEventingBasicConsumer(channel);
 
             var semaphore = new SemaphoreSlim(consumerOptions.PrefetchCount);
 
-            rabbitConsumer.ReceivedAsync += async (sender, args) =>
+            consumer.ReceivedAsync += async (sender, ea) =>
             {
-                await semaphore.WaitAsync(cancellationToken);
+                if (cancellationToken.IsCancellationRequested)
+                    return;
 
-                var body = args.Body.ToArray();
-
-                var message = Encoding.UTF8.GetString(body);
-
-                TEventType? @event = (TEventType?)JsonSerializer.Deserialize(message, typeof(TEventType), jsonSerializerOption)
-                 ?? throw new RabbitFlowException("[RABBIT-FLOW]: Message deserialization failed. Ensure the message format is valid and matches the expected type.");
-
-                IServiceScope? scope = null;
-
-                object? consumerService = null;
-
-                Exception? lastException = null;
-
-                int retryCount = retryPolicy.MaxRetryCount;
-                
-                var processingTask = Task.Run(async () =>
+                try
                 {
+                    await semaphore.WaitAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                _ = ProcessMessageAsync(ea);
+            };
+
+            async Task ProcessMessageAsync(BasicDeliverEventArgs args)
+            {
+                try
+                {
+                    var body = args.Body.ToArray();
+
+                    var message = Encoding.UTF8.GetString(body);
+
+                    TEventType? @event;
+
                     try
                     {
-                        scope = rootServiceProvider.CreateScope();
+                        @event = JsonSerializer.Deserialize<TEventType>(message, jsonSerializerOption)
+                                 ?? throw new RabbitFlowException("[RABBIT-FLOW]: Message deserialization returned null.");
+                    }
+                    catch (Exception ex)
+                    {
+                        await HandleErrorAsync<TEventType>(
+                            autoAck: consumerOptions.AutoAckOnError,
+                            channel: channel,
+                            deliveryTag: args.DeliveryTag,
+                            extendDeadletterMessage: consumerOptions.ExtendDeadletterMessage,
+                            deadletterQueue: deadLetterQueueName,
+                            @event: null,
+                            exception: ex,
+                            serializerOptions: jsonSerializerOption,
+                            cancellationToken: cancellationToken);
+
+                        logger.LogError(ex, "[RABBIT-FLOW]: Deserialization failed.");
+                        return;
+                    }
+
+                    Exception? lastException = null;
+                    var remainingAttempts = retryPolicy.MaxRetryCount;
+
+                    while (remainingAttempts > 0 && !cancellationToken.IsCancellationRequested)
+                    {
+                        using var attemptCts = new CancellationTokenSource(channel.ContinuationTimeout);
+
+                        using var linked = CancellationTokenSource.CreateLinkedTokenSource(attemptCts.Token, cancellationToken);
+
+                        var attemptCt = linked.Token;
+
+                        IServiceScope? scope = null;
+
+                        object? consumerService = null;
 
                         try
                         {
-                            if (consumer_settings.CreateNewInstancePerMessage)
-                            {
-                                var scopedServiceProvider = scope.ServiceProvider;
-
-                                consumerService = scopedServiceProvider.GetRequiredService(consumerAbstraction) ?? throw new Exception("[RABBIT-FLOW]: Consumer was not found in Service Collection");
-                            }
-                            else
-                            {
-                                consumerService = rootServiceProvider.GetRequiredService(consumerAbstraction) ?? throw new Exception("[RABBIT-FLOW]: Consumer was not found in Service Collection");
-                            }
-                        }
-                        catch (InvalidOperationException ex)
-                        {
-                            throw new RabbitFlowException("[RABBIT-FLOW]: Failed to resolve consumer service. Ensure all dependencies are correctly registered and configured. If CreateNewInstancePerMessage is set to false, all services must be Singleton.", ex);
-                        }
-
-                        while (retryCount > 0)
-                        {
-                            using var attemptCts = new CancellationTokenSource(channel.ContinuationTimeout);
-
-                            var attemptCt = attemptCts.Token;
+                            scope = rootServiceProvider.CreateScope();
                             
+                            consumerService = scope.ServiceProvider.GetRequiredService<TConsumer>();
+
+                            if (!(consumerService is IRabbitFlowConsumer<TEventType> typedConsumer))
+                                throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>.");
+
+                            await typedConsumer.HandleAsync(@event, attemptCt).ConfigureAwait(false);
+
+                            await SafeAckAsync(channel, args.DeliveryTag, logger, cancellationToken);
+
+                            return; // success
+                        }
+                        catch (OperationCanceledException ex) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                        {
+                            lastException = ex;
+                            await HandleExceptionRetry(ex, retryPolicy, remainingAttempts, logger, cancellationToken);
+                        }
+                        catch (TaskCanceledException ex) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                        {
+                            lastException = ex;
+                            await HandleExceptionRetry(ex, retryPolicy, remainingAttempts, logger, cancellationToken);
+                        }
+                        catch (RabbitFlowTransientException ex)
+                        {
+                            lastException = ex;
+                            await HandleExceptionRetry(ex, retryPolicy, remainingAttempts, logger, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            await HandleErrorAsync(
+                                consumerOptions.AutoAckOnError,
+                                channel,
+                                args.DeliveryTag,
+                                consumerOptions.ExtendDeadletterMessage,
+                                deadLetterQueueName,
+                                @event,
+                                ex,
+                                jsonSerializerOption,
+                                cancellationToken);
+                            logger.LogError(ex, "[RABBIT-FLOW]: Non-transient error. No more retries.");
+                            return;
+                        }
+                        finally
+                        {
+                            scope?.Dispose();
+                            remainingAttempts--;
+                        }
+                    }
+
+                    if (remainingAttempts == 0)
+                    {
+                        var overRetryEx = new RabbitFlowOverRetriesException(retryPolicy.MaxRetryCount, lastException);
+
+                        await HandleErrorAsync(
+                            consumerOptions.AutoAckOnError,
+                            channel,
+                            args.DeliveryTag,
+                            consumerOptions.ExtendDeadletterMessage,
+                            deadLetterQueueName,
+                            @event,
+                            overRetryEx,
+                            jsonSerializerOption,
+                            cancellationToken);
+
+                        logger.LogError(overRetryEx,
+                            "[RABBIT-FLOW]: Exhausted retries ({Max}) for message.", retryPolicy.MaxRetryCount);
+
+                        if (customDeadletter != null && @event != null)
+                        {
                             try
                             {
-                                if (!(consumerService is IRabbitFlowConsumer<TEventType>))
-                                {
-                                    throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer service does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>. This is likely due to a misconfiguration.");
-                                }
-
-           
-                                await (consumerService as IRabbitFlowConsumer<TEventType>)!.HandleAsync(@event, attemptCt).ConfigureAwait(false);
-                                
-                                await channel.BasicAckAsync(args.DeliveryTag, false);
-                                
-                                break;
-                            }
-                            catch (OperationCanceledException ex) when (ex.CancellationToken == attemptCt)
-                            {
-                                lastException = ex;
-                                
-                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
-                                
-                                retryCount--;
-                            }
-                            catch (TaskCanceledException ex) when (ex.CancellationToken == attemptCt)
-                            {
-                                lastException = ex;
-                                
-                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
-                                
-                                retryCount--;
-                            }
-                            catch (TaskCanceledException ex)
-                            {
-                                await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
-
-                                logger.LogError(ex, "[RABBIT-FLOW]: Task was unexpectedly canceled while processing the message. This may indicate a timeout or other issue.");
-
-                                break;
-                            }
-                            catch (OperationCanceledException ex)
-                            {
-                                await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
-
-                                logger.LogError(ex, "[RABBIT-FLOW]: Operation was unexpectedly canceled while processing the message. Investigate the root cause to determine if it's due to a timeout or cancellation token.");
-
-                                break;
-                            }
-                            catch (RabbitFlowTransientException ex)
-                            {
-                                await HandleExceptionRetry(ex, retryPolicy, retryCount, channel, logger);
-
-                                retryCount--;
-                            }
-                            catch (Exception ex)
-                            {
-                                await HandleErrorAsync(consumerOptions.AutoAckOnError, channel, args.DeliveryTag, consumerOptions.ExtendDeadletterMessage, deadLetterQueueName, (TEventType?)@event, ex, jsonSerializerOption, cancellationToken: cancellationToken);
-
-                                logger.LogError(ex, "[RABBIT-FLOW]: An unexpected error occurred while processing the message. No further retries will be attempted. To enable automatic retry for specific errors, catch them in your handler and throw a RabbitFlowTransientException instead.");
-
-                                break;
-                            }
-                            finally
-                            {
-                                scope?.Dispose();   
-                            }
-                        }
-
-                        if (retryCount == 0)
-                        {
-                            logger.LogError("[RABBIT-FLOW]: Maximum retry attempts reached ({maxRetryCount}) while processing the message. Message will be nacked or acknowledged depending on configuration.", retryPolicy.MaxRetryCount);
-
-                            var exception = new RabbitFlowOverRetriesException(retryPolicy.MaxRetryCount, lastException);
-                           
-                            await HandleErrorAsync(
-                                consumerOptions.AutoAckOnError, 
-                                channel, args.DeliveryTag, 
-                                consumerOptions.ExtendDeadletterMessage, 
-                                deadLetterQueueName, 
-                                (TEventType?)@event,
-                                exception: exception, 
-                                serializerOptions: jsonSerializerOption, 
-                                cancellationToken: cancellationToken);
-
-                            if (customDeadletter != null)
-                            {
                                 var publisher = rootServiceProvider.GetRequiredService<IRabbitFlowPublisher>();
-
-                                if (@event != null)
-                                {
-                                    await publisher.PublishAsync((TEventType)@event, customDeadletter.DeadletterQueueName, publisherId: "custom-dead-letter");
-                                }
-
+                                await publisher.PublishAsync(@event, customDeadletter.DeadletterQueueName, publisherId: "custom-dead-letter");
+                            }
+                            catch (Exception dlxEx)
+                            {
+                                logger.LogError(dlxEx, "[RABBIT-FLOW]: Failed publishing to custom dead-letter queue.");
                             }
                         }
                     }
-                    finally
-                    {
-                        scope?.Dispose();
-                        semaphore.Release();
-                    }
-                }, cancellationToken)
-                .ContinueWith(t =>
+                }
+                catch (AlreadyClosedException exClosed)
                 {
-                    if (t.IsFaulted && t.Exception != null)
-                    {
-                        logger.LogError(t.Exception.Flatten(),
-                            "[RABBIT-FLOW]: Unhandled exception in message processing task");
+                    // Channel/Connection closed: broker will requeue if message was not ACKed.
+                    logger.LogWarning(exClosed, "[RABBIT-FLOW]: Channel closed during message processing. Message likely requeued.");
+                }
+                catch (Exception exOuter)
+                {
+                    logger.LogError(exOuter, "[RABBIT-FLOW]: Unhandled exception in message processing.");
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }
 
-                    }
-                    else if (t.IsCanceled)
-                    {
-                        logger.LogWarning("[RABBIT-FLOW]: Message processing task was canceled");
-                    }
-
-                }, TaskScheduler.Default);
-            };
-
-            await channel.BasicConsumeAsync(queue: consumerOptions.QueueName, autoAck: false, consumer: rabbitConsumer, cancellationToken);
+            await channel.BasicConsumeAsync(queue: consumerOptions.QueueName,
+                autoAck: false,
+                consumer: consumer,
+                cancellationToken);
 
             return rootServiceProvider;
         }
 
+        private static async Task SafeAckAsync<TConsumer>(IChannel channel, ulong deliveryTag, ILogger<TConsumer> logger, CancellationToken ct)
+        {
+            try
+            {
+                await channel.BasicAckAsync(deliveryTag, false, ct);
+            }
+            catch (AlreadyClosedException ex)
+            {
+                logger.LogWarning(ex, "[RABBIT-FLOW]: Channel closed before ACK. Message will be requeued by broker.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[RABBIT-FLOW]: Unexpected error while ACKing message.");
+            }
+        }
+
+        private static async Task SafeNackAsync<TConsumer>(IChannel channel, ulong deliveryTag, bool requeue, ILogger<TConsumer> logger, CancellationToken ct)
+        {
+            try
+            {
+                await channel.BasicNackAsync(deliveryTag, false, requeue, ct);
+            }
+            catch (AlreadyClosedException ex)
+            {
+                logger.LogWarning(ex, "[RABBIT-FLOW]: Channel closed before NACK. Broker will decide requeue behavior (likely requeue).");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "[RABBIT-FLOW]: Unexpected error while NACKing message.");
+            }
+        }
 
         private static async Task HandleExceptionRetry<TConsumer>(
-            Exception ex, 
-            RetryPolicy<TConsumer> retryPolicy, 
-            int retryCount, 
-            IChannel channel, 
-            ILogger<TConsumer> logger) where TConsumer : class
+            Exception ex,
+            RetryPolicy<TConsumer> retryPolicy,
+            int remainingAttempts,
+            ILogger<TConsumer> logger,
+            CancellationToken ct) where TConsumer : class
         {
-            var currentAttempt = retryPolicy.MaxRetryCount - retryCount + 1;
+            var attemptIndex = retryPolicy.MaxRetryCount - remainingAttempts + 1;
+            var baseDelay = retryPolicy.RetryInterval;
 
-            var delay = retryPolicy.RetryInterval;
-
-            if (retryPolicy.ExponentialBackoff && currentAttempt > 1)
+            long delay = baseDelay;
+            if (retryPolicy.ExponentialBackoff && attemptIndex > 1)
             {
-                delay = retryPolicy.RetryInterval * (int)Math.Pow(retryPolicy.ExponentialBackoffFactor, currentAttempt - 1);
+                try
+                {
+                    var computed = checked(baseDelay * (long)Math.Pow(retryPolicy.ExponentialBackoffFactor, attemptIndex - 1));
+                    delay = Math.Min(computed, 60_000);
+                }
+                catch (OverflowException)
+                {
+                    delay = 60_000;
+                }
             }
 
-            logger.LogWarning("[RABBIT-FLOW]: Error processing the message. Attempt: {currentAttempt}/{maxRetryCount}. Delay: {delay} ms. Exception Message: {message}",
-                currentAttempt, retryPolicy.MaxRetryCount, delay, ex.Message);
+            logger.LogWarning(
+                "[RABBIT-FLOW]: Attempt {Attempt}/{Max}. Waiting {Delay} ms. Exception: {Message}",
+                attemptIndex, retryPolicy.MaxRetryCount, delay, ex.Message);
 
-            await Task.Delay(delay, CancellationToken.None);    
+            try
+            {
+                await Task.Delay((int)delay, ct);
+            }
+            catch (OperationCanceledException)
+            {
+            }
         }
 
         private static async Task HandleErrorAsync<TEventType>(
@@ -333,50 +446,71 @@ namespace EasyRabbitFlow
         {
             if (autoAck)
             {
-                await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
+                try
+                {
+                    await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
+                }
+                catch (AlreadyClosedException) { /* back to queue */ }
+                return;
+            }
+
+            if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
+            {
+                var innerExceptions = new List<object>();
+                const int MaxDepth = 10;
+                var temp = exception;
+                var depth = 0;
+                while (temp?.InnerException != null && depth < MaxDepth)
+                {
+                    temp = temp.InnerException;
+                    if (temp != null)
+                    {
+                        innerExceptions.Add(new
+                        {
+                            exceptionType = temp.GetType().Name,
+                            errorMessage = temp.Message,
+                            stackTrace = temp.StackTrace,
+                            source = temp.Source
+                        });
+                    }
+                    depth++;
+                }
+
+                var extendedMessage = new
+                {
+                    dateUtc = DateTime.UtcNow,
+                    messageType = typeof(TEventType).Name,
+                    messageData = @event,
+                    exceptionType = exception?.GetType().Name,
+                    errorMessage = exception?.Message,
+                    stackTrace = exception?.StackTrace,
+                    source = exception?.Source,
+                    innerExceptions
+                };
+
+                try
+                {
+                    var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, serializerOptions));
+                    await channel.BasicPublishAsync(exchange: "",
+                        routingKey: deadletterQueue,
+                        body: bytes,
+                        cancellationToken: cancellationToken);
+                    await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
+                }
+                catch (AlreadyClosedException)
+                {
+                    // If the channel is closed here, the message is requeued (no ack) and the extended payload is not published.
+                }
             }
             else
             {
-                if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
-                {
-                    var innerExceptions = new List<Exception>();
-
-                    var tempException = exception;
-
-                    const int MaxInnerExceptionDepth = 10;
-
-                    while (tempException?.InnerException != null && innerExceptions.Count < MaxInnerExceptionDepth)
-                    {
-                        innerExceptions.Add(tempException.InnerException);
-
-                        tempException = tempException.InnerException;
-                    }
-
-                    var extendedMessage = new
-                    {
-                        dateUtc = DateTime.UtcNow,
-                        messageType = typeof(TEventType).Name,
-                        messageData = @event,
-                        exceptionType = exception?.GetType().Name,
-                        errorMessage = exception?.Message,
-                        stackTrace = exception?.StackTrace,
-                        source = exception?.Source,
-                        innerExceptions = innerExceptions.Select(e => new
-                        {
-                            exceptionType = e.GetType().Name,
-                            errorMessage = e.Message,
-                            stackTrace = e.StackTrace,
-                            source = e.Source
-                        }).ToList()
-                    };
-
-                    await channel.BasicPublishAsync(exchange: "", routingKey: deadletterQueue, body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, options: serializerOptions)), cancellationToken: cancellationToken);
-
-                    await channel.BasicAckAsync(deliveryTag, false, cancellationToken);
-                }
-                else
+                try
                 {
                     await channel.BasicNackAsync(deliveryTag, false, false, cancellationToken);
+                }
+                catch (AlreadyClosedException)
+                {
+                    // Closed channel -> broker automatically requeues (similar to no explicit ack).
                 }
             }
         }

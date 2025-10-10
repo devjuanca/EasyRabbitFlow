@@ -36,7 +36,7 @@ namespace EasyRabbitFlow.Settings
 
             if (consumerAbstraction != null)
             {
-                _services.AddTransient(consumerAbstraction, consumerImplementation);
+                _services.AddTransient<TConsumer>();
             }
             else
             {
