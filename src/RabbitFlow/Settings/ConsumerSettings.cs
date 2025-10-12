@@ -11,8 +11,24 @@ namespace EasyRabbitFlow.Settings
     /// auto-acknowledgment behavior, message prefetch count, processing timeout, 
     /// retry policy, and more for a specific consumer type.
     /// </summary>
-    /// <typeparam name="TConsumer">The type of the consumer that must implement IRabbitFlowConsumer&lt;T&gt;.</typeparam>
-    public class ConsumerSettings<TConsumer> where TConsumer : class
+    internal interface IConsumerSettingsBase
+    {
+        string QueueName { get; }
+
+        string? ConsumerId { get; set; }
+
+        bool AutoAckOnError { get; set; }
+
+        bool AutoGenerate { get; set; }
+
+        bool ExtendDeadletterMessage { get; set; }
+
+        ushort PrefetchCount { get; set; }
+
+        TimeSpan Timeout { get; set; }
+    }
+
+    public class ConsumerSettings<TConsumer> : IConsumerSettingsBase where TConsumer : class
     {
         private readonly IServiceCollection _services;
 

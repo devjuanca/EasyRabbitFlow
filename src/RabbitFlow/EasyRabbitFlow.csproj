@@ -5,21 +5,39 @@
 		<Nullable>enable</Nullable>
 		<Title>EasyRabbitFlow</Title>
 		<Authors>Juan Carlos Torres Cuervo</Authors>
-		<Description>EasyRabbitFlow - A streamlined .NET RabbitMQ client for seamless messaging integration, simplified configuration, and robust message handling.</Description>
-		<VersionPrefix>3.0.9</VersionPrefix>
-		<PackageTags>rabbitmq, .net, messaging</PackageTags>
+		<Description>EasyRabbitFlow: high-performance RabbitMQ client for .NET. Fluent configuration, optional topology (queue/exchange/dead-letter) generation, reflection-free consumers, configurable retry (exponential/backoff), custom dead-letter routing, temporary batch processing, queue state helpers. Targets .NET Standard 2.1.</Description>
+		<Version>4.0.0</Version>
+		<PackageTags>rabbitmq;dotnet;messaging;queue;consumer;publisher;retry;deadletter;backoff;temporary;batch</PackageTags>
 		<PackageProjectUrl>https://github.com/devjuanca/EasyRabbitFlow</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/devjuanca/EasyRabbitFlow</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageIcon>icon.png</PackageIcon>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<Deterministic>true</Deterministic>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+		<IncludeSymbols>true</IncludeSymbols>
+		<IncludeSources>true</IncludeSources>
+		<ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
 		<NoWarn>$(NoWarn);CS1591</NoWarn>
 	</PropertyGroup>
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.0" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
 		<PackageReference Include="RabbitMQ.Client" Version="7.1.2" />
 		<PackageReference Include="System.Text.Json" Version="9.0.0" />
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="\" />
+		<None Include="icon.png" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
 </Project>
