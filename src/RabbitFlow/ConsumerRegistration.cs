@@ -19,18 +19,37 @@ namespace EasyRabbitFlow
     public static class ConsumerRegistration
     {
         /// <summary>
-        /// Registers and starts a RabbitMQ consumer of type <typeparamref name="TConsumer"/> for messages of type <typeparamref name="TEventType"/>.
+        /// Registers and starts a RabbitMQ consumer of type <typeparamref name="TConsumer"/> 
+        /// for messages of type <typeparamref name="TEventType"/>.
         /// </summary>
-        /// <typeparam name="TEventType">The type of the message payload the consumer handles.</typeparam>
-        /// <typeparam name="TConsumer">The consumer implementation that processes incoming messages.</typeparam>
-        /// <param name="rootServiceProvider">The root service provider used to resolve dependencies.</param>
-        /// <param name="settings">Optional action to configure consumer registration settings.</param>
-        /// <param name="cancellationToken">A cancellation token for graceful shutdown.</param>
-        /// <returns>The original <see cref="IServiceProvider"/> instance, allowing fluent chaining.</returns>
+        /// <typeparam name="TEventType">The type of message payload that the consumer processes.</typeparam>
+        /// <typeparam name="TConsumer">The consumer implementation responsible for handling the messages.</typeparam>
+        /// <param name="rootServiceProvider">The root <see cref="IServiceProvider"/> used to resolve dependencies.</param>
+        /// <param name="settings">Optional configuration delegate for consumer registration behavior.</param>
+        /// <param name="cancellationToken">A token that propagates cancellation requests for graceful shutdown.</param>
+        /// <returns>The same <see cref="IServiceProvider"/> instance, allowing fluent chaining.</returns>
         /// <remarks>
-        /// This method establishes a connection and channel, declares queues and exchanges if configured,
-        /// and begins consuming messages asynchronously with retry, DLQ, and error handling support.
+        /// This method manually initializes and starts a consumer:
+        /// <list type="bullet">
+        /// <item><description>Establishes a RabbitMQ connection and channel.</description></item>
+        /// <item><description>Declares queues and exchanges (if <c>AutoGenerate</c> is enabled).</description></item>
+        /// <item><description>Starts consuming messages asynchronously with built-in retry, DLQ, and error-handling logic.</description></item>
+        /// </list>
         /// </remarks>
+        /// <remarks>
+        /// <b>Deprecated:</b> Use the hosted service registered via <c>AddRabbitFlowConsumers()</c> 
+        /// to automatically initialize all registered consumers.
+        /// <para>
+        /// <b>Migration guide:</b><br/>
+        /// 1) Remove manual calls to <c>InitializeConsumerAsync</c> from your <c>Program.cs</c> or Startup file.<br/>
+        /// 2) Add <c>services.AddRabbitFlowConsumersHostedService()</c> after configuring RabbitFlow.<br/>
+        /// 3) (Optional) Use the <paramref name="settings"/> action to mark consumers as active or inactive if you
+        /// still rely on this method during transition.
+        /// </para>
+        /// This method remains available temporarily for backward compatibility.
+        /// </remarks>
+        [Obsolete("Use AddRabbitFlowConsumers on IServiceCollection to automatically initialize all consumers. Remove manual calls to InitializeConsumerAsync.")]
+
         public static async Task<IServiceProvider> InitializeConsumerAsync<TEventType, TConsumer>(
             this IServiceProvider rootServiceProvider,
             Action<ConsumerRegisterSettings>? settings = null,

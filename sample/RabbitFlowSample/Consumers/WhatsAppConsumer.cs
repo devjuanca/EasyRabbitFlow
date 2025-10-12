@@ -1,22 +1,39 @@
-﻿using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Services;
 using RabbitFlowSample.Events;
 using System.Text.Json;
 
 namespace RabbitFlowSample.Consumers;
 
-public class WhatsAppConsumer : IRabbitFlowConsumer<NotificationEvent>
+public class WhatsAppConsumer(
+    GuidScopedService guidScopedService,
+    GuidSingletonService guidSingletonService,
+    GuidTransientService guidTransientService,
+    ILogger<WhatsAppConsumer> logger) : IRabbitFlowConsumer<NotificationEvent>
 {
-    private readonly ILogger<WhatsAppConsumer> _logger;
-
-    public WhatsAppConsumer(ILogger<WhatsAppConsumer> logger)
-    {
-        _logger = logger;
-    }
-
     public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("New whatsapp event received. Event:{event}", JsonSerializer.Serialize(message));
+        var scopedGuid = guidScopedService.Guid;
 
-        await Task.Delay(1000, cancellationToken);
+        var singletonGuid = guidSingletonService.Guid;
+
+        var transientGuid = guidTransientService.Guid;
+
+        logger.LogInformation("[WhatsApp] Singleton service GUID: {Guid}", singletonGuid);
+
+        logger.LogInformation("[WhatsApp] Scoped service GUID: {Guid}", scopedGuid);
+
+        logger.LogInformation("[WhatsApp] Transient service GUID: {Guid}", transientGuid);
+
+        if (message.WhatsAppNotificationData is null)
+        {
+            logger.LogInformation("[WhatsApp] No whatsapp data. Skipping.");
+            return;
+        }
+
+        var latency = Random.Shared.Next(50, 250);
+        
+        await Task.Delay(latency, cancellationToken);
+        
+        logger.LogInformation("[WhatsApp] Delivered whatsapp message after {Latency}ms: {Payload}", latency, JsonSerializer.Serialize(message.WhatsAppNotificationData));
     }
 }

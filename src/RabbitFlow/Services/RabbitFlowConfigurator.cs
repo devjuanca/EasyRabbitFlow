@@ -3,7 +3,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using RabbitMQ.Client;
 using System;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace EasyRabbitFlow.Services
 {
@@ -17,6 +22,8 @@ namespace EasyRabbitFlow.Services
     {
         private readonly IServiceCollection _services;
 
+        private static readonly ConcurrentDictionary<Type, Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?>> _deserializeCache = new ConcurrentDictionary<Type, Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?>>();
+    
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RabbitFlowConfigurator"/> class.
@@ -97,7 +104,95 @@ namespace EasyRabbitFlow.Services
 
             settings.Invoke(consumerSettings);
 
-            _services.AddSingleton(consumerSettings);
+			_services.AddSingleton(consumerSettings);
+
+			var consumerType = typeof(TConsumer);
+			
+            var consumerInterface = consumerType.GetInterfaces().FirstOrDefault(t => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IRabbitFlowConsumer<>))
+				?? throw new Exception($"Consumer {consumerType.Name} must implement IRabbitFlowConsumer<TEvent>.");
+			
+            var eventType = consumerInterface.GetGenericArguments().First();
+
+            // Get method info once
+            var handleMethod = consumerType.GetMethod(nameof(IRabbitFlowConsumer<object>.HandleAsync))
+                ?? throw new InvalidOperationException($"Method HandleAsync not found in {consumerType.Name}.");
+
+            // Build a strongly-typed wrapper via expression once.
+            Func<object, object, CancellationToken, Task> compiledHandleAsync = BuildHandleWrapper(consumerType, eventType, handleMethod);
+
+            var factory = new ConsumerSettingsFactory
+            {
+                Deserialize = GetOrBuildDeserializer(eventType),
+                InvokeHandleAsync = compiledHandleAsync,
+                PublishToCustomDeadletter = (evt, queue, sp) =>
+                {
+                    var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+                    return publisher.PublishAsync(evt, queue, publisherId: "custom-dead-letter");
+                }
+            };
+
+
+            // Build generic marker type ConsumerSettingsMarker<TConsumer,TEvent>
+            var markerType = typeof(ConsumerSettingsMarker<,>).MakeGenericType(consumerType, eventType);
+			
+            var markerInstance = Activator.CreateInstance(markerType, consumerSettings, factory)!;
+			
+            _services.AddSingleton(typeof(IConsumerSettingsMarker), markerInstance);
+        }
+
+        // Builds a compiled delegate that wraps TConsumer.HandleAsync(TEvent, CancellationToken)
+        private static Func<object, object, CancellationToken, Task> BuildHandleWrapper(
+            Type consumerType,
+            Type eventType,
+            System.Reflection.MethodInfo handleMethod)
+        {
+            var consumerObj = Expression.Parameter(typeof(object), "consumerObj");
+
+            var messageObj = Expression.Parameter(typeof(object), "messageObj");
+            
+            var ct = Expression.Parameter(typeof(CancellationToken), "ct");
+
+            var call = Expression.Call(
+                Expression.Convert(consumerObj, consumerType),
+                handleMethod,
+                Expression.Convert(messageObj, eventType),
+                ct);
+
+            var lambda = Expression.Lambda<Func<object, object, CancellationToken, Task>>(call, consumerObj, messageObj, ct);
+
+            return lambda.Compile();
+        }
+
+        // Builds and caches a strongly-typed JsonSerializer.Deserialize<TEvent>(ReadOnlySpan<byte>, JsonSerializerOptions)
+        private static Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?> GetOrBuildDeserializer(Type eventType)
+        {
+            return _deserializeCache.GetOrAdd(eventType, Build);
+
+            static Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?> Build(Type t)
+            {
+                var memParam = Expression.Parameter(typeof(ReadOnlyMemory<byte>), "mem");
+                
+                var optsParam = Expression.Parameter(typeof(JsonSerializerOptions), "opts");
+
+                // Access mem.Span
+                var spanProp = Expression.Property(memParam, nameof(ReadOnlyMemory<byte>.Span));
+
+                // Method: JsonSerializer.Deserialize<T>(ReadOnlySpan<byte>, JsonSerializerOptions)
+                var genericMethod = typeof(JsonSerializer)
+                    .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                    .First(m => m.Name == nameof(JsonSerializer.Deserialize) && m.IsGenericMethod && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(ReadOnlySpan<byte>));
+
+                var closedMethod = genericMethod.MakeGenericMethod(t);
+
+                var call = Expression.Call(closedMethod, spanProp, optsParam);
+
+                // box result
+                var body = Expression.Convert(call, typeof(object));
+
+                var lambda = Expression.Lambda<Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?>>(body, memParam, optsParam);
+                
+                return lambda.Compile();
+            }
         }
     }
 }

@@ -1,11 +1,16 @@
 using EasyRabbitFlow;
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
+using Microsoft.AspNetCore.Mvc;
 using RabbitFlowSample;
 using RabbitFlowSample.Consumers;
 using RabbitFlowSample.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddEndpointsApiExplorer();
+
+builder.Services.AddSwaggerGen();
 
 builder.Services.AddRabbitFlow(settings =>
 {
@@ -14,19 +19,18 @@ builder.Services.AddRabbitFlow(settings =>
         hostSettings.Host = "localhost";
         hostSettings.Username = "guest";
         hostSettings.Password = "guest";
-        hostSettings.Port = 5672; // Default Port. OPTIONAL
+        hostSettings.Port = 5672; // Optional (default 5672)
     });
 
     settings.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = false); // OPTIONAL
 
-    settings.AddConsumer<EmailConsumer>(queueName: "emails-test-queue", consumerSettings =>
-    {
-        consumerSettings.ConsumerId = "Email";
 
-        consumerSettings.PrefetchCount = 5;
+    settings.AddConsumer<EmailConsumer>(queueName: "email-queue", consumerSettings =>
+    {
+        consumerSettings.ConsumerId = "EmailQueueConsumer";
 
         consumerSettings.Timeout = TimeSpan.FromMilliseconds(2000);
-
+        
         consumerSettings.AutoGenerate = true;
 
         consumerSettings.ConfigureAutoGenerate(opt =>
@@ -44,14 +48,14 @@ builder.Services.AddRabbitFlow(settings =>
             retryPolicy.ExponentialBackoffFactor = 2;
         });
 
+        consumerSettings.ExtendDeadletterMessage = true;
+
     });
 
-    settings.AddConsumer<WhatsAppConsumer>("whatsapps-test-queue", consumerSettings =>
+    settings.AddConsumer<WhatsAppConsumer>(queueName: "whatsapp-queue", consumerSettings =>
     {
-        consumerSettings.ConsumerId = "WhatsApp";
-
-        consumerSettings.PrefetchCount = 5;
-
+        consumerSettings.Timeout = TimeSpan.FromMilliseconds(3000);
+        
         consumerSettings.AutoGenerate = true;
 
         consumerSettings.ConfigureAutoGenerate(opt =>
@@ -60,25 +64,12 @@ builder.Services.AddRabbitFlow(settings =>
             opt.ExchangeType = ExchangeType.Fanout;
             opt.ExclusiveQueue = false;
         });
+
+        consumerSettings.ExtendDeadletterMessage = true;     
     });
 
-    settings.AddConsumer<ServiceLifetimeTestConsumer>("service-lifetime-test", consumerSettings =>
-    {
-        consumerSettings.AutoGenerate = true;
 
-        consumerSettings.PrefetchCount = 5;
-
-        consumerSettings.ExtendDeadletterMessage = true;
-
-        consumerSettings.Timeout = TimeSpan.FromSeconds(10);
-
-        consumerSettings.ConfigureRetryPolicy(retryPolicy =>
-        {
-            retryPolicy.MaxRetryCount = 2;
-        });
-    });
-
-});
+}).UseRabbitFlowConsumers();
 
 builder.Services.AddSingleton<GuidSingletonService>();
 
@@ -88,122 +79,107 @@ builder.Services.AddTransient<GuidTransientService>();
 
 var app = builder.Build();
 
-await app.Services.InitializeConsumerAsync<NotificationEvent, EmailConsumer>();
+app.UseSwagger();
 
-await app.Services.InitializeConsumerAsync<NotificationEvent, WhatsAppConsumer>();
-
-await app.Services.InitializeConsumerAsync<ServiceLifetimeEvent, ServiceLifetimeTestConsumer>();
+app.UseSwaggerUI();
 
 app.UseHttpsRedirection();
 
-app.MapPost("/notification", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
+
+// Fanout broadcast (both email & whatsapp consumers receive)
+app.MapPost("/notification", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await Task.WhenAll(Enumerable.Range(0, 1).Select(i => publisher.PublishAsync(emailEvent, exchangeName: "notifications", routingKey: "")));
+    await publisher.PublishAsync(eventPayload, exchangeName: "notifications", routingKey: "");
+    
+    return Results.Accepted(value: eventPayload);
+})
+.WithName("PublishNotificationFanout")
+.WithSummary("Publishes NotificationEvent to fanout exchange 'notifications'.")
+.Produces(StatusCodes.Status202Accepted);
 
-});
-
-app.MapPost("/whatsapp", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
+// Direct email send bypassing fanout (goes only to email-send-queue)
+app.MapPost("/email", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await  publisher.PublishAsync(emailEvent, "whatsapps-test-queue");
-});
+    await publisher.PublishAsync(eventPayload, "email-queue");
+    
+    return Results.Accepted(value: eventPayload);
+})
+.WithName("PublishEmailDirectQueue")
+.WithSummary("Publishes NotificationEvent directly to email send queue.")
+.Produces(StatusCodes.Status202Accepted);
 
-app.MapPost("/email", async (IRabbitFlowPublisher publisher, NotificationEvent emailEvent) =>
+// Direct whatsapp delivery bypassing fanout
+app.MapPost("/whatsapp", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await publisher.PublishAsync(emailEvent, "emails-test-queue");
-});
+    await publisher.PublishAsync(eventPayload, "whatsapp-queue");
+    
+    return Results.Accepted(value: eventPayload);
+})
+.WithName("PublishWhatsAppDirectQueue")
+.WithSummary("Publishes NotificationEvent directly to whatsapp delivery queue.")
+.Produces(StatusCodes.Status202Accepted);
 
-app.MapPost("/service-lifetime-test", async (IRabbitFlowPublisher publisher, ILogger<Program> logger) =>
+
+app.MapPost("/volatile", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger,  CancellationToken ct) =>
 {
-    await Task.WhenAll(Enumerable.Range(0, 20).Select(i => publisher.PublishAsync(new ServiceLifetimeEvent(), "service-lifetime-test")));
-});
+    var events = Enumerable.Range(0, count).Select(_ => new VolatileEvent()).ToArray();
+    
+    var processed = await rabbitFlowTemporary.RunAsync(
+        messages: events,
+        onMessageReceived: async (@event, msgCt) =>
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), msgCt);
+            logger.LogInformation("Processed volatile event {Id}", @event.Id);
+        },
+        onCompleted: (totalProcessed, errors) =>
+        {
+            logger.LogInformation("Volatile batch completed. Total={Total}, Errors={Errors}", totalProcessed, errors);
+        },
+        options: new RunTemporaryOptions
+        {
+            PrefetchCount = 2,
+            Timeout = TimeSpan.FromSeconds(10),
+            QueuePrefixName = "volatile",
+        },
+        cancellationToken: ct);
 
-app.MapPost("/volatile", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger, VolatileEvent emailEvent, CancellationToken cancellationToken) =>
+    return Results.Ok(new { requested = count, processed });
+})
+.WithName("RunVolatileAndForget")
+.WithSummary("Runs a temporary volatile queue.")
+.Produces(StatusCodes.Status200OK);
+
+
+app.MapPost("/volatile-fire-and-forget", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger,  CancellationToken ct = default) =>
 {
-    var events = Enumerable.Range(0, 15).Select(i => new VolatileEvent
-    {
-        Id = Guid.NewGuid()
-
-    }).ToArray();
-
+    var events = Enumerable.Range(0, count).Select(_ => new VolatileEvent()).ToArray();
 
     rabbitFlowTemporary.RunAsync(
         messages: events,
         onMessageReceived: async (@event, ct) =>
-         {
-             await Task.Delay(TimeSpan.FromMilliseconds(1000), ct);
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), ct);
 
-             logger.LogWarning("[{Timestamp}] - P1 Completado: {@e}", DateTime.Now, @event.Id);
-
-         },
+            logger.LogInformation("Processed volatile event {Id}", @event.Id);
+        },
         onCompleted: (totalProcessed, errors) =>
         {
-            logger.LogWarning("[{Timestamp}] - COMPLETED: {processed}", DateTime.Now, totalProcessed);
+            logger.LogInformation("Volatile batch completed. Total={Total}, Errors={Errors}", totalProcessed, errors);
         },
-       options: new RunTemporaryOptions
-       {
-           PrefetchCount = 5,
-           Timeout = TimeSpan.FromSeconds(30),
-           QueuePrefixName = "volatile",
-       },
-       cancellationToken: CancellationToken.None)
-    .ContinueWith(t => { }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-
-});
-
-
-app.MapPost("/volatile-with-results", (IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger, IServiceScopeFactory serviceScopeFactory, VolatileEvent emailEvent, CancellationToken cancellationToken) =>
-{
-    var events = Enumerable.Range(0, 20).Select(i => new VolatileEvent
-    {
-        Id = Guid.NewGuid()
-    }).ToArray();
-
-    rabbitFlowTemporary.RunAsync(
-    messages: events,
-    onMessageReceived: async (@event, ct) =>
-    {
-
-        await Task.Delay(TimeSpan.FromMilliseconds(1000), cancellationToken);
-
-        using var scope = serviceScopeFactory.CreateScope();
-
-        var guidService = scope.ServiceProvider.GetRequiredService<GuidSingletonService>();
-
-        int shouldFail = new Random().Next(0, 10);
-
-        if (shouldFail < 5)
+        options: new RunTemporaryOptions
         {
-            throw new Exception("Simulated failure for testing purposes.");
-        }
+            PrefetchCount = 2,
+            Timeout = TimeSpan.FromSeconds(10),
+            QueuePrefixName = "volatile",
+        },
+        cancellationToken: CancellationToken.None)
+    .FireAndForget(cancellationToken: CancellationToken.None);
 
-        logger.LogWarning("[{Timestamp}] - P2 Completado: {@e}", DateTime.Now, @event.Id);
-
-        return new VolatileResult(@event.Id, guidService.Guid, true, DateTime.UtcNow);
-
-    },
-    onCompletedAsync: async (totalMessages, results) =>
-    {
-        logger.LogWarning("Completed: {count} from a total of {totalMessages}", results.Count, totalMessages);
-
-        foreach (var result in results)
-        {
-            logger.LogWarning("[{Timestamp}] - Resultado: {@result}", result.Timestamp, result);
-        }
-
-        await Task.CompletedTask;
-    },
-    options: new RunTemporaryOptions
-    {
-        PrefetchCount = 5,
-        Timeout = TimeSpan.FromSeconds(30),
-        QueuePrefixName = "volatile-with-results",
-    },
-    cancellationToken: CancellationToken.None)
-.ContinueWith(t => { }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-
-});
+    return Results.Accepted();
+})
+.WithName("RunVolatile")
+.WithSummary("Runs a temporary volatile queue as a fire and forget.")
+.Produces(StatusCodes.Status202Accepted);
 
 
 app.Run();
-
-internal record VolatileResult(Guid EventId, Guid CompletionId, bool Success, DateTime Timestamp);

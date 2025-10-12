@@ -1,6 +1,6 @@
 ## RabbitFlow Documentation
 
-Welcome to the documentation for the **RabbitFlow** library! This guide will walk you through the process of configuring and using RabbitMQ consumers in your application using RabbitFlow.
+Welcome to **RabbitFlow**, a streamlined .NET library for configuring RabbitMQ messaging with minimal ceremony and high performance.
 
 ### Table of Contents
 
@@ -12,21 +12,28 @@ Welcome to the documentation for the **RabbitFlow** library! This guide will wal
    - [Publisher Options](#publisher-options)
 4. [Consumers](#consumers)
    - [Adding Consumers](#adding-consumers)
+   - [Auto-Generate Queue / Exchange](#auto-generate-queue-exchange)
+   - [Custom Dead-Letter](#custom-dead-letter)
    - [Retry Policies](#retry-policies)
    - [Consumer Interface Implementation](#consumer-interface-implementation)
-5. [Initialize Consumers](#initialize-consumers)
+5. [Hosted Initialization (Recommended)](#hosted-initialization-recommended)
 6. [Publishing Messages](#publishing-messages)
 7. [Queue State](#queue-state)
 8. [Temporary Queue Processing](#temporary-message-processing)
+9. [Performance Notes](#performance-notes)
 
 
 ### 1. Introduction
 
-RabbitFlow is an intuitive library designed to simplify the management of RabbitMQ consumers within your application. This documentation provides step-by-step instructions for setting up, configuring, and using RabbitFlow effectively in your projects.
+RabbitFlow simplifies integration with RabbitMQ by:
+- Auto-registering consumers with strongly typed settings.
+- Optional automatic queue/exchange/dead-letter generation.
+- Efficient retry, timeout, and error handling.
+- High performance message processing (no per-message reflection).
 
-RabbitFlow is specifically designed to handle two approaches: pre-defined exchanges and queues within RabbitMQ, as well as the dynamic creation of new ones as needed. The rationale behind this approach is to offer flexibility in managing RabbitMQ infrastructure while maintaining simplicity in usage.
+It supports both pre-existing infrastructure and on-demand generation.
 
-Now, let's dive into the details of setting up, configuring, and using RabbitFlow in your projects.
+Let’s explore setup and usage.
 ### 2. Install
 
 To install the **RabbitFlow** library into your project, you can use the NuGet package manager:
@@ -36,32 +43,48 @@ dotnet add package EasyRabbitFlow
 ```
 
 ### 3. Configuration
-To configure RabbitFlow in your application, use the AddRabbitFlow method:
+Register core services using `AddRabbitFlow`, then optionally start the hosted consumer service with `UseRabbitFlowConsumers`.
 ```csharp
-builder.Services.AddRabbitFlow(opt =>
-{
-    // Configure host settings
-    opt.ConfigureHost(hostSettings =>
+builder.Services
+    .AddRabbitFlow(cfg =>
     {
-        hostSettings.Host = "rabbitmq.example.com";
-        hostSettings.Username = "guest";
-        hostSettings.Password = "guest";
-    });
+        cfg.ConfigureHost(host =>
+        {
+            host.Host = "rabbitmq.example.com";
+            host.Username = "guest";
+            host.Password = "guest";
+        });
 
-    // Configure JSON serialization options. [OPTIONAL]
-    opt.ConfigureJsonSerializerOptions(jsonSettings =>
-    {
-        jsonSettings.PropertyNameCaseInsensitive = true;
-        jsonSettings.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-        jsonSettings.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
-    });
+        cfg.ConfigureJsonSerializerOptions(json =>
+        {
+            json.PropertyNameCaseInsensitive = true;
+            json.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+            json.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+        });
 
-    // Configure Publisher. [OPTIONAL]
-    opt.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = false);
+        cfg.ConfigurePublisher(pub => pub.DisposePublisherConnection = false);
 
-    // Add and configure consumers
-     settings.AddConsumer<TConsumer>(consumer=>{...});
-});
+        cfg.AddConsumer<EmailConsumer>("email-queue", c =>
+        {
+            c.PrefetchCount = 5;
+            c.Timeout = TimeSpan.FromSeconds(2);
+            c.AutoGenerate = true;
+            c.ConfigureAutoGenerate(a =>
+            {
+                a.ExchangeName = "notifications";
+                a.ExchangeType = ExchangeType.Fanout;
+                a.GenerateDeadletterQueue = true;
+            });
+            c.ConfigureRetryPolicy(r =>
+            {
+                r.MaxRetryCount = 3;
+                r.RetryInterval = 1000; // ms
+                r.ExponentialBackoff = true;
+                r.ExponentialBackoffFactor = 2;
+            });
+        });
+    })
+    .UseRabbitFlowConsumers(); // starts background consumption
 ```
 
 - #### 3.1 Host Configuration
@@ -174,26 +197,13 @@ public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
 ```
 
 
-### 5. Initialize Consumers
-Use the `InitializeConsumer` extension method to efficiently process messages using registered consumers.
-
-This method is an extension of `IServiceProvider`. It is intended for use when the application's ServiceProvider is already built, ensuring no second container is created to handle incoming messages.
-
-This method resolves all required services and configurations, starting the message listener for the queue.
-
-You can configure whether the consumer will be active and whether a new instance of the consumer should be created for each message. This ensures isolated processing in a scoped environment or a single instance for all incoming messages. Use this feature according to your needs.
-
+### 5. Hosted Initialization (Recommended)
+Consumers are automatically started by calling:
+```csharp
+builder.Services.AddRabbitFlow(cfg => { /* config */ })
+                .UseRabbitFlowConsumers();
 ```
-var app = builder.Build();
-
-app.Services.InitializeConsumer<EmailEvent, EmailConsumer>();
-
-app.Services.InitializeConsumer<WhatsAppEvent, WhatsAppConsumer>(opt =>
-{
-    opt.PerMessageInstance = true;
-    opt.Active = false;
-});
-```
+Older manual initialization methods are deprecated.
 
 ### 6. Publishing Messages
 Publisher Interface

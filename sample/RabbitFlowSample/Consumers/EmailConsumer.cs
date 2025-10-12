@@ -1,22 +1,35 @@
-﻿using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Exceptions;
 using RabbitFlowSample.Events;
 using System.Text.Json;
 
 namespace RabbitFlowSample.Consumers;
 
-public class EmailConsumer : IRabbitFlowConsumer<NotificationEvent>
+public class EmailConsumer(ILogger<EmailConsumer> logger) : IRabbitFlowConsumer<NotificationEvent>
 {
-    private readonly ILogger<EmailConsumer> _logger;
-
-    public EmailConsumer(ILogger<EmailConsumer> logger)
-    {
-        _logger = logger;
-    }
-
     public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("New email event received. Event:{event}", JsonSerializer.Serialize(message));
+        if (message.EmailNotificationData is null)
+        {
+            logger.LogInformation("[EmailSend] No email data. Skipping.");
+            return;
+        }
+        // Simulate random transient failure
+        var roll = Random.Shared.NextDouble();
 
-        await Task.Delay(1000, cancellationToken);
+        if (roll < 0.15)
+        {
+            logger.LogWarning("[EmailSend] Transient failure encountered. Will be retried if configured.");
+            throw new RabbitFlowTransientException("Simulated transient email send failure.");
+        }
+        if (roll > 0.95)
+        {
+            logger.LogError("[EmailSend] Permanent failure encountered. Will not retry.");
+            throw new Exception("Simulated permanent email failure.");
+        }
+        
+        await Task.Delay(300, cancellationToken); // Simulate IO
+        
+        logger.LogInformation("[EmailSend] Email sent successfully: {Payload}", JsonSerializer.Serialize(message.EmailNotificationData));
     }
 }
