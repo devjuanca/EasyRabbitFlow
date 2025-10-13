@@ -16,7 +16,6 @@ using System.Threading.Tasks;
 
 namespace EasyRabbitFlow.Services
 {
-
     internal class ConsumerHostedService : IHostedService
     {
         private readonly IServiceProvider _root;
@@ -53,7 +52,13 @@ namespace EasyRabbitFlow.Services
             foreach (var marker in markers)
             {
                 var settingsObj = marker.SettingsInstance;
-                
+
+                if (!settingsObj.Enable)
+                {
+                    _logger.LogInformation("[RABBIT-FLOW]: Consumer for {Consumer} is disabled. Skipping.", marker.ConsumerType.Name);
+                    continue;
+                }
+
                 var consumerType = marker.ConsumerType;
                 
                 var eventType = marker.EventType;
