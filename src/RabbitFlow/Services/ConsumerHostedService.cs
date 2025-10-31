@@ -115,9 +115,15 @@ namespace EasyRabbitFlow.Services
 
                 if (autoGenerate)
                 {
-                    var autoGenObj = _root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(consumerType));
+                    var autoGenType = typeof(AutoGenerateSettings<>).MakeGenericType(consumerType);
 
-                    if (autoGenObj != null)
+                    var autoGenObj = _root.GetService(autoGenType) ?? Activator.CreateInstance(autoGenType);
+
+                    if (autoGenObj == null)
+                    {
+                        _logger.LogWarning("[RABBIT-FLOW]: AutoGenerateSettings could not be created for {Consumer}. Skipping generation.", consumerType.Name);
+                    }
+                    else
                     {
                         var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? $"{queueName}-exchange";
                         
@@ -135,37 +141,30 @@ namespace EasyRabbitFlow.Services
                         
                         var exchangeType = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeType))?.GetValue(autoGenObj)?.ToString()?.ToLowerInvariant() ?? "direct";
                         
-                        var generateExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateExchange))?.GetValue(autoGenObj) ?? false;
-
+                        var generateExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateExchange))?.GetValue(autoGenObj) ?? true; // default true when fallback
+                        
                         IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
 
                         if (generateDeadletter)
                         {
                             deadLetterQueueName = $"{queueName}-deadletter";
-                            
                             var deadLetterExchange = $"{queueName}-deadletter-exchange";
-                            
                             var deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
 
                             await channel.QueueDeclareAsync(deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: cancellationToken);
-                            
                             await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: cancellationToken);
-                            
                             await channel.QueueBindAsync(deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
 
                             args ??= new Dictionary<string, object?>();
-                            
                             args["x-dead-letter-exchange"] = deadLetterExchange;
-                            
                             args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
                         }
 
                         await channel.QueueDeclareAsync(queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
-                        
+
                         if (generateExchange)
                         {
                             await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
-
                             await channel.QueueBindAsync(queueName, exchangeName, routingKey);
                         }
                     }

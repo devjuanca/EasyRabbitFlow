@@ -6,7 +6,7 @@
 		<Title>EasyRabbitFlow</Title>
 		<Authors>Juan Carlos Torres Cuervo</Authors>
 		<Description>EasyRabbitFlow: high-performance RabbitMQ client for .NET. Fluent configuration, optional topology (queue/exchange/dead-letter) generation, reflection-free consumers, configurable retry (exponential/backoff), custom dead-letter routing, temporary batch processing, queue state helpers. Targets .NET Standard 2.1.</Description>
-		<Version>4.0.1</Version>
+		<Version>4.0.2</Version>
 		<PackageTags>rabbitmq;dotnet;messaging;queue;consumer;publisher;retry;deadletter;backoff;temporary;batch</PackageTags>
 		<PackageProjectUrl>https://github.com/devjuanca/EasyRabbitFlow</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/devjuanca/EasyRabbitFlow</RepositoryUrl>
