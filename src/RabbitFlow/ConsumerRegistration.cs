@@ -225,6 +225,8 @@ namespace EasyRabbitFlow
 
             var semaphore = new SemaphoreSlim(consumerOptions.PrefetchCount);
 
+            var channelGate = new SemaphoreSlim(1, 1);
+
             consumer.ReceivedAsync += async (sender, args) =>
             {
                 if (cancellationToken.IsCancellationRequested)
@@ -248,9 +250,7 @@ namespace EasyRabbitFlow
             {
                 try
                 {
-                    var body = args.Body.ToArray();
-
-                    var message = Encoding.UTF8.GetString(body);
+                    var message = Encoding.UTF8.GetString(args.Body.Span);
 
                     TEventType? @event;
 
@@ -264,6 +264,7 @@ namespace EasyRabbitFlow
                         await HandleErrorAsync<TEventType>(
                             autoAck: consumerOptions.AutoAckOnError,
                             channel: channel,
+                            channelGate: channelGate,
                             deliveryTag: args.DeliveryTag,
                             extendDeadletterMessage: consumerOptions.ExtendDeadletterMessage,
                             deadletterQueue: deadLetterQueueName,
@@ -304,7 +305,7 @@ namespace EasyRabbitFlow
 
                             await typedConsumer.HandleAsync(@event, attemptCt).ConfigureAwait(false);
 
-                            await SafeAckAsync(channel, args.DeliveryTag, logger, cancellationToken);
+                            await SafeAckAsync(channel, channelGate, args.DeliveryTag, logger, cancellationToken);
 
                             return; // success
                         }
@@ -328,6 +329,7 @@ namespace EasyRabbitFlow
                             await HandleErrorAsync(
                                 consumerOptions.AutoAckOnError,
                                 channel,
+                                channelGate,
                                 args.DeliveryTag,
                                 consumerOptions.ExtendDeadletterMessage,
                                 deadLetterQueueName,
@@ -352,6 +354,7 @@ namespace EasyRabbitFlow
                         await HandleErrorAsync(
                             consumerOptions.AutoAckOnError,
                             channel,
+                            channelGate,
                             args.DeliveryTag,
                             consumerOptions.ExtendDeadletterMessage,
                             deadLetterQueueName,
@@ -400,8 +403,9 @@ namespace EasyRabbitFlow
             return rootServiceProvider;
         }
 
-        private static async Task SafeAckAsync<TConsumer>(IChannel channel, ulong deliveryTag, ILogger<TConsumer> logger, CancellationToken ct)
+        private static async Task SafeAckAsync<TConsumer>(IChannel channel, SemaphoreSlim channelGate, ulong deliveryTag, ILogger<TConsumer> logger, CancellationToken ct)
         {
+            await channelGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 await channel.BasicAckAsync(deliveryTag, false, ct);
@@ -413,6 +417,10 @@ namespace EasyRabbitFlow
             catch (Exception ex)
             {
                 logger.LogError(ex, "[RABBIT-FLOW]: Unexpected error while ACKing message.");
+            }
+            finally
+            {
+                channelGate.Release();
             }
         }
 
@@ -435,11 +443,11 @@ namespace EasyRabbitFlow
                 {
                     var computed = checked(baseDelay * (long)Math.Pow(retryPolicy.ExponentialBackoffFactor, attemptIndex - 1));
 
-                    delay = Math.Min(computed, 60_000);
+                    delay = Math.Min(computed, retryPolicy.MaxRetryDelay);
                 }
                 catch (OverflowException)
                 {
-                    delay = 60_000;
+                    delay = retryPolicy.MaxRetryDelay;
                 }
             }
 
@@ -458,6 +466,7 @@ namespace EasyRabbitFlow
         private static async Task HandleErrorAsync<TEventType>(
             bool autoAck,
             IChannel channel,
+            SemaphoreSlim channelGate,
             ulong deliveryTag,
             bool extendDeadletterMessage = false,
             string deadletterQueue = "",
@@ -466,6 +475,9 @@ namespace EasyRabbitFlow
             JsonSerializerOptions? serializerOptions = null,
             CancellationToken cancellationToken = default) where TEventType : class
         {
+            await channelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
             if (autoAck)
             {
                 try
@@ -543,6 +555,11 @@ namespace EasyRabbitFlow
                 {
                     // Closed channel. Broker automatically requeues (similar to no explicit ack).
                 }
+            }
+            }
+            finally
+            {
+                channelGate.Release();
             }
         }
     }

@@ -33,5 +33,12 @@
         /// The default value is 1, meaning the retry interval will double with each retry.
         /// </summary>
         public int ExponentialBackoffFactor { get; set; } = 1;
+
+        /// <summary>
+        /// Gets or sets the maximum delay (in milliseconds) allowed between retries when using exponential backoff.
+        /// This acts as an upper bound to prevent retry delays from growing indefinitely.
+        /// The default value is 60000 milliseconds (60 seconds).
+        /// </summary>
+        public int MaxRetryDelay { get; set; } = 60_000;
     }
 }

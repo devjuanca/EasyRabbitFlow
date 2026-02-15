@@ -72,7 +72,17 @@ namespace EasyRabbitFlow.Settings
         /// <summary>
         /// Fanout exchange type.
         /// </summary>
-        Fanout
+        Fanout,
+
+        /// <summary>
+        /// Topic exchange type.
+        /// </summary>
+        Topic,
+
+        /// <summary>
+        /// Headers exchange type.
+        /// </summary>
+        Headers
     }
 
 }

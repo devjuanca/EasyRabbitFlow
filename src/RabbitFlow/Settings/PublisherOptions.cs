@@ -18,23 +18,30 @@
 
 
         /// <summary>
-        /// Gets or sets the mode in which the RabbitMQ channel will operate.
-        /// This property determines how messages are confirmed after being published.
-        /// <list type="bullet">
-        /// <item><c>Transactional</c>: The channel will operate in transactional mode, where messages are only considered published after a transaction is committed. This ensures reliability but can introduce performance overhead.</item>
-        /// <item><c>Confirm</c>: The channel will use publisher confirms, where the broker sends a confirmation to indicate that the message was received. This mode offers a balance between reliability and performance.</item>
-        /// </list>
-        /// Default value is <see cref="ChannelMode.Confirm"/>. 
+        /// Gets or sets a value indicating whether idempotency support is enabled for published messages.
+        /// When <c>true</c>, the publisher automatically assigns a unique <c>MessageId</c> to each message
+        /// via <see cref="RabbitMQ.Client.IBasicProperties.MessageId"/>. Consumers can use this value 
+        /// for deduplication. The generated <c>MessageId</c> is also available in <see cref="PublishResult.MessageId"/>.
+        /// Default value is <c>false</c>.
         /// </summary>
-        public ChannelMode ChannelMode { get; set; } = ChannelMode.Confirm;
+        public bool IdempotencyEnabled { get; set; } = false;
     }
 
     /// <summary>
-    /// Specifies the mode in which the RabbitMQ channel operates for message publishing. Default is <see cref="ChannelMode.Confirm"/>.
+    /// Specifies the mode in which the RabbitMQ channel operates for batch message publishing.
     /// </summary>
     public enum ChannelMode
     {
+        /// <summary>
+        /// All messages in the batch are published atomically within a single AMQP transaction.
+        /// If any message fails, the entire batch is rolled back and no messages are delivered.
+        /// </summary>
         Transactional,
+
+        /// <summary>
+        /// Each message in the batch is individually confirmed by the broker.
+        /// A failure mid-batch does not roll back previously confirmed messages.
+        /// </summary>
         Confirm
     }
 }

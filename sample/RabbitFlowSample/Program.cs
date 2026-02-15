@@ -91,9 +91,11 @@ app.UseHttpsRedirection();
 // Fanout broadcast (both email & whatsapp consumers receive)
 app.MapPost("/notification", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await publisher.PublishAsync(eventPayload, exchangeName: "notifications", routingKey: "");
-    
-    return Results.Accepted(value: eventPayload);
+    var result = await publisher.PublishAsync(eventPayload, exchangeName: "notifications", routingKey: "");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageId, result.Destination, result.TimestampUtc, Payload = eventPayload })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
 })
 .WithName("PublishNotificationFanout")
 .WithSummary("Publishes NotificationEvent to fanout exchange 'notifications'.")
@@ -102,9 +104,11 @@ app.MapPost("/notification", async ([FromServices] IRabbitFlowPublisher publishe
 // Direct email send bypassing fanout (goes only to email-send-queue)
 app.MapPost("/email", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await publisher.PublishAsync(eventPayload, "email-queue");
-    
-    return Results.Accepted(value: eventPayload);
+    var result = await publisher.PublishAsync(eventPayload, "email-queue");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageId, result.Destination, result.TimestampUtc, Payload = eventPayload })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
 })
 .WithName("PublishEmailDirectQueue")
 .WithSummary("Publishes NotificationEvent directly to email send queue.")
@@ -113,12 +117,27 @@ app.MapPost("/email", async ([FromServices] IRabbitFlowPublisher publisher, [Fro
 // Direct whatsapp delivery bypassing fanout
 app.MapPost("/whatsapp", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    await publisher.PublishAsync(eventPayload, "whatsapp-queue");
-    
-    return Results.Accepted(value: eventPayload);
+    var result = await publisher.PublishAsync(eventPayload, "whatsapp-queue");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageId, result.Destination, result.TimestampUtc, Payload = eventPayload })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
 })
 .WithName("PublishWhatsAppDirectQueue")
 .WithSummary("Publishes NotificationEvent directly to whatsapp delivery queue.")
+.Produces(StatusCodes.Status202Accepted);
+
+// Batch publish to fanout exchange (atomic by default - Transactional)
+app.MapPost("/notification/batch", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent[] events) =>
+{
+    var result = await publisher.PublishBatchAsync(events, exchangeName: "notifications", routingKey: "");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageCount, result.MessageIds, result.Destination, result.ChannelMode, result.TimestampUtc })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
+})
+.WithName("PublishNotificationBatch")
+.WithSummary("Publishes a batch of NotificationEvents atomically (Transactional by default).")
 .Produces(StatusCodes.Status202Accepted);
 
 
