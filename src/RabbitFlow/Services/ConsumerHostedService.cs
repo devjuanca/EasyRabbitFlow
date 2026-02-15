@@ -97,6 +97,8 @@ namespace EasyRabbitFlow.Services
 
                 int rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
 
+                int rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
+
                 var customDeadLetterObj = _root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(consumerType));
 
                 var connection = await connectionFactory.CreateConnectionAsync($"consumer_{consumerId}", cancellationToken);
@@ -106,6 +108,42 @@ namespace EasyRabbitFlow.Services
                 _connections.Add(connection);
                 
                 _channels.Add(channel);
+
+                connection.ConnectionShutdownAsync += (sender, args) =>
+                {
+                    _logger.LogWarning("[RABBIT-FLOW]: Connection shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", consumerType.Name, args.ReplyCode, args.ReplyText);
+                    return Task.CompletedTask;
+                };
+
+                connection.CallbackExceptionAsync += (sender, args) =>
+                {
+                    _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection callback exception for {Consumer}.", consumerType.Name);
+                    return Task.CompletedTask;
+                };
+
+                connection.RecoverySucceededAsync += (sender, args) =>
+                {
+                    _logger.LogInformation("[RABBIT-FLOW]: Connection recovery succeeded for {Consumer}.", consumerType.Name);
+                    return Task.CompletedTask;
+                };
+
+                connection.ConnectionRecoveryErrorAsync += (sender, args) =>
+                {
+                    _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection recovery error for {Consumer}.", consumerType.Name);
+                    return Task.CompletedTask;
+                };
+
+                channel.CallbackExceptionAsync += (sender, args) =>
+                {
+                    _logger.LogWarning(args.Exception, "[RABBIT-FLOW]: Channel callback exception for {Consumer}.", consumerType.Name);
+                    return Task.CompletedTask;
+                };
+
+                channel.ChannelShutdownAsync += (sender, args) =>
+                {
+                    _logger.LogWarning("[RABBIT-FLOW]: Channel shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", consumerType.Name, args.ReplyCode, args.ReplyText);
+                    return Task.CompletedTask;
+                };
 
                 channel.ContinuationTimeout = timeout;
                 
@@ -177,7 +215,7 @@ namespace EasyRabbitFlow.Services
                 // Build fast processor delegate using precompiled factory
                 var markerFactory = marker.Factory;
                 
-                var processor = BuildProcessorFromFactory(markerFactory, consumerType, eventType, channel, deadLetterQueueName, extendDeadLetter, autoAckOnError, serializerOptions, semaphore, rpMax, rpInterval, rpExp, rpFactor, customDeadLetterObj);
+                var processor = BuildProcessorFromFactory(markerFactory, consumerType, eventType, channel, deadLetterQueueName, extendDeadLetter, autoAckOnError, serializerOptions, semaphore, rpMax, rpInterval, rpExp, rpFactor, rpMaxDelay, customDeadLetterObj);
 
                 consumer.ReceivedAsync += async (_, ea) =>
                 {
@@ -212,6 +250,7 @@ namespace EasyRabbitFlow.Services
             int retryInterval,
             bool exponential,
             int expFactor,
+            int maxRetryDelay,
             object? customDeadLetterObj)
         {
             return async (args, rootCt) =>
@@ -259,13 +298,13 @@ namespace EasyRabbitFlow.Services
                         {
                             lastException = ex;
                             
-                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, rootCt);
+                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, maxRetryDelay, rootCt);
                         }
                         catch (RabbitFlowTransientException ex)
                         {
                             lastException = ex;
                             
-                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, rootCt);
+                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, maxRetryDelay, rootCt);
                         }
                         catch (Exception ex)
                         {
@@ -281,7 +320,7 @@ namespace EasyRabbitFlow.Services
 
                     if (remainingAttempts <= 0)
                     {
-                        await HandleErrorAsync(channel, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, evt, lastException ?? new Exception("Error desconocido"), eventType, serializerOptions, rootCt);
+                        await HandleErrorAsync(channel, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, evt, lastException ?? new Exception("Unknown error"), eventType, serializerOptions, rootCt);
                         
                         if (customDeadLetterObj != null && evt != null)
                         {
@@ -298,7 +337,7 @@ namespace EasyRabbitFlow.Services
                             }
                             catch (Exception dlxEx)
                             {
-                                _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publicando en custom dead-letter.");
+                                _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publishing to custom dead-letter queue.");
                             }
                         }
                     }
@@ -306,7 +345,7 @@ namespace EasyRabbitFlow.Services
                 catch (AlreadyClosedException) { }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[RABBIT-FLOW]: Excepción no controlada en procesamiento de mensaje (HostedService).");
+                    _logger.LogError(ex, "[RABBIT-FLOW]: Unhandled exception in message processing (HostedService).");
                 }
                 finally
                 {
@@ -315,7 +354,7 @@ namespace EasyRabbitFlow.Services
             };
         }
 
-        private static async Task ApplyRetryDelayReflection(int baseInterval, bool exponential, int expFactor, int maxRetries, int remainingAttempts, CancellationToken ct)
+        private static async Task ApplyRetryDelayReflection(int baseInterval, bool exponential, int expFactor, int maxRetries, int remainingAttempts, int maxRetryDelay, CancellationToken ct)
         {
             if (remainingAttempts <= 1)
             {
@@ -330,9 +369,9 @@ namespace EasyRabbitFlow.Services
                 try
                 {
                     var computed = checked(baseInterval * (long)Math.Pow(expFactor, attemptIndex - 1));
-                    delay = Math.Min(computed, 60_000);
+                    delay = Math.Min(computed, maxRetryDelay);
                 }
-                catch { delay = 60_000; }
+                catch { delay = maxRetryDelay; }
             }
             try 
             { 

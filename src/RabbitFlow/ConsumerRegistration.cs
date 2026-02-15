@@ -435,11 +435,11 @@ namespace EasyRabbitFlow
                 {
                     var computed = checked(baseDelay * (long)Math.Pow(retryPolicy.ExponentialBackoffFactor, attemptIndex - 1));
 
-                    delay = Math.Min(computed, 60_000);
+                    delay = Math.Min(computed, retryPolicy.MaxRetryDelay);
                 }
                 catch (OverflowException)
                 {
-                    delay = 60_000;
+                    delay = retryPolicy.MaxRetryDelay;
                 }
             }
 

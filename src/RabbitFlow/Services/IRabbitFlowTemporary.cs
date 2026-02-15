@@ -11,6 +11,8 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
+namespace EasyRabbitFlow.Services
+{
 
 public interface IRabbitFlowTemporary
 {
@@ -560,4 +562,5 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
         return processed;
     }
 
+}
 }

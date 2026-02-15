@@ -5,7 +5,7 @@ using System;
 
 namespace EasyRabbitFlow
 {
-    public static class DependencyInyection
+    public static class DependencyInjection
     {
         /// <summary>
         /// Configures core RabbitFlow services using the provided configurator.
