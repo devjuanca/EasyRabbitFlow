@@ -1,4 +1,5 @@
 using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Settings;
 using EasyRabbitFlow.Exceptions;
 using RabbitFlowSample.Events;
 using System.Text.Json;
@@ -7,8 +8,12 @@ namespace RabbitFlowSample.Consumers;
 
 public class EmailConsumer(ILogger<EmailConsumer> logger) : IRabbitFlowConsumer<NotificationEvent>
 {
-    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
+        // Access AMQP metadata via the message context parameter
+        logger.LogInformation("[EmailSend] Processing message. MessageId={MessageId}, Redelivered={Redelivered}",
+            context.MessageId ?? "(none)", context.Redelivered);
+
         if (message.EmailNotificationData is null)
         {
             logger.LogInformation("[EmailSend] No email data. Skipping.");

@@ -16,8 +16,39 @@
 
 ---
 
+> ## ⚠️ Breaking Changes (v5.0.0)
+>
+> **`IRabbitFlowConsumer<TEvent>.HandleAsync` signature changed**
+>
+> A new `RabbitFlowMessageContext` parameter was added to provide AMQP metadata (MessageId, CorrelationId, headers, delivery info) directly to each consumer.
+>
+> ```diff
+> - Task HandleAsync(TEvent message, CancellationToken cancellationToken);
+> + Task HandleAsync(TEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken);
+> ```
+>
+> **How to migrate:** Add the `RabbitFlowMessageContext context` parameter to every `HandleAsync` implementation. If you don't need the context, simply ignore it:
+>
+> ```csharp
+> public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, CancellationToken ct)
+> {
+>     // context is available but not required to use
+>     return ProcessAsync(message, ct);
+> }
+> ```
+>
+> **Other changes in v5.0.0:**
+> - `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
+> - `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
+> - `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
+> - `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
+> - `PublisherOptions.IdempotencyEnabled` is new — auto-assigns a unique `MessageId` to every published message.
+
+---
+
 ## Table of Contents
 
+- [⚠️ Breaking Changes (v5.0.0)](#️-breaking-changes-v500)
 - [Why EasyRabbitFlow?](#why-easyrabbitflow)
 - [Architecture Overview](#architecture-overview)
 - [Getting Started](#getting-started)
@@ -37,6 +68,8 @@
   - [Single Message](#single-message)
   - [Batch Publishing](#batch-publishing)
   - [Idempotency](#idempotency)
+  - [Correlation](#correlation)
+- [Message Context](#message-context)
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
 - [Temporary Batch Processing](#temporary-batch-processing)
@@ -59,6 +92,8 @@
 | Full DI integration (scoped/transient/singleton) | ✅ |
 | Publisher confirms (single) & transactional batch | ✅ |
 | Built-in idempotency support (auto `MessageId`) | ✅ |
+| CorrelationId support (end-to-end tracing) | ✅ |
+| `RabbitFlowMessageContext` per-message metadata | ✅ |
 | Rich `PublishResult` / `BatchPublishResult` types | ✅ |
 | Thread-safe channel operations | ✅ |
 | .NET Standard 2.1 (works with .NET 6, 7, 8, 9+) | ✅ |
@@ -158,10 +193,10 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
         _logger = logger;
     }
 
-    public async Task HandleAsync(OrderCreatedEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(OrderCreatedEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Processing order {OrderId}, total: {Total}",
-            message.OrderId, message.Total);
+        _logger.LogInformation("Processing order {OrderId}, total: {Total}, correlationId: {CorrelationId}",
+            message.OrderId, message.Total, context.CorrelationId);
 
         // Your business logic here: save to DB, send email, call API, etc.
         await Task.CompletedTask;
@@ -298,9 +333,11 @@ Every consumer implements `IRabbitFlowConsumer<TEvent>`:
 ```csharp
 public interface IRabbitFlowConsumer<TEvent>
 {
-    Task HandleAsync(TEvent message, CancellationToken cancellationToken);
+    Task HandleAsync(TEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken);
 }
 ```
+
+The `RabbitFlowMessageContext` parameter provides AMQP metadata (MessageId, CorrelationId, headers, etc.) for the message being processed. See [Message Context](#message-context) for details.
 
 Consumers support **full dependency injection** — you can inject any service (scoped, transient, singleton):
 
@@ -316,9 +353,9 @@ public class EmailConsumer : IRabbitFlowConsumer<NotificationEvent>
         _logger = logger;
     }
 
-    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Sending email to {Recipient}", message.Email);
+        _logger.LogInformation("Sending email to {Recipient}, MessageId={MessageId}", message.Email, context.MessageId);
         await _emailService.SendAsync(message.Email, message.Subject, message.Body, cancellationToken);
     }
 }
@@ -496,13 +533,14 @@ public class OrderService
             throw new Exception($"Publish failed: {result.Error?.Message}");
     }
 
-    // Publish to an exchange with routing key
-    public async Task BroadcastNotificationAsync(NotificationEvent notification)
+    // Publish to an exchange with routing key and correlation ID
+    public async Task BroadcastNotificationAsync(NotificationEvent notification, string correlationId)
     {
         var result = await _publisher.PublishAsync(
             notification,
             exchangeName: "notifications",
-            routingKey: "user.created");
+            routingKey: "user.created",
+            correlationId: correlationId);
 
         Console.WriteLine($"Published to {result.Destination} at {result.TimestampUtc}");
     }
@@ -514,12 +552,14 @@ public class OrderService
 ```csharp
 // Publish to exchange (with routing key) — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
-    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    string? correlationId = null, string publisherId = "",
+    JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Publish directly to queue — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
-    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    string? correlationId = null, string publisherId = "",
+    JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -564,14 +604,16 @@ var result = await publisher.PublishBatchAsync(
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string exchangeName, string routingKey,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    string? correlationId = null, string publisherId = "",
+    JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Batch to queue
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string queueName,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    string? correlationId = null, string publisherId = "",
+    JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -597,6 +639,69 @@ cfg.ConfigurePublisher(pub => pub.IdempotencyEnabled = true);
 ```
 
 When enabled, every published message (single or batch) gets a unique `MessageId` set in `BasicProperties.MessageId`. The ID is also returned in `PublishResult.MessageId` or `BatchPublishResult.MessageIds`.
+
+### Correlation
+
+Pass a `correlationId` when publishing to trace related messages end-to-end:
+
+```csharp
+// Single message with correlation
+await publisher.PublishAsync(order, "orders-queue", correlationId: "req-abc-123");
+
+// Exchange publish with correlation
+await publisher.PublishAsync(event, "notifications", routingKey: "new", correlationId: requestId);
+
+// Batch — same correlationId shared across all messages
+await publisher.PublishBatchAsync(events, "orders-queue", correlationId: batchId);
+```
+
+The `correlationId` is set on `BasicProperties.CorrelationId` and received by consumers via `RabbitFlowMessageContext.CorrelationId`.
+
+---
+
+## Message Context
+
+Every consumer receives a `RabbitFlowMessageContext` as a parameter of `HandleAsync`, providing access to AMQP metadata of the message being processed:
+
+```csharp
+public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
+{
+    public async Task HandleAsync(OrderCreatedEvent message, RabbitFlowMessageContext context, CancellationToken ct)
+    {
+        // Idempotency check using MessageId
+        if (context.MessageId != null && await _db.ExistsAsync(context.MessageId))
+        {
+            _logger.LogWarning("Duplicate message {Id}, skipping", context.MessageId);
+            return;
+        }
+
+        // Trace correlation across services
+        _logger.LogInformation("Processing order. CorrelationId={CorrelationId}", context.CorrelationId);
+
+        // Check if this is a redelivery
+        if (context.Redelivered)
+        {
+            _logger.LogWarning("Redelivered message, DeliveryTag={Tag}", context.DeliveryTag);
+        }
+
+        await ProcessOrderAsync(message, ct);
+    }
+}
+```
+
+**`RabbitFlowMessageContext` properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `MessageId` | string? | Unique ID from `BasicProperties.MessageId` (set when `IdempotencyEnabled = true`) |
+| `CorrelationId` | string? | Correlation ID from `BasicProperties.CorrelationId` (set via `correlationId` parameter) |
+| `Exchange` | string? | Exchange that delivered the message (empty for direct queue publishes) |
+| `RoutingKey` | string? | Routing key used when the message was published |
+| `Headers` | IDictionary? | Custom AMQP headers from `BasicProperties.Headers` |
+| `DeliveryTag` | ulong | Broker-assigned delivery tag for this message |
+| `Redelivered` | bool | Whether the broker redelivered this message |
+
+> **Note:** `RabbitFlowMessageContext` is immutable — all properties are read-only and populated automatically from `BasicDeliverEventArgs` before `HandleAsync` is invoked.
 
 ---
 
@@ -749,7 +854,7 @@ using EasyRabbitFlow.Exceptions;
 
 public class PaymentConsumer : IRabbitFlowConsumer<PaymentEvent>
 {
-    public async Task HandleAsync(PaymentEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(PaymentEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
         try
         {

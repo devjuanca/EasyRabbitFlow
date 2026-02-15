@@ -290,12 +290,21 @@ namespace EasyRabbitFlow.Services
                         var attemptCt = linked.Token;
                         
                         using var scope = _root.CreateScope();
-                        
+
                         try
                         {
+                            var messageContext = new RabbitFlowMessageContext(
+                                args.BasicProperties?.MessageId,
+                                args.BasicProperties?.CorrelationId,
+                                args.Exchange,
+                                args.RoutingKey,
+                                args.BasicProperties?.Headers,
+                                args.DeliveryTag,
+                                args.Redelivered);
+
                             var consumer = scope.ServiceProvider.GetRequiredService(consumerType);
-                            
-                            await markerFactory.InvokeHandleAsync(consumer, evt, attemptCt).ConfigureAwait(false);
+
+                            await markerFactory.InvokeHandleAsync(consumer, evt, messageContext, attemptCt).ConfigureAwait(false);
                             
                             await SafeAckAsync(channel, channelGate, args.DeliveryTag, rootCt);
                             

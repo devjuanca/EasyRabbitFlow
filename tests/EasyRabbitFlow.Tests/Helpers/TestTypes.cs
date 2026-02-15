@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Settings;
 
 namespace EasyRabbitFlow.Tests.Helpers;
 
@@ -15,7 +16,7 @@ public class TestConsumer : IRabbitFlowConsumer<TestEvent>
 
     public static IReadOnlyList<TestEvent> ReceivedMessages => _received.ToList();
 
-    public Task HandleAsync(TestEvent message, CancellationToken cancellationToken)
+    public Task HandleAsync(TestEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
         _received.Add(message);
         return Task.CompletedTask;
@@ -34,7 +35,7 @@ public class TransientFailConsumer : IRabbitFlowConsumer<TestEvent>
 
     public static IReadOnlyList<TestEvent> ReceivedMessages => _received.ToList();
 
-    public Task HandleAsync(TestEvent message, CancellationToken cancellationToken)
+    public Task HandleAsync(TestEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
         var count = Interlocked.Increment(ref _callCount);
 
