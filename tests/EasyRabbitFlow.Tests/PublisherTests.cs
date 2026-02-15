@@ -37,7 +37,7 @@ public class PublisherTests
         var result = await publisher.PublishAsync(evt, queueName);
 
         // Assert
-        Assert.True(result);
+        Assert.True(result.Success);
 
         var messageCount = await ch.MessageCountAsync(queueName);
         Assert.True(messageCount >= 1, $"Expected at least 1 message in queue, found {messageCount}");
@@ -66,7 +66,7 @@ public class PublisherTests
         var result = await publisher.PublishAsync(evt, exchangeName, routingKey: routingKey);
 
         // Assert
-        Assert.True(result);
+        Assert.True(result.Success);
 
         await Task.Delay(200); // small delay for message to be routed
         var messageCount = await ch.MessageCountAsync(queueName);

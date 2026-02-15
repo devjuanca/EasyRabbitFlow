@@ -34,6 +34,9 @@
   - [Retry Policies](#retry-policies)
   - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
 - [Publishing Messages](#publishing-messages)
+  - [Single Message](#single-message)
+  - [Batch Publishing](#batch-publishing)
+  - [Idempotency](#idempotency)
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
 - [Temporary Batch Processing](#temporary-batch-processing)
@@ -54,7 +57,10 @@
 | Temporary batch processing with auto-cleanup | ✅ |
 | Queue state & purge utilities | ✅ |
 | Full DI integration (scoped/transient/singleton) | ✅ |
-| Transactional or confirm-mode publishing | ✅ |
+| Publisher confirms (single) & transactional batch | ✅ |
+| Built-in idempotency support (auto `MessageId`) | ✅ |
+| Rich `PublishResult` / `BatchPublishResult` types | ✅ |
+| Thread-safe channel operations | ✅ |
 | .NET Standard 2.1 (works with .NET 6, 7, 8, 9+) | ✅ |
 
 ---
@@ -198,8 +204,10 @@ builder.Services
 ```csharp
 app.MapPost("/orders", async (OrderCreatedEvent order, IRabbitFlowPublisher publisher) =>
 {
-    var success = await publisher.PublishAsync(order, "orders-queue");
-    return success ? Results.Ok("Order queued") : Results.Problem("Failed to queue order");
+    var result = await publisher.PublishAsync(order, "orders-queue");
+    return result.Success
+        ? Results.Ok(new { result.Destination, result.MessageId, result.TimestampUtc })
+        : Results.Problem(result.Error?.Message);
 });
 ```
 
@@ -270,14 +278,14 @@ If not configured, the default `JsonSerializerOptions` are used.
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false; // Keep connection alive (default)
-    pub.ChannelMode = ChannelMode.Confirm;  // Confirm mode (default)
+    pub.IdempotencyEnabled = true;          // Auto-assign MessageId to every message
 });
 ```
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DisposePublisherConnection` | bool | `false` | Dispose connection after each publish |
-| `ChannelMode` | ChannelMode | `Confirm` | `Confirm` (fast + reliable) or `Transactional` (full ACID) |
+| `IdempotencyEnabled` | bool | `false` | Auto-assign a unique `MessageId` to every published message for deduplication |
 
 ---
 
@@ -463,7 +471,11 @@ When `ExtendDeadletterMessage = true`, the dead-letter message includes full err
 
 ## Publishing Messages
 
-Inject `IRabbitFlowPublisher` and publish to exchanges or queues:
+Inject `IRabbitFlowPublisher` to publish messages. All single-message publishes use **publisher confirms** — the `await` only completes after the broker confirms receipt.
+
+### Single Message
+
+Returns a `PublishResult` with `Success`, `Destination`, `RoutingKey`, `MessageId`, `TimestampUtc`, and `Error`:
 
 ```csharp
 public class OrderService
@@ -476,37 +488,115 @@ public class OrderService
     }
 
     // Publish directly to a queue
-    public async Task<bool> CreateOrderAsync(OrderCreatedEvent order)
+    public async Task CreateOrderAsync(OrderCreatedEvent order)
     {
-        return await _publisher.PublishAsync(order, queueName: "orders-queue");
+        var result = await _publisher.PublishAsync(order, queueName: "orders-queue");
+
+        if (!result.Success)
+            throw new Exception($"Publish failed: {result.Error?.Message}");
     }
 
     // Publish to an exchange with routing key
-    public async Task<bool> BroadcastNotificationAsync(NotificationEvent notification)
+    public async Task BroadcastNotificationAsync(NotificationEvent notification)
     {
-        return await _publisher.PublishAsync(
+        var result = await _publisher.PublishAsync(
             notification,
             exchangeName: "notifications",
             routingKey: "user.created");
+
+        Console.WriteLine($"Published to {result.Destination} at {result.TimestampUtc}");
     }
 }
 ```
 
-**Publisher method signatures:**
+**Method signatures:**
 
 ```csharp
-// Publish to exchange (with routing key)
-Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
+// Publish to exchange (with routing key) — always uses publisher confirms
+Task<PublishResult> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
     string publisherId = "", JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
-// Publish directly to queue
-Task<bool> PublishAsync<TEvent>(TEvent message, string queueName,
+// Publish directly to queue — always uses publisher confirms
+Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
     string publisherId = "", JsonSerializerOptions? jsonOptions = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
-Returns `true` on success, `false` on failure (errors are logged internally).
+**`PublishResult` properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `Success` | bool | Whether the broker confirmed the message |
+| `MessageId` | string? | Unique ID (when `IdempotencyEnabled = true`) |
+| `Destination` | string | Target exchange or queue name |
+| `RoutingKey` | string | Routing key used (empty for queue publishes) |
+| `TimestampUtc` | DateTime | When the publish was executed |
+| `Error` | Exception? | The exception if `Success` is `false` |
+
+### Batch Publishing
+
+Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter controls atomicity:
+
+- **`Transactional`** (default): All-or-nothing — if any message fails, the entire batch is rolled back.
+- **`Confirm`**: Each message is individually confirmed — a mid-batch failure does not roll back previous messages.
+
+```csharp
+// Atomic batch (Transactional — default)
+var result = await publisher.PublishBatchAsync(
+    orders,
+    exchangeName: "orders-exchange",
+    routingKey: "new-order");
+
+Console.WriteLine($"Batch: {result.MessageCount} messages, success={result.Success}");
+
+// Non-atomic batch (Confirm mode — higher throughput)
+var result = await publisher.PublishBatchAsync(
+    orders,
+    queueName: "orders-queue",
+    channelMode: ChannelMode.Confirm);
+```
+
+**Method signatures:**
+
+```csharp
+// Batch to exchange
+Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
+    string exchangeName, string routingKey,
+    ChannelMode channelMode = ChannelMode.Transactional,
+    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    CancellationToken cancellationToken = default) where TEvent : class;
+
+// Batch to queue
+Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
+    string queueName,
+    ChannelMode channelMode = ChannelMode.Transactional,
+    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    CancellationToken cancellationToken = default) where TEvent : class;
+```
+
+**`BatchPublishResult` properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `Success` | bool | Whether all messages were published |
+| `MessageCount` | int | Number of messages in the batch |
+| `MessageIds` | IReadOnlyList\<string\> | IDs per message (when `IdempotencyEnabled = true`) |
+| `Destination` | string | Target exchange or queue name |
+| `RoutingKey` | string | Routing key used |
+| `ChannelMode` | ChannelMode | Mode used (`Transactional` or `Confirm`) |
+| `TimestampUtc` | DateTime | When the batch was executed |
+| `Error` | Exception? | The exception if `Success` is `false` |
+
+### Idempotency
+
+Enable automatic `MessageId` generation so consumers can deduplicate:
+
+```csharp
+cfg.ConfigurePublisher(pub => pub.IdempotencyEnabled = true);
+```
+
+When enabled, every published message (single or batch) gets a unique `MessageId` set in `BasicProperties.MessageId`. The ID is also returned in `PublishResult.MessageId` or `BatchPublishResult.MessageIds`.
 
 ---
 
@@ -726,6 +816,7 @@ EasyRabbitFlow is designed for high-throughput scenarios:
 - **Zero per-message reflection** — consumer handlers are compiled via expression trees at startup, not resolved per message.
 - **Connection pooling** — publisher reuses a single connection by default.
 - **Prefetch control** — tune `PrefetchCount` for optimal throughput vs. memory usage.
+- **Thread-safe channel operations** — all channel I/O (ACK/NACK/Publish) is serialized via per-channel semaphores, preventing race conditions when `PrefetchCount > 1`.
 - **Semaphore-based concurrency** — internal semaphores prevent consumer overload.
 - **Automatic recovery** — connections auto-recover after network failures with configurable intervals.
 
@@ -749,7 +840,7 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false;         // Reuse connection
-    pub.ChannelMode = ChannelMode.Confirm;          // Fast + reliable
+    pub.IdempotencyEnabled = true;                  // Auto-assign MessageId
 });
 ```
 
