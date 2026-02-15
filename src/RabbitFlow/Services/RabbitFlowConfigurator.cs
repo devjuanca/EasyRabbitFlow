@@ -118,7 +118,7 @@ namespace EasyRabbitFlow.Services
                 ?? throw new InvalidOperationException($"Method HandleAsync not found in {consumerType.Name}.");
 
             // Build a strongly-typed wrapper via expression once.
-            Func<object, object, CancellationToken, Task> compiledHandleAsync = BuildHandleWrapper(consumerType, eventType, handleMethod);
+            Func<object, object, RabbitFlowMessageContext, CancellationToken, Task> compiledHandleAsync = BuildHandleWrapper(consumerType, eventType, handleMethod);
 
             var factory = new ConsumerSettingsFactory
             {
@@ -140,8 +140,8 @@ namespace EasyRabbitFlow.Services
             _services.AddSingleton(typeof(IConsumerSettingsMarker), markerInstance);
         }
 
-        // Builds a compiled delegate that wraps TConsumer.HandleAsync(TEvent, CancellationToken)
-        private static Func<object, object, CancellationToken, Task> BuildHandleWrapper(
+        // Builds a compiled delegate that wraps TConsumer.HandleAsync(TEvent, RabbitFlowMessageContext, CancellationToken)
+        private static Func<object, object, RabbitFlowMessageContext, CancellationToken, Task> BuildHandleWrapper(
             Type consumerType,
             Type eventType,
             System.Reflection.MethodInfo handleMethod)
@@ -149,16 +149,19 @@ namespace EasyRabbitFlow.Services
             var consumerObj = Expression.Parameter(typeof(object), "consumerObj");
 
             var messageObj = Expression.Parameter(typeof(object), "messageObj");
-            
+
+            var contextParam = Expression.Parameter(typeof(RabbitFlowMessageContext), "context");
+
             var ct = Expression.Parameter(typeof(CancellationToken), "ct");
 
             var call = Expression.Call(
                 Expression.Convert(consumerObj, consumerType),
                 handleMethod,
                 Expression.Convert(messageObj, eventType),
+                contextParam,
                 ct);
 
-            var lambda = Expression.Lambda<Func<object, object, CancellationToken, Task>>(call, consumerObj, messageObj, ct);
+            var lambda = Expression.Lambda<Func<object, object, RabbitFlowMessageContext, CancellationToken, Task>>(call, consumerObj, messageObj, contextParam, ct);
 
             return lambda.Compile();
         }

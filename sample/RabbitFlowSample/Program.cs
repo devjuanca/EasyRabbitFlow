@@ -22,7 +22,12 @@ builder.Services.AddRabbitFlow(settings =>
         hostSettings.Port = 5672; // Optional (default 5672)
     });
 
-    settings.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = false); // OPTIONAL
+    settings.ConfigurePublisher(publisherSettings =>
+    {
+        publisherSettings.DisposePublisherConnection = false;
+        publisherSettings.IdempotencyEnabled = true;
+    }
+    ); // OPTIONAL
 
 
     settings.AddConsumer<EmailConsumer>(queueName: "email-queue", consumerSettings =>
@@ -104,7 +109,7 @@ app.MapPost("/notification", async ([FromServices] IRabbitFlowPublisher publishe
 // Direct email send bypassing fanout (goes only to email-send-queue)
 app.MapPost("/email", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    var result = await publisher.PublishAsync(eventPayload, "email-queue");
+    var result = await publisher.PublishAsync(eventPayload, "email-queue", correlationId: Guid.NewGuid().ToString());
 
     return result.Success
         ? Results.Accepted(value: new { result.MessageId, result.Destination, result.TimestampUtc, Payload = eventPayload })

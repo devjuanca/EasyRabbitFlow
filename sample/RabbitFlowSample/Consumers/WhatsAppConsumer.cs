@@ -1,4 +1,5 @@
 using EasyRabbitFlow.Services;
+using EasyRabbitFlow.Settings;
 using RabbitFlowSample.Events;
 using System.Text.Json;
 
@@ -10,7 +11,7 @@ public class WhatsAppConsumer(
     GuidTransientService guidTransientService,
     ILogger<WhatsAppConsumer> logger) : IRabbitFlowConsumer<NotificationEvent>
 {
-    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
         var scopedGuid = guidScopedService.Guid;
 

@@ -297,13 +297,22 @@ namespace EasyRabbitFlow
                         try
                         {
                             scope = rootServiceProvider.CreateScope();
-                            
+
+                            var messageContext = new RabbitFlowMessageContext(
+                                args.BasicProperties?.MessageId,
+                                args.BasicProperties?.CorrelationId,
+                                args.Exchange,
+                                args.RoutingKey,
+                                args.BasicProperties?.Headers,
+                                args.DeliveryTag,
+                                args.Redelivered);
+
                             consumerService = scope.ServiceProvider.GetRequiredService<TConsumer>();
 
                             if (!(consumerService is IRabbitFlowConsumer<TEventType> typedConsumer))
                                 throw new RabbitFlowException($"[RABBIT-FLOW]: Consumer does not implement IRabbitFlowConsumer<{typeof(TEventType).Name}>.");
 
-                            await typedConsumer.HandleAsync(@event, attemptCt).ConfigureAwait(false);
+                            await typedConsumer.HandleAsync(@event, messageContext, attemptCt).ConfigureAwait(false);
 
                             await SafeAckAsync(channel, channelGate, args.DeliveryTag, logger, cancellationToken);
 
