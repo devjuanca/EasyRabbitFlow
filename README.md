@@ -1,324 +1,760 @@
-## RabbitFlow Documentation
+<p align="center">
+  <img src="icon.png" alt="EasyRabbitFlow" width="120" />
+</p>
 
-Welcome to **RabbitFlow**, a streamlined .NET library for configuring RabbitMQ messaging with minimal ceremony and high performance.
+<h1 align="center">EasyRabbitFlow</h1>
 
-### Table of Contents
+<p align="center">
+  <strong>High-performance RabbitMQ client for .NET — fluent configuration, automatic topology, zero-ceremony consumers.</strong>
+</p>
 
-1. [Introduction](#introduction)
-2. [Install](#install)
-3. [Configuration](#configuration)
-   - [Host Configuration](#host-configuration)
-   - [JSON Serialization Options](#json-serialization-options)
-   - [Publisher Options](#publisher-options)
-4. [Consumers](#consumers)
-   - [Adding Consumers](#adding-consumers)
-   - [Auto-Generate Queue / Exchange](#auto-generate-queue-exchange)
-   - [Custom Dead-Letter](#custom-dead-letter)
-   - [Retry Policies](#retry-policies)
-   - [Consumer Interface Implementation](#consumer-interface-implementation)
-5. [Hosted Initialization (Recommended)](#hosted-initialization-recommended)
-6. [Publishing Messages](#publishing-messages)
-7. [Queue State](#queue-state)
-8. [Temporary Queue Processing](#temporary-message-processing)
-9. [Performance Notes](#performance-notes)
+<p align="center">
+  <a href="https://www.nuget.org/packages/EasyRabbitFlow"><img src="https://img.shields.io/nuget/v/EasyRabbitFlow" alt="NuGet" /></a>
+  <a href="https://www.nuget.org/packages/EasyRabbitFlow"><img src="https://img.shields.io/nuget/dt/EasyRabbitFlow" alt="Downloads" /></a>
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
+</p>
 
+---
 
-### 1. Introduction
+## Table of Contents
 
-RabbitFlow simplifies integration with RabbitMQ by:
-- Auto-registering consumers with strongly typed settings.
-- Optional automatic queue/exchange/dead-letter generation.
-- Efficient retry, timeout, and error handling.
-- High performance message processing (no per-message reflection).
+- [Why EasyRabbitFlow?](#why-easyrabbitflow)
+- [Architecture Overview](#architecture-overview)
+- [Getting Started](#getting-started)
+  - [Installation](#installation)
+  - [Quick Start](#quick-start)
+- [Configuration](#configuration)
+  - [Host Settings](#host-settings)
+  - [JSON Serialization](#json-serialization)
+  - [Publisher Options](#publisher-options)
+- [Consumers](#consumers)
+  - [Implementing a Consumer](#implementing-a-consumer)
+  - [Registering Consumers](#registering-consumers)
+  - [Auto-Generate Topology](#auto-generate-topology)
+  - [Retry Policies](#retry-policies)
+  - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
+- [Publishing Messages](#publishing-messages)
+- [Queue State Inspection](#queue-state-inspection)
+- [Queue Purging](#queue-purging)
+- [Temporary Batch Processing](#temporary-batch-processing)
+- [Transient Exceptions & Custom Retry Logic](#transient-exceptions--custom-retry-logic)
+- [Full API Reference](#full-api-reference)
+- [Performance Notes](#performance-notes)
 
-It supports both pre-existing infrastructure and on-demand generation.
+---
 
-Let’s explore setup and usage.
-### 2. Install
+## Why EasyRabbitFlow?
 
-To install the **RabbitFlow** library into your project, you can use the NuGet package manager:
+| Feature | EasyRabbitFlow |
+|---------|----------------|
+| Fluent, strongly-typed configuration | ✅ |
+| Automatic queue / exchange / dead-letter generation | ✅ |
+| Reflection-free per-message processing | ✅ |
+| Configurable retry with exponential backoff | ✅ |
+| Temporary batch processing with auto-cleanup | ✅ |
+| Queue state & purge utilities | ✅ |
+| Full DI integration (scoped/transient/singleton) | ✅ |
+| Transactional or confirm-mode publishing | ✅ |
+| .NET Standard 2.1 (works with .NET 6, 7, 8, 9+) | ✅ |
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Your Application                            │
+├────────────┬──────────────┬──────────────┬──────────────────────────┤
+│ Publisher  │  Consumers   │   State /    │  Temporary Batch         │
+│            │  (Hosted)    │   Purger     │  Processing              │
+├────────────┴──────────────┴──────────────┴──────────────────────────┤
+│                     EasyRabbitFlow Library                           │
+│                                                                     │
+│  ┌──────────────┐  ┌────────────────┐  ┌─────────────────────────┐ │
+│  │ IRabbitFlow   │  │ ConsumerHosted │  │ IRabbitFlowTemporary    │ │
+│  │ Publisher     │  │ Service        │  │ (batch processing)      │ │
+│  └──────┬───────┘  └───────┬────────┘  └────────────┬────────────┘ │
+│         │                  │                         │              │
+│  ┌──────┴──────────────────┴─────────────────────────┴────────┐    │
+│  │              RabbitMQ.Client (ConnectionFactory)            │    │
+│  └────────────────────────────┬────────────────────────────────┘    │
+└───────────────────────────────┼─────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │     RabbitMQ Broker    │
+                    │                       │
+                    │  ┌─────────────────┐  │
+                    │  │   Exchanges     │  │
+                    │  └────────┬────────┘  │
+                    │           │            │
+                    │  ┌────────▼────────┐  │
+                    │  │     Queues      │  │
+                    │  └────────┬────────┘  │
+                    │           │            │
+                    │  ┌────────▼────────┐  │
+                    │  │  Dead-Letter    │  │
+                    │  │    Queues       │  │
+                    │  └─────────────────┘  │
+                    └───────────────────────┘
+```
+
+### Message Flow
+
+```
+  Publisher                    RabbitMQ                        Consumer
+  ────────                    ────────                        ────────
+
+  PublishAsync() ──────►  Exchange ──routing──► Queue ──────► HandleAsync()
+                                                  │               │
+                                                  │          (on failure)
+                                                  │               │
+                                                  │          Retry Policy
+                                                  │          (exponential
+                                                  │           backoff)
+                                                  │               │
+                                                  │          (exhausted)
+                                                  │               │
+                                                  └──► Dead-Letter Queue
+```
+
+---
+
+## Getting Started
+
+### Installation
 
 ```bash
 dotnet add package EasyRabbitFlow
 ```
 
-### 3. Configuration
-Register core services using `AddRabbitFlow`, then optionally start the hosted consumer service with `UseRabbitFlowConsumers`.
+### Quick Start
+
+**1. Define your event model:**
+
+```csharp
+public class OrderCreatedEvent
+{
+    public string OrderId { get; set; } = string.Empty;
+    public decimal Total { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+**2. Implement a consumer:**
+
+```csharp
+public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
+{
+    private readonly ILogger<OrderConsumer> _logger;
+
+    public OrderConsumer(ILogger<OrderConsumer> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task HandleAsync(OrderCreatedEvent message, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Processing order {OrderId}, total: {Total}",
+            message.OrderId, message.Total);
+
+        // Your business logic here: save to DB, send email, call API, etc.
+        await Task.CompletedTask;
+    }
+}
+```
+
+**3. Configure in `Program.cs`:**
+
 ```csharp
 builder.Services
     .AddRabbitFlow(cfg =>
     {
         cfg.ConfigureHost(host =>
         {
-            host.Host = "rabbitmq.example.com";
+            host.Host = "localhost";
+            host.Port = 5672;
             host.Username = "guest";
             host.Password = "guest";
         });
 
-        cfg.ConfigureJsonSerializerOptions(json =>
+        cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
         {
-            json.PropertyNameCaseInsensitive = true;
-            json.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-            json.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
-        });
-
-        cfg.ConfigurePublisher(pub => pub.DisposePublisherConnection = false);
-
-        cfg.AddConsumer<EmailConsumer>("email-queue", c =>
-        {
-            c.PrefetchCount = 5;
-            c.Timeout = TimeSpan.FromSeconds(2);
             c.AutoGenerate = true;
-            c.ConfigureAutoGenerate(a =>
-            {
-                a.ExchangeName = "notifications";
-                a.ExchangeType = ExchangeType.Fanout;
-                a.GenerateDeadletterQueue = true;
-            });
+            c.PrefetchCount = 10;
+            c.Timeout = TimeSpan.FromSeconds(30);
             c.ConfigureRetryPolicy(r =>
             {
                 r.MaxRetryCount = 3;
-                r.RetryInterval = 1000; // ms
                 r.ExponentialBackoff = true;
                 r.ExponentialBackoffFactor = 2;
             });
         });
     })
-    .UseRabbitFlowConsumers(); // starts background consumption
+    .UseRabbitFlowConsumers(); // Starts background consumer automatically
 ```
 
-- #### 3.1 Host Configuration
-The ConfigureHost method allows you to specify the connection details for your RabbitMQ host:
+**4. Publish from an endpoint or service:**
+
 ```csharp
-opt.ConfigureHost(hostSettings =>
+app.MapPost("/orders", async (OrderCreatedEvent order, IRabbitFlowPublisher publisher) =>
 {
-    hostSettings.Host = "rabbitmq.example.com";
-    hostSettings.Username = "guest";
-    hostSettings.Password = "guest";
+    var success = await publisher.PublishAsync(order, "orders-queue");
+    return success ? Results.Ok("Order queued") : Results.Problem("Failed to queue order");
 });
 ```
 
-- #### 3.2 JSON Serialization Options
-This option allows you to globally configure how JSON serialization should be handled. This configuration is optional; if not provided, the default JsonSerializerOptions will be used.
+That's it — **four steps** from zero to a working publish/consume pipeline.
+
+---
+
+## Configuration
+
+All configuration is done through the `AddRabbitFlow` extension method:
+
 ```csharp
-opt.ConfigureJsonSerializerOptions(jsonSettings =>
+builder.Services.AddRabbitFlow(cfg =>
 {
-    jsonSettings.PropertyNameCaseInsensitive = true;
-    jsonSettings.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-    jsonSettings.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+    cfg.ConfigureHost(...);                    // Connection settings
+    cfg.ConfigureJsonSerializerOptions(...);   // Serialization (optional)
+    cfg.ConfigurePublisher(...);               // Publisher behavior (optional)
+    cfg.AddConsumer<T>(...);                   // Register consumers
 });
 ```
 
-
-- #### 3.3 Publisher Options
-Optionally, you may configure the publisher that you intend to use by defining the 'DisposePublisherConnection' variable. 
-
-This variable determines whether the connection established by the publisher with RabbitMQ should be kept alive or terminated upon the completion of the process.
-The default value is false.
-```csharp
- opt.ConfigurePublisher(publisherSettings => publisherSettings.DisposePublisherConnection = true);
-```
-
-### 4. Consumers
-- #### 4.1 Adding Consumers
-Define and configure consumers for specific queues using the AddConsumer method:
-
-All consumers must implement the interface `IRabbitFlowConsumer<TEvent>` where TEvent us the event or message model.
-
-Using the `AddConsumer` method, all required services and configurations will be created and registered into the DI container, ready for use.
+### Host Settings
 
 ```csharp
-opt.AddConsumer<EmailConsumer>("email-queue", consumerSettings =>
+cfg.ConfigureHost(host =>
 {
-    consumerSettings.PrefetchCount = 1;
-    consumerSettings.Timeout = TimeSpan.FromMilliseconds(500);
-    consumerSettings.AutoGenerate = true;
-    consumerSettings.ConfigureAutoGenerate(opt =>
-      {
-     	opt.DurableQueue = true;
-     	opt.DurableExchange = true;
-     	opt.ExclusiveQueue = false;
-     	opt.AutoDeleteQueue = false;
-     	opt.GenerateDeadletterQueue = true;
-     	opt.ExchangeType = ExchangeType.Direct;
-    	// ... other settings ...
-      });
-```
-
-#### 4.2 Retry Policies
-You can configure a retry policy to handle message processing failures effectively. 
-
-By default, all exceptions related to timeout issues will be automatically retried if the retry mechanism is enabled.
-
-Additionally, you can customize the retry logic by defining your own rules for handling specific use cases using the `TranscientException`  class from the `EasyRabbitFlow.Exceptions` namespace.
-
-```csharp
-consumerSettings.ConfigureRetryPolicy(retryPolicy =>
-{
-    retryPolicy.MaxRetryCount = 3;
-    retryPolicy.RetryInterval = 1000;
-    retryPolicy.ExponentialBackoff = true;
-    retryPolicy.ExponentialBackoffFactor = 2;
+    host.Host = "rabbitmq.example.com";
+    host.Port = 5672;
+    host.Username = "admin";
+    host.Password = "secret";
+    host.VirtualHost = "/";
+    host.AutomaticRecoveryEnabled = true;
+    host.NetworkRecoveryInterval = TimeSpan.FromSeconds(10);
+    host.RequestedHeartbeat = TimeSpan.FromSeconds(30);
 });
 ```
 
-#### 4.3 Consumer Interface Implementation
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Host` | string | `"localhost"` | RabbitMQ server hostname or IP |
+| `Port` | int | `5672` | AMQP port |
+| `Username` | string | `"guest"` | Authentication username |
+| `Password` | string | `"guest"` | Authentication password |
+| `VirtualHost` | string | `"/"` | RabbitMQ virtual host |
+| `AutomaticRecoveryEnabled` | bool | `true` | Auto-reconnect after failures |
+| `TopologyRecoveryEnabled` | bool | `true` | Auto-recover queues/exchanges after reconnect |
+| `NetworkRecoveryInterval` | TimeSpan | `10s` | Wait time between recovery attempts |
+| `RequestedHeartbeat` | TimeSpan | `30s` | Heartbeat interval for connection health |
 
-Consumers must implement the `IRabbitFlowConsumer<TEvent>` interface:
+### JSON Serialization
+
+Optionally customize how messages are serialized/deserialized:
 
 ```csharp
-// Consumers must implement the IRabbitFlowConsumer<TEvent> interface:
+cfg.ConfigureJsonSerializerOptions(json =>
+{
+    json.PropertyNameCaseInsensitive = true;
+    json.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+    json.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+});
+```
 
+If not configured, the default `JsonSerializerOptions` are used.
+
+### Publisher Options
+
+```csharp
+cfg.ConfigurePublisher(pub =>
+{
+    pub.DisposePublisherConnection = false; // Keep connection alive (default)
+    pub.ChannelMode = ChannelMode.Confirm;  // Confirm mode (default)
+});
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DisposePublisherConnection` | bool | `false` | Dispose connection after each publish |
+| `ChannelMode` | ChannelMode | `Confirm` | `Confirm` (fast + reliable) or `Transactional` (full ACID) |
+
+---
+
+## Consumers
+
+### Implementing a Consumer
+
+Every consumer implements `IRabbitFlowConsumer<TEvent>`:
+
+```csharp
 public interface IRabbitFlowConsumer<TEvent>
 {
     Task HandleAsync(TEvent message, CancellationToken cancellationToken);
 }
+```
 
-// Example EmailConsumer
+Consumers support **full dependency injection** — you can inject any service (scoped, transient, singleton):
 
-public class EmailConsumer : IRabbitFlowConsumer<EmailEvent>
+```csharp
+public class EmailConsumer : IRabbitFlowConsumer<NotificationEvent>
 {
+    private readonly IEmailService _emailService;
     private readonly ILogger<EmailConsumer> _logger;
 
-    public EmailConsumer(ILogger<EmailConsumer> logger)
+    public EmailConsumer(IEmailService emailService, ILogger<EmailConsumer> logger)
     {
+        _emailService = emailService;
         _logger = logger;
     }
 
-    public async Task HandleAsync(EmailEvent message, CancellationToken cancellationToken)
+    public async Task HandleAsync(NotificationEvent message, CancellationToken cancellationToken)
     {
-        await Task.CompletedTask;
-
-        _logger.LogInformation("New email event received. Event:{event}", JsonSerializer.Serialize(message));
+        _logger.LogInformation("Sending email to {Recipient}", message.Email);
+        await _emailService.SendAsync(message.Email, message.Subject, message.Body, cancellationToken);
     }
 }
-
-
 ```
 
-
-### 5. Hosted Initialization (Recommended)
-Consumers are automatically started by calling:
-```csharp
-builder.Services.AddRabbitFlow(cfg => { /* config */ })
-                .UseRabbitFlowConsumers();
-```
-Older manual initialization methods are deprecated.
-
-### 6. Publishing Messages
-Publisher Interface
-
-Use the IRabbitFlowPublisher interface to publish messages to a RabbitMQ:
-
-`JsonSerializerOptions` can be overridden from global settings.
-
-The `publisherId` parameter is intended to identify the connection created with RabbitMQ.
+### Registering Consumers
 
 ```csharp
-public interface IRabbitFlowPublisher
+cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 {
-    Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
-
-    Task<bool> PublishAsync<TEvent>(TEvent message, string queueName, string publisherId = "", JsonSerializerOptions? jsonOptions = null) where TEvent : class;
-}
-
+    c.Enable = true;                              // Enable/disable this consumer
+    c.PrefetchCount = 5;                          // Messages fetched in parallel
+    c.Timeout = TimeSpan.FromSeconds(30);         // Per-message processing timeout
+    c.AutoAckOnError = false;                     // Don't ack failed messages
+    c.ExtendDeadletterMessage = true;             // Add error details to DLQ messages
+    c.ConsumerId = "email-consumer-1";            // Custom connection identifier
+});
 ```
 
-### 7. Queue State
-The `IRabbitFlowState` interface allows you to access queue status information:
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Enable` | bool | `true` | Whether this consumer is active |
+| `QueueName` | string | *(set in constructor)* | Queue to consume from |
+| `ConsumerId` | string? | `null` | Custom connection ID (falls back to queue name) |
+| `PrefetchCount` | ushort | `1` | How many messages to prefetch |
+| `Timeout` | TimeSpan | `30s` | Processing timeout per message |
+| `AutoAckOnError` | bool | `false` | Auto-acknowledge on error (message lost) |
+| `AutoGenerate` | bool | `false` | Auto-create queue/exchange/DLQ |
+| `ExtendDeadletterMessage` | bool | `false` | Enrich dead-letter messages with error details |
+
+### Auto-Generate Topology
+
+When `AutoGenerate = true`, EasyRabbitFlow creates queues, exchanges, and dead-letter queues automatically:
 
 ```csharp
-public interface IRabbitFlowState
+cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 {
-    bool IsEmptyQueue(string queueName);
-    uint GetQueueLength(string queueName);
-    uint GetConsumersCount(string queueName);
-    bool QueueHasConsumers(string queueName);
-}
-
+    c.AutoGenerate = true;
+    c.ConfigureAutoGenerate(ag =>
+    {
+        ag.ExchangeName = "orders-exchange";      // Custom exchange name
+        ag.ExchangeType = ExchangeType.Fanout;    // Direct | Fanout | Topic | Headers
+        ag.RoutingKey = "orders-routing-key";      // Routing key for binding
+        ag.GenerateExchange = true;                // Create the exchange
+        ag.GenerateDeadletterQueue = true;         // Create a dead-letter queue
+        ag.DurableQueue = true;                    // Queue survives broker restart
+        ag.DurableExchange = true;                 // Exchange survives broker restart
+        ag.ExclusiveQueue = false;                 // Not limited to one connection
+        ag.AutoDeleteQueue = false;                // Don't delete when last consumer disconnects
+    });
+});
 ```
 
-### 8. Temporary Message Processing
+**Generated topology when `AutoGenerate = true`:**
 
-`IRabbitFlowTemporary` is a utility designed to simplify **fire-and-forget style workflows** where a batch of messages is sent to RabbitMQ, processed by handlers, and discarded — all within a **temporary queue**.
+```
+                        ┌──────────────────────┐
+                        │  orders-exchange      │
+                        │  (fanout)             │
+                        └──────────┬───────────┘
+                                   │ routing-key
+                        ┌──────────▼───────────┐
+                        │  orders-queue         │──── args: x-dead-letter-exchange
+                        │  (durable)            │         x-dead-letter-routing-key
+                        └──────────┬───────────┘
+                                   │ (on failure)
+                  ┌────────────────▼─────────────────┐
+                  │  orders-queue-deadletter-exchange │
+                  │  (direct)                         │
+                  └────────────────┬─────────────────┘
+                                   │
+                  ┌────────────────▼─────────────────┐
+                  │  orders-queue-deadletter          │
+                  └──────────────────────────────────┘
+```
 
-This is ideal for:
-- **Background jobs** that need to process large collections of data (e.g., generating PDFs, sending emails, calculating reports), where you want to **free up the main thread or HTTP request quickly** and continue processing in the background.
-- **Ephemeral tasks** that don't need long-term queues or persistent consumers.
-- **One-time batch processing**, such as database cleanup, syncing remote systems, or running onboarding flows.
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GenerateExchange` | bool | `true` | Create the exchange |
+| `GenerateDeadletterQueue` | bool | `true` | Create dead-letter queue and exchange |
+| `ExchangeType` | ExchangeType | `Direct` | `Direct`, `Fanout`, `Topic`, or `Headers` |
+| `ExchangeName` | string? | `null` | Custom name (defaults to `{queue}-exchange`) |
+| `RoutingKey` | string? | `null` | Custom routing key (defaults to `{queue}-routing-key`) |
+| `DurableExchange` | bool | `true` | Exchange survives broker restart |
+| `DurableQueue` | bool | `true` | Queue survives broker restart |
+| `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
+| `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
+| `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
 
-This approach lets you **publish the work and return immediately**, while the internal RabbitMQ mechanism ensures each message is processed asynchronously and independently — with timeout and cancellation support.
+### Retry Policies
+
+Configure how failed messages are retried:
+
+```csharp
+c.ConfigureRetryPolicy(r =>
+{
+    r.MaxRetryCount = 5;               // Number of attempts
+    r.RetryInterval = 1000;            // Base delay in ms
+    r.ExponentialBackoff = true;        // Enable exponential backoff
+    r.ExponentialBackoffFactor = 2;     // Multiply delay by this factor
+    r.MaxRetryDelay = 30_000;           // Cap delay at 30 seconds
+});
+```
+
+**Example: retry timeline with exponential backoff (factor=2, base=1000ms):**
+
+```
+Attempt 1 → fail → wait 1000ms
+Attempt 2 → fail → wait 2000ms
+Attempt 3 → fail → wait 4000ms
+Attempt 4 → fail → wait 8000ms
+Attempt 5 → fail → sent to dead-letter queue
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `MaxRetryCount` | int | `1` | Total retry attempts |
+| `RetryInterval` | int | `1000` | Base delay between retries (ms) |
+| `ExponentialBackoff` | bool | `false` | Enable exponential backoff |
+| `ExponentialBackoffFactor` | int | `1` | Multiplier for exponential growth |
+| `MaxRetryDelay` | int | `60000` | Upper bound for delay (ms) |
+
+### Custom Dead-Letter Queues
+
+Route failed messages to a specific dead-letter queue:
+
+```csharp
+c.ConfigureCustomDeadletter(dl =>
+{
+    dl.DeadletterQueueName = "custom-errors-queue";
+});
+```
+
+When `ExtendDeadletterMessage = true`, the dead-letter message includes full error details:
+
+```json
+{
+  "dateUtc": "2026-01-15T10:30:00Z",
+  "messageType": "OrderCreatedEvent",
+  "messageData": { "orderId": "ORD-123", "total": 99.99 },
+  "exceptionType": "TimeoutException",
+  "errorMessage": "The operation was canceled.",
+  "stackTrace": "...",
+  "source": "OrderService",
+  "innerExceptions": []
+}
+```
 
 ---
 
-### ✨ How It Works
+## Publishing Messages
 
-- A **temporary, exclusive queue** and exchange are created automatically for the message type.
-- All messages are published to this queue and immediately consumed by an internal async handler.
-- The temporary queue and exchange are deleted automatically after the process completes.
-- You can specify:
-  - Per-message timeout.
-  - Degree of parallelism via prefetch.
-  - A callback on completion.
-  - A global cancellation token.
+Inject `IRabbitFlowPublisher` and publish to exchanges or queues:
+
+```csharp
+public class OrderService
+{
+    private readonly IRabbitFlowPublisher _publisher;
+
+    public OrderService(IRabbitFlowPublisher publisher)
+    {
+        _publisher = publisher;
+    }
+
+    // Publish directly to a queue
+    public async Task<bool> CreateOrderAsync(OrderCreatedEvent order)
+    {
+        return await _publisher.PublishAsync(order, queueName: "orders-queue");
+    }
+
+    // Publish to an exchange with routing key
+    public async Task<bool> BroadcastNotificationAsync(NotificationEvent notification)
+    {
+        return await _publisher.PublishAsync(
+            notification,
+            exchangeName: "notifications",
+            routingKey: "user.created");
+    }
+}
+```
+
+**Publisher method signatures:**
+
+```csharp
+// Publish to exchange (with routing key)
+Task<bool> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
+    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    CancellationToken cancellationToken = default) where TEvent : class;
+
+// Publish directly to queue
+Task<bool> PublishAsync<TEvent>(TEvent message, string queueName,
+    string publisherId = "", JsonSerializerOptions? jsonOptions = null,
+    CancellationToken cancellationToken = default) where TEvent : class;
+```
+
+Returns `true` on success, `false` on failure (errors are logged internally).
 
 ---
 
-### 🔧 API Overview
+## Queue State Inspection
+
+Use `IRabbitFlowState` to query queue metadata at runtime:
 
 ```csharp
-Task<int> RunAsync<T>(
-    IReadOnlyList<T> messages,
-    Func<T, CancellationToken, Task> onMessageReceived,
-    Action<int, int>? onCompleted = null,
-    RunTemporaryOptions? options = null,
-    CancellationToken cancellationToken = default
-) where T : class;
+public class HealthCheckService
+{
+    private readonly IRabbitFlowState _state;
+
+    public HealthCheckService(IRabbitFlowState state)
+    {
+        _state = state;
+    }
+
+    public async Task<object> GetQueueHealthAsync(string queueName)
+    {
+        return new
+        {
+            IsEmpty = await _state.IsEmptyQueueAsync(queueName),
+            MessageCount = await _state.GetQueueLengthAsync(queueName),
+            ConsumerCount = await _state.GetConsumersCountAsync(queueName),
+            HasConsumers = await _state.HasConsumersAsync(queueName)
+        };
+    }
+}
 ```
 
-Sample
-```csharp
-public record InvoiceToProcess(string InvoiceId, decimal Amount);
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `IsEmptyQueueAsync(queueName)` | `Task<bool>` | Is the queue empty? |
+| `GetQueueLengthAsync(queueName)` | `Task<uint>` | Number of messages in the queue |
+| `GetConsumersCountAsync(queueName)` | `Task<uint>` | Number of active consumers |
+| `HasConsumersAsync(queueName)` | `Task<bool>` | Does the queue have any consumers? |
 
+---
+
+## Queue Purging
+
+Use `IRabbitFlowPurger` to remove all messages from queues:
+
+```csharp
+// Purge a single queue
+await purger.PurgeMessagesAsync("orders-queue");
+
+// Purge multiple queues at once
+await purger.PurgeMessagesAsync(new[] { "orders-queue", "emails-queue", "notifications-queue" });
+```
+
+---
+
+## Temporary Batch Processing
+
+`IRabbitFlowTemporary` is designed for **fire-and-forget batch workflows** — process a collection of messages through RabbitMQ with automatic queue creation and cleanup.
+
+**Ideal for:**
+- Background jobs (PDF generation, email sending, report calculation)
+- One-time batch processing (database cleanup, data migration)
+- Parallel processing with configurable concurrency
+
+### Basic Usage
+
+```csharp
 public class InvoiceService
 {
-    private readonly IRabbitFlowTemporary _rabbitFlow;
+    private readonly IRabbitFlowTemporary _temporary;
 
-    public InvoiceService(IRabbitFlowTemporary rabbitFlow)
+    public InvoiceService(IRabbitFlowTemporary temporary)
     {
-        _rabbitFlow = rabbitFlow;
+        _temporary = temporary;
     }
 
-    public async Task StartBatchProcessingAsync(List<InvoiceToProcess> invoices)
+    public async Task ProcessInvoiceBatchAsync(List<Invoice> invoices)
     {
-        _ = _rabbitFlow.RunAsync(
+        int processed = await _temporary.RunAsync(
             invoices,
-            async (invoice, ct) =>
+            onMessageReceived: async (invoice, ct) =>
             {
-                Console.WriteLine($"Processing invoice {invoice.InvoiceId}...");
-
-                // Simulate long-running processing
-                await Task.Delay(1000, ct);
-
-                // You could do: Save to DB, call APIs, generate PDFs, etc.
-                Console.WriteLine($"Finished invoice {invoice.InvoiceId}");
+                Console.WriteLine($"Processing invoice {invoice.Id}...");
+                await Task.Delay(500, ct); // Simulate work
             },
-            onCompleted: (success, errors) =>
+            onCompleted: (total, errors) =>
             {
-                Console.WriteLine($"Invoice batch complete. ✅ {success}, ❌ {errors}");
+                Console.WriteLine($"Done! Processed: {total}, Errors: {errors}");
             },
             options: new RunTemporaryOptions
             {
-                Timeout = TimeSpan.FromSeconds(5),
-                PrefetchCount = 5,
-                QueuePrefixName = "invoice",
+                PrefetchCount = 10,
+                Timeout = TimeSpan.FromSeconds(30),
                 CorrelationId = Guid.NewGuid().ToString()
-            }
-        );
-
-        Console.WriteLine("Batch dispatch complete — processing will continue in background.");
+            });
     }
 }
-
 ```
 
+### With Result Collection
+
+```csharp
+int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
+    invoices,
+    onMessageReceived: async (invoice, ct) =>
+    {
+        var result = await ProcessInvoiceAsync(invoice, ct);
+        return new InvoiceResult { InvoiceId = invoice.Id, Status = "Completed" };
+    },
+    onCompletedAsync: async (count, results) =>
+    {
+        // results is a ConcurrentQueue<InvoiceResult> with all collected results
+        Console.WriteLine($"Processed {count} invoices, collected {results.Count} results");
+        await SaveResultsAsync(results);
+    });
+```
+
+### How It Works
+
+```
+  Your Code                   RabbitMQ (Temporary)            Handler
+  ─────────                   ──────────────────              ───────
+
+  RunAsync(messages) ─────►  Create temp queue  ───────────►  onMessageReceived()
+       │                     Publish all msgs                      │
+       │                           │                               │
+       │                     Consume & process  ◄──────────────────┘
+       │                           │
+       │                     All processed?
+       │                           │ yes
+       ◄──────────────────── Delete temp queue
+       │                     Call onCompleted()
+       │
+  return count
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `PrefetchCount` | ushort | `1` | Parallel message processing (>0) |
+| `Timeout` | TimeSpan? | `null` | Per-message timeout |
+| `QueuePrefixName` | string? | `null` | Custom prefix for the temp queue name |
+| `CorrelationId` | string? | `Guid` | Correlation ID for tracing/logging |
+
+---
+
+## Transient Exceptions & Custom Retry Logic
+
+By default, timeouts and `RabbitFlowTransientException` trigger retries. Throw `RabbitFlowTransientException` from your consumer to signal a retryable error:
+
+```csharp
+using EasyRabbitFlow.Exceptions;
+
+public class PaymentConsumer : IRabbitFlowConsumer<PaymentEvent>
+{
+    public async Task HandleAsync(PaymentEvent message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ProcessPaymentAsync(message);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable)
+        {
+            // This will trigger the retry policy
+            throw new RabbitFlowTransientException("Payment gateway temporarily unavailable", ex);
+        }
+        // Any other exception → no retry, sent to dead-letter queue
+    }
+}
+```
+
+**Exception types:**
+
+| Exception | Purpose |
+|-----------|---------|
+| `RabbitFlowTransientException` | Signals a retryable error — triggers retry policy |
+| `RabbitFlowException` | General library error |
+| `RabbitFlowOverRetriesException` | Thrown internally when all retry attempts are exhausted |
+
+---
+
+## Full API Reference
+
+### Registered Services
+
+| Interface | Lifetime | Description |
+|-----------|----------|-------------|
+| `IRabbitFlowPublisher` | Singleton | Publish messages to exchanges or queues |
+| `IRabbitFlowState` | Singleton | Query queue metadata |
+| `IRabbitFlowTemporary` | Singleton | Temporary batch processing |
+| `IRabbitFlowPurger` | Singleton | Purge queue messages |
+| `ConsumerHostedService` | Hosted | Background consumer lifecycle (via `UseRabbitFlowConsumers`) |
+
+### Extension Methods
+
+```csharp
+// Register all EasyRabbitFlow services
+IServiceCollection AddRabbitFlow(this IServiceCollection services,
+    Action<RabbitFlowConfigurator>? configurator = null);
+
+// Start background consumer processing
+IServiceCollection UseRabbitFlowConsumers(this IServiceCollection services);
+```
+
+### RabbitFlowConfigurator Methods
+
+| Method | Description |
+|--------|-------------|
+| `ConfigureHost(Action<HostSettings>)` | Set RabbitMQ connection details |
+| `ConfigureJsonSerializerOptions(Action<JsonSerializerOptions>)` | Customize JSON serialization |
+| `ConfigurePublisher(Action<PublisherOptions>?)` | Configure publisher behavior |
+| `AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>>)` | Register a consumer |
+
+---
+
+## Performance Notes
+
+EasyRabbitFlow is designed for high-throughput scenarios:
+
+- **Zero per-message reflection** — consumer handlers are compiled via expression trees at startup, not resolved per message.
+- **Connection pooling** — publisher reuses a single connection by default.
+- **Prefetch control** — tune `PrefetchCount` for optimal throughput vs. memory usage.
+- **Semaphore-based concurrency** — internal semaphores prevent consumer overload.
+- **Automatic recovery** — connections auto-recover after network failures with configurable intervals.
+
+**Recommended settings for high throughput:**
+
+```csharp
+cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
+{
+    c.PrefetchCount = 50;                          // Process 50 messages concurrently
+    c.Timeout = TimeSpan.FromSeconds(60);          // Generous timeout for heavy processing
+    c.ConfigureRetryPolicy(r =>
+    {
+        r.MaxRetryCount = 3;
+        r.RetryInterval = 500;
+        r.ExponentialBackoff = true;
+        r.ExponentialBackoffFactor = 2;
+        r.MaxRetryDelay = 10_000;                  // Cap at 10 seconds
+    });
+});
+
+cfg.ConfigurePublisher(pub =>
+{
+    pub.DisposePublisherConnection = false;         // Reuse connection
+    pub.ChannelMode = ChannelMode.Confirm;          // Fast + reliable
+});
+```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE.txt).
