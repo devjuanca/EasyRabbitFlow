@@ -26,6 +26,8 @@ namespace EasyRabbitFlow.Services
 
         private readonly List<IChannel> _channels = new List<IChannel>();
 
+        private readonly List<SemaphoreSlim> _channelGates = new List<SemaphoreSlim>();
+
         public ConsumerHostedService(IServiceProvider root, ILogger<ConsumerHostedService> logger)
         {
             _root = root;
@@ -209,13 +211,17 @@ namespace EasyRabbitFlow.Services
                 }
 
                 var consumer = new AsyncEventingBasicConsumer(channel);
-                
+
                 var semaphore = new SemaphoreSlim(prefetch);
+
+                var channelGate = new SemaphoreSlim(1, 1);
+
+                _channelGates.Add(channelGate);
 
                 // Build fast processor delegate using precompiled factory
                 var markerFactory = marker.Factory;
-                
-                var processor = BuildProcessorFromFactory(markerFactory, consumerType, eventType, channel, deadLetterQueueName, extendDeadLetter, autoAckOnError, serializerOptions, semaphore, rpMax, rpInterval, rpExp, rpFactor, rpMaxDelay, customDeadLetterObj);
+
+                var processor = BuildProcessorFromFactory(markerFactory, consumerType, eventType, channel, channelGate, deadLetterQueueName, extendDeadLetter, autoAckOnError, serializerOptions, semaphore, rpMax, rpInterval, rpExp, rpFactor, rpMaxDelay, customDeadLetterObj);
 
                 consumer.ReceivedAsync += async (_, ea) =>
                 {
@@ -241,6 +247,7 @@ namespace EasyRabbitFlow.Services
             Type consumerType,
             Type eventType,
             IChannel channel,
+            SemaphoreSlim channelGate,
             string deadLetterQueueName,
             bool extendDeadLetter,
             bool autoAckOnError,
@@ -266,7 +273,7 @@ namespace EasyRabbitFlow.Services
                     }
                     catch (Exception ex)
                     {
-                        await HandleErrorAsync(channel, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, null, ex, eventType, serializerOptions, rootCt);
+                        await HandleErrorAsync(channel, channelGate, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, null, ex, eventType, serializerOptions, rootCt);
                         return;
                     }
 
@@ -290,7 +297,7 @@ namespace EasyRabbitFlow.Services
                             
                             await markerFactory.InvokeHandleAsync(consumer, evt, attemptCt).ConfigureAwait(false);
                             
-                            await SafeAckAsync(channel, args.DeliveryTag, rootCt);
+                            await SafeAckAsync(channel, channelGate, args.DeliveryTag, rootCt);
                             
                             return;
                         }
@@ -320,7 +327,7 @@ namespace EasyRabbitFlow.Services
 
                     if (remainingAttempts <= 0)
                     {
-                        await HandleErrorAsync(channel, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, evt, lastException ?? new Exception("Unknown error"), eventType, serializerOptions, rootCt);
+                        await HandleErrorAsync(channel, channelGate, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, evt, lastException ?? new Exception("Unknown error"), eventType, serializerOptions, rootCt);
                         
                         if (customDeadLetterObj != null && evt != null)
                         {
@@ -380,13 +387,18 @@ namespace EasyRabbitFlow.Services
             catch { }
         }
 
-        private static async Task SafeAckAsync(IChannel channel, ulong deliveryTag, CancellationToken ct)
+        private static async Task SafeAckAsync(IChannel channel, SemaphoreSlim channelGate, ulong deliveryTag, CancellationToken ct)
         {
+            await channelGate.WaitAsync(ct).ConfigureAwait(false);
             try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
+            finally { channelGate.Release(); }
         }
 
-        private static async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, bool autoAck, bool extendDeadletterMessage, string deadletterQueue, object? evt, Exception exception, Type evtType, JsonSerializerOptions serializerOptions, CancellationToken ct)
+        private static async Task HandleErrorAsync(IChannel channel, SemaphoreSlim channelGate, ulong deliveryTag, bool autoAck, bool extendDeadletterMessage, string deadletterQueue, object? evt, Exception exception, Type evtType, JsonSerializerOptions serializerOptions, CancellationToken ct)
         {
+            await channelGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
             if (autoAck)
             {
                 try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
@@ -441,6 +453,8 @@ namespace EasyRabbitFlow.Services
             {
                 try { await channel.BasicNackAsync(deliveryTag, false, false, ct); } catch { }
             }
+            }
+            finally { channelGate.Release(); }
         }
 
         public Task StopAsync(CancellationToken cancellationToken)
@@ -461,6 +475,11 @@ namespace EasyRabbitFlow.Services
                     conn.Dispose(); 
                 } 
                 catch { }
+            }
+
+            foreach (var gate in _channelGates)
+            {
+                gate.Dispose();
             }
 
             return Task.CompletedTask;

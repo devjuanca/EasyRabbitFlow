@@ -148,6 +148,8 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var semaphore = new SemaphoreSlim(prefetchCount);
 
+        var channelGate = new SemaphoreSlim(1, 1);
+
         var activeTasks = new ConcurrentBag<Task>();
 
         consumer.ReceivedAsync += async (model, ea) =>
@@ -170,7 +172,15 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
                 // Acknowledge the message to RabbitMQ
                 if (channel.IsOpen)
                 {
-                    await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
+                    await channelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
+                    }
+                    finally
+                    {
+                        channelGate.Release();
+                    }
                 }
 
                 // Create the processing task that will manage its own semaphore release
@@ -255,7 +265,15 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg));
 
-                await channel.BasicPublishAsync("", _queue, body);
+                await channelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await channel.BasicPublishAsync("", _queue, body);
+                }
+                finally
+                {
+                    channelGate.Release();
+                }
             }
             catch (Exception ex)
             {
@@ -331,6 +349,8 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 _logger.LogError(ex, "[RabbitFlowTemporary] Error in completion callback. CorrelationId: {correlationId}", correlationId);
             }
+
+            channelGate.Dispose();
         }
 
         return processed;
@@ -384,6 +404,8 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
 
         var semaphore = new SemaphoreSlim(prefetchCount);
 
+        var channelGate = new SemaphoreSlim(1, 1);
+
         var activeTasks = new ConcurrentBag<Task>();
 
         consumer.ReceivedAsync += async (model, ea) =>
@@ -406,7 +428,15 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
                 // Acknowledge the message to RabbitMQ
                 if (channel.IsOpen)
                 {
-                    await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
+                    await channelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
+                    }
+                    finally
+                    {
+                        channelGate.Release();
+                    }
                 }
 
                 // Create the processing task that will manage its own semaphore release
@@ -487,7 +517,15 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg, JsonSerializerOptions.Web));
 
-                await channel.BasicPublishAsync("", _queue, body);
+                await channelGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await channel.BasicPublishAsync("", _queue, body);
+                }
+                finally
+                {
+                    channelGate.Release();
+                }
             }
             catch (Exception ex)
             {
@@ -557,6 +595,8 @@ internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
             {
                 _logger.LogError(ex, "[RabbitFlowTemporary] Error in async completion callback. CorrelationId: {correlationId}", correlationId);
             }
+
+            channelGate.Dispose();
         }
 
         return processed;
