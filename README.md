@@ -799,6 +799,38 @@ public class InvoiceService
 }
 ```
 
+### Error Handling with `onError`
+
+The `onError` callback is invoked whenever a message fails during processing (timeout, cancellation, or exception). Use it to decide what to do with failed messages — log them, persist them, or republish to another queue:
+
+```csharp
+int processed = await _temporary.RunAsync(
+    invoices,
+    onMessageReceived: async (invoice, ct) =>
+    {
+        await ProcessInvoiceAsync(invoice, ct);
+    },
+    onCompleted: (total, errors) =>
+    {
+        Console.WriteLine($"Done! Processed: {total}, Errors: {errors}");
+    },
+    onError: async (failedInvoice, ct) =>
+    {
+        // Store the failed message for later retry or manual review
+        await _failedMessageStore.SaveAsync(failedInvoice, ct);
+
+        // Or republish to a dead-letter queue
+        await _publisher.PublishAsync(failedInvoice, "invoices-failed-queue");
+    },
+    options: new RunTemporaryOptions
+    {
+        PrefetchCount = 10,
+        Timeout = TimeSpan.FromSeconds(30)
+    });
+```
+
+> **Note:** If `onError` itself throws, the exception is caught and logged internally — it will not break the batch processing flow.
+
 ### With Result Collection
 
 ```csharp
@@ -814,6 +846,10 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
         // results is a ConcurrentQueue<InvoiceResult> with all collected results
         Console.WriteLine($"Processed {count} invoices, collected {results.Count} results");
         await SaveResultsAsync(results);
+    },
+    onError: async (failedInvoice, ct) =>
+    {
+        await _failedMessageStore.SaveAsync(failedInvoice, ct);
     });
 ```
 
@@ -825,8 +861,10 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
 
   RunAsync(messages) ─────►  Create temp queue  ───────────►  onMessageReceived()
        │                     Publish all msgs                      │
-       │                           │                               │
-       │                     Consume & process  ◄──────────────────┘
+       │                           │                          ┌────┴────┐
+       │                           │                        success   failure
+       │                           │                          │         │
+       │                     Consume & process  ◄─────────────┘    onError()
        │                           │
        │                     All processed?
        │                           │ yes

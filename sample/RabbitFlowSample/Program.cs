@@ -155,11 +155,16 @@ app.MapPost("/volatile", async (int count, [FromServices] IRabbitFlowTemporary r
         onMessageReceived: async (@event, msgCt) =>
         {
             await Task.Delay(TimeSpan.FromMilliseconds(250), msgCt);
+            throw new Exception("Simulated processing error");
             logger.LogInformation("Processed volatile event {Id}", @event.Id);
         },
         onCompleted: (totalProcessed, errors) =>
         {
             logger.LogInformation("Volatile batch completed. Total={Total}, Errors={Errors}", totalProcessed, errors);
+        },
+        onError: async (@event, errorCt) =>
+        {
+            logger.LogWarning("Failed to process volatile event {Id}", @event.Id);
         },
         options: new RunTemporaryOptions
         {
@@ -191,6 +196,12 @@ app.MapPost("/volatile-fire-and-forget", async (int count, [FromServices] IRabbi
         onCompleted: (totalProcessed, errors) =>
         {
             logger.LogInformation("Volatile batch completed. Total={Total}, Errors={Errors}", totalProcessed, errors);
+        },
+        onError: (@event, errorCt) =>
+        {
+            logger.LogWarning("Failed to process volatile event {Id}", @event.Id);
+
+            return Task.CompletedTask;
         },
         options: new RunTemporaryOptions
         {
