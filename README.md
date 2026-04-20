@@ -63,6 +63,7 @@
   - [Registering Consumers](#registering-consumers)
   - [Auto-Generate Topology](#auto-generate-topology)
   - [Retry Policies](#retry-policies)
+  - [Consumer Timeout](#consumer-timeout)
   - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
 - [Publishing Messages](#publishing-messages)
   - [Single Message](#single-message)
@@ -477,6 +478,41 @@ Attempt 5 → fail → sent to dead-letter queue
 | `ExponentialBackoff` | bool | `false` | Enable exponential backoff |
 | `ExponentialBackoffFactor` | int | `1` | Multiplier for exponential growth |
 | `MaxRetryDelay` | int | `60000` | Upper bound for delay (ms) |
+
+### Consumer Timeout
+
+The `Timeout` setting (in `ConsumerSettings`) bounds how long a single handler invocation may run before being cancelled:
+
+```csharp
+c.Timeout = TimeSpan.FromSeconds(30); // default
+```
+
+Internally it drives a `CancellationTokenSource` passed to `HandleAsync`. On timeout, the token is cancelled, the attempt fails, and the retry policy kicks in.
+
+**Server-side timeout (`x-consumer-timeout`)**
+
+RabbitMQ also enforces its own per-queue delivery acknowledgement timeout (default 30 minutes). If a message is not acked within that window, the broker closes the channel with `PRECONDITION_FAILED` and requeues the message.
+
+When `AutoGenerate = true`, EasyRabbitFlow automatically sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
+
+```
+x-consumer-timeout = Timeout × MaxRetryCount + Σ RetryIntervals + 30s grace
+```
+
+This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
+
+**Channel recovery**
+
+If the broker does close a channel (timeout exceeded, protocol violation, etc.), EasyRabbitFlow automatically recreates the channel, re-applies QoS, and re-subscribes the consumer — with exponential backoff between attempts (1s, 2s, 4s… capped at 30s). Connection-level closures are handled the same way.
+
+> **⚠️ Migration note (upgrading from < 5.1.0)**
+>
+> Queue arguments are immutable in RabbitMQ. If you had a queue created by a previous version (without `x-consumer-timeout`), the next startup with `AutoGenerate = true` will fail with `PRECONDITION_FAILED: inequivalent arg 'x-consumer-timeout'`.
+>
+> **Options:**
+> 1. Delete the queue and let EasyRabbitFlow recreate it.
+> 2. Apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) to the existing queue on the broker and add `x-consumer-timeout` with the same value to `AutoGenerateSettings.Args` so the declare matches.
+> 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
 
 ### Custom Dead-Letter Queues
 

@@ -22,11 +22,7 @@ namespace EasyRabbitFlow.Services
 
         private readonly ILogger<ConsumerHostedService> _logger;
 
-        private readonly List<IConnection> _connections = new List<IConnection>();
-
-        private readonly List<IChannel> _channels = new List<IChannel>();
-
-        private readonly List<SemaphoreSlim> _channelGates = new List<SemaphoreSlim>();
+        private readonly List<ConsumerInstance> _instances = new List<ConsumerInstance>();
 
         public ConsumerHostedService(IServiceProvider root, ILogger<ConsumerHostedService> logger)
         {
@@ -46,8 +42,8 @@ namespace EasyRabbitFlow.Services
 
             var connectionFactory = _root.GetRequiredService<ConnectionFactory>();
 
-            var serializerOptions = _root.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? new JsonSerializerOptions 
-            { 
+            var serializerOptions = _root.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? new JsonSerializerOptions
+            {
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase
             };
 
@@ -61,437 +57,604 @@ namespace EasyRabbitFlow.Services
                     continue;
                 }
 
-                var consumerType = marker.ConsumerType;
-                
-                var eventType = marker.EventType;
-                
-                var queueName = settingsObj.QueueName;
-
-                if (string.IsNullOrWhiteSpace(queueName))
+                if (string.IsNullOrWhiteSpace(settingsObj.QueueName))
                 {
-                    _logger.LogWarning("[RABBIT-FLOW]: Empty QueueName for {Consumer}. Avoiding.", consumerType.Name);
+                    _logger.LogWarning("[RABBIT-FLOW]: Empty QueueName for {Consumer}. Avoiding.", marker.ConsumerType.Name);
                     continue;
                 }
 
-                bool autoGenerate = settingsObj.AutoGenerate;
-                
-                ushort prefetch = settingsObj.PrefetchCount;
-                
-                TimeSpan timeout = settingsObj.Timeout;
-                
-                bool extendDeadLetter = settingsObj.ExtendDeadletterMessage;
-                
-                bool autoAckOnError = settingsObj.AutoAckOnError;
-                
-                string consumerId = settingsObj.ConsumerId ?? queueName;
+                var instance = new ConsumerInstance(_root, _logger, connectionFactory, serializerOptions, marker);
 
-                var retryPolicyObj = _root.GetService(typeof(RetryPolicy<>).MakeGenericType(consumerType))
-                                       ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(consumerType));
+                _instances.Add(instance);
 
-                // Extract retry configuration once (avoid per-message reflection)
-                var rpType = retryPolicyObj.GetType();
-
-                int rpMax = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryCount))!.GetValue(retryPolicyObj)!;
-
-                int rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
-
-                bool rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
-
-                int rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
-
-                int rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
-
-                var customDeadLetterObj = _root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(consumerType));
-
-                var connection = await connectionFactory.CreateConnectionAsync($"consumer_{consumerId}", cancellationToken);
-                
-                var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
-                
-                _connections.Add(connection);
-                
-                _channels.Add(channel);
-
-                connection.ConnectionShutdownAsync += (sender, args) =>
-                {
-                    _logger.LogWarning("[RABBIT-FLOW]: Connection shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", consumerType.Name, args.ReplyCode, args.ReplyText);
-                    return Task.CompletedTask;
-                };
-
-                connection.CallbackExceptionAsync += (sender, args) =>
-                {
-                    _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection callback exception for {Consumer}.", consumerType.Name);
-                    return Task.CompletedTask;
-                };
-
-                connection.RecoverySucceededAsync += (sender, args) =>
-                {
-                    _logger.LogInformation("[RABBIT-FLOW]: Connection recovery succeeded for {Consumer}.", consumerType.Name);
-                    return Task.CompletedTask;
-                };
-
-                connection.ConnectionRecoveryErrorAsync += (sender, args) =>
-                {
-                    _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection recovery error for {Consumer}.", consumerType.Name);
-                    return Task.CompletedTask;
-                };
-
-                channel.CallbackExceptionAsync += (sender, args) =>
-                {
-                    _logger.LogWarning(args.Exception, "[RABBIT-FLOW]: Channel callback exception for {Consumer}.", consumerType.Name);
-                    return Task.CompletedTask;
-                };
-
-                channel.ChannelShutdownAsync += (sender, args) =>
-                {
-                    _logger.LogWarning("[RABBIT-FLOW]: Channel shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", consumerType.Name, args.ReplyCode, args.ReplyText);
-                    return Task.CompletedTask;
-                };
-
-                channel.ContinuationTimeout = timeout;
-                
-                await channel.BasicQosAsync(0, prefetch, false, cancellationToken);
-
-                string deadLetterQueueName = string.Empty;
-
-                if (autoGenerate)
-                {
-                    var autoGenType = typeof(AutoGenerateSettings<>).MakeGenericType(consumerType);
-
-                    var autoGenObj = _root.GetService(autoGenType) ?? Activator.CreateInstance(autoGenType);
-
-                    if (autoGenObj == null)
-                    {
-                        _logger.LogWarning("[RABBIT-FLOW]: AutoGenerateSettings could not be created for {Consumer}. Skipping generation.", consumerType.Name);
-                    }
-                    else
-                    {
-                        var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? $"{queueName}-exchange";
-                        
-                        var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? $"{queueName}-routing-key";
-                        
-                        var generateDeadletter = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateDeadletterQueue))?.GetValue(autoGenObj) ?? false;
-                        
-                        var durableQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DurableQueue))?.GetValue(autoGenObj) ?? true;
-                        
-                        var durableExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DurableExchange))?.GetValue(autoGenObj) ?? true;
-                        
-                        var autoDeleteQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.AutoDeleteQueue))?.GetValue(autoGenObj) ?? false;
-                        
-                        var exclusiveQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExclusiveQueue))?.GetValue(autoGenObj) ?? false;
-                        
-                        var exchangeType = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeType))?.GetValue(autoGenObj)?.ToString()?.ToLowerInvariant() ?? "direct";
-                        
-                        var generateExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateExchange))?.GetValue(autoGenObj) ?? true; // default true when fallback
-                        
-                        IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
-
-                        if (generateDeadletter)
-                        {
-                            deadLetterQueueName = $"{queueName}-deadletter";
-                            var deadLetterExchange = $"{queueName}-deadletter-exchange";
-                            var deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
-
-                            await channel.QueueDeclareAsync(deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: cancellationToken);
-                            await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: cancellationToken);
-                            await channel.QueueBindAsync(deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
-
-                            args ??= new Dictionary<string, object?>();
-                            args["x-dead-letter-exchange"] = deadLetterExchange;
-                            args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
-                        }
-
-                        await channel.QueueDeclareAsync(queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
-
-                        if (generateExchange)
-                        {
-                            await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
-                            await channel.QueueBindAsync(queueName, exchangeName, routingKey);
-                        }
-                    }
-                }
-
-                var consumer = new AsyncEventingBasicConsumer(channel);
-
-                var semaphore = new SemaphoreSlim(prefetch);
-
-                var channelGate = new SemaphoreSlim(1, 1);
-
-                _channelGates.Add(channelGate);
-
-                // Build fast processor delegate using precompiled factory
-                var markerFactory = marker.Factory;
-
-                var processor = BuildProcessorFromFactory(markerFactory, consumerType, eventType, channel, channelGate, deadLetterQueueName, extendDeadLetter, autoAckOnError, serializerOptions, semaphore, rpMax, rpInterval, rpExp, rpFactor, rpMaxDelay, customDeadLetterObj);
-
-                consumer.ReceivedAsync += async (_, ea) =>
-                {
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                    try 
-                    { 
-                        await semaphore.WaitAsync(cancellationToken); 
-                    } 
-                    catch { return; }
-
-                    _ = processor(ea, cancellationToken);
-                };
-
-                await channel.BasicConsumeAsync(queue: queueName, autoAck: false, consumer: consumer, cancellationToken: cancellationToken);
+                await instance.StartAsync(cancellationToken);
             }
         }
 
-        private Func<BasicDeliverEventArgs, CancellationToken, Task> BuildProcessorFromFactory(
-            ConsumerSettingsFactory markerFactory,
-            Type consumerType,
-            Type eventType,
-            IChannel channel,
-            SemaphoreSlim channelGate,
-            string deadLetterQueueName,
-            bool extendDeadLetter,
-            bool autoAckOnError,
-            JsonSerializerOptions serializerOptions,
-            SemaphoreSlim semaphore,
-            int maxRetries,
-            int retryInterval,
-            bool exponential,
-            int expFactor,
-            int maxRetryDelay,
-            object? customDeadLetterObj)
+        public async Task StopAsync(CancellationToken cancellationToken)
         {
-            return async (args, rootCt) =>
+            foreach (var instance in _instances)
             {
-                try
-                {
-                    var body = args.Body.ToArray();
+                await instance.StopAsync();
+            }
+        }
+    }
 
-                    object? evt;
+    internal sealed class ConsumerInstance
+    {
+        private readonly IServiceProvider _root;
+        private readonly ILogger _logger;
+        private readonly ConnectionFactory _connectionFactory;
+        private readonly JsonSerializerOptions _serializerOptions;
+        private readonly IConsumerSettingsMarker _marker;
+
+        private readonly ConsumerSettingsFactory _markerFactory;
+        private readonly Type _consumerType;
+        private readonly Type _eventType;
+        private readonly string _queueName;
+        private readonly string _consumerId;
+        private readonly TimeSpan _timeout;
+        private readonly ushort _prefetch;
+        private readonly bool _autoGenerate;
+        private readonly bool _extendDeadLetter;
+        private readonly bool _autoAckOnError;
+
+        private readonly int _rpMax;
+        private readonly int _rpInterval;
+        private readonly bool _rpExp;
+        private readonly int _rpFactor;
+        private readonly int _rpMaxDelay;
+
+        private readonly object? _customDeadLetterObj;
+        private readonly object? _autoGenObj;
+        private readonly long _serverConsumerTimeoutMs;
+
+        private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _recoveryGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _prefetchSemaphore;
+
+        private IConnection? _connection;
+        private IChannel? _channel;
+        private string _deadLetterQueueName = string.Empty;
+        private volatile bool _stopping;
+        private CancellationToken _lifetimeCt;
+
+        public ConsumerInstance(
+            IServiceProvider root,
+            ILogger logger,
+            ConnectionFactory connectionFactory,
+            JsonSerializerOptions serializerOptions,
+            IConsumerSettingsMarker marker)
+        {
+            _root = root;
+            _logger = logger;
+            _connectionFactory = connectionFactory;
+            _serializerOptions = serializerOptions;
+            _marker = marker;
+
+            var settings = marker.SettingsInstance;
+
+            _markerFactory = marker.Factory;
+            _consumerType = marker.ConsumerType;
+            _eventType = marker.EventType;
+            _queueName = settings.QueueName;
+            _consumerId = settings.ConsumerId ?? settings.QueueName;
+            _timeout = settings.Timeout;
+            _prefetch = settings.PrefetchCount;
+            _autoGenerate = settings.AutoGenerate;
+            _extendDeadLetter = settings.ExtendDeadletterMessage;
+            _autoAckOnError = settings.AutoAckOnError;
+
+            var retryPolicyObj = root.GetService(typeof(RetryPolicy<>).MakeGenericType(_consumerType))
+                                ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType));
+
+            var rpType = retryPolicyObj.GetType();
+
+            _rpMax = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryCount))!.GetValue(retryPolicyObj)!;
+            _rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
+            _rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
+            _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
+            _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
+
+            _customDeadLetterObj = root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(_consumerType));
+
+            _autoGenObj = _autoGenerate
+                ? (root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType))
+                    ?? Activator.CreateInstance(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType)))
+                : null;
+
+            _prefetchSemaphore = new SemaphoreSlim(_prefetch);
+
+            long sumRetryDelaysMs = 0;
+
+            for (int attemptIndex = 1; attemptIndex <= _rpMax - 1; attemptIndex++)
+            {
+                long d = _rpInterval;
+
+                if (_rpExp && attemptIndex > 1)
+                {
                     try
                     {
-                        evt = markerFactory.Deserialize(body, serializerOptions) ?? throw new Exception("Deserialization returned null");
+                        var computed = checked((long)(_rpInterval * Math.Pow(_rpFactor, attemptIndex - 1)));
+                        d = Math.Min(computed, _rpMaxDelay);
+                    }
+                    catch { d = _rpMaxDelay; }
+                }
+
+                sumRetryDelaysMs += d;
+            }
+
+            const long serverTimeoutGraceMs = 30_000;
+
+            _serverConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _rpMax) + sumRetryDelaysMs + serverTimeoutGraceMs;
+        }
+
+        public async Task StartAsync(CancellationToken cancellationToken)
+        {
+            _lifetimeCt = cancellationToken;
+
+            await EnsureConnectionAsync(cancellationToken);
+            await EnsureChannelAsync(cancellationToken);
+        }
+
+        public async Task StopAsync()
+        {
+            _stopping = true;
+
+            await _recoveryGate.WaitAsync();
+            try
+            {
+                DisposeChannel();
+                DisposeConnection();
+            }
+            finally
+            {
+                _recoveryGate.Release();
+            }
+
+            _channelGate.Dispose();
+            _prefetchSemaphore.Dispose();
+            _recoveryGate.Dispose();
+        }
+
+        private async Task EnsureConnectionAsync(CancellationToken ct)
+        {
+            if (_connection != null && _connection.IsOpen)
+            {
+                return;
+            }
+
+            DisposeConnection();
+
+            _connection = await _connectionFactory.CreateConnectionAsync($"consumer_{_consumerId}", ct);
+
+            _connection.ConnectionShutdownAsync += OnConnectionShutdownAsync;
+            _connection.CallbackExceptionAsync += OnConnectionCallbackExceptionAsync;
+            _connection.RecoverySucceededAsync += OnRecoverySucceededAsync;
+            _connection.ConnectionRecoveryErrorAsync += OnConnectionRecoveryErrorAsync;
+        }
+
+        private async Task EnsureChannelAsync(CancellationToken ct)
+        {
+            if (_channel != null && _channel.IsOpen)
+            {
+                return;
+            }
+
+            DisposeChannel();
+
+            _channel = await _connection!.CreateChannelAsync(cancellationToken: ct);
+
+            _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
+            _channel.ChannelShutdownAsync += OnChannelShutdownAsync;
+
+            await _channel.BasicQosAsync(0, _prefetch, false, ct);
+
+            if (_autoGenerate && _autoGenObj != null)
+            {
+                await DeclareTopologyAsync(_channel, ct);
+            }
+
+            var consumer = new AsyncEventingBasicConsumer(_channel);
+
+            consumer.ReceivedAsync += async (_, ea) =>
+            {
+                if (_stopping || _lifetimeCt.IsCancellationRequested)
+                {
+                    return;
+                }
+                try
+                {
+                    await _prefetchSemaphore.WaitAsync(_lifetimeCt);
+                }
+                catch { return; }
+
+                _ = ProcessMessageAsync(ea);
+            };
+
+            await _channel.BasicConsumeAsync(queue: _queueName, autoAck: false, consumer: consumer, cancellationToken: ct);
+        }
+
+        private async Task DeclareTopologyAsync(IChannel channel, CancellationToken ct)
+        {
+            var autoGenObj = _autoGenObj!;
+
+            var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? $"{_queueName}-exchange";
+
+            var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? $"{_queueName}-routing-key";
+
+            var generateDeadletter = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateDeadletterQueue))?.GetValue(autoGenObj) ?? false;
+
+            var durableQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DurableQueue))?.GetValue(autoGenObj) ?? true;
+
+            var durableExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DurableExchange))?.GetValue(autoGenObj) ?? true;
+
+            var autoDeleteQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.AutoDeleteQueue))?.GetValue(autoGenObj) ?? false;
+
+            var exclusiveQueue = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExclusiveQueue))?.GetValue(autoGenObj) ?? false;
+
+            var exchangeType = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeType))?.GetValue(autoGenObj)?.ToString()?.ToLowerInvariant() ?? "direct";
+
+            var generateExchange = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateExchange))?.GetValue(autoGenObj) ?? true;
+
+            IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
+
+            if (generateDeadletter)
+            {
+                _deadLetterQueueName = $"{_queueName}-deadletter";
+                var deadLetterExchange = $"{_queueName}-deadletter-exchange";
+                var deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
+
+                await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
+                await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: ct);
+                await channel.QueueBindAsync(_deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
+
+                args ??= new Dictionary<string, object?>();
+                args["x-dead-letter-exchange"] = deadLetterExchange;
+                args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
+            }
+
+            args ??= new Dictionary<string, object?>();
+
+            if (!args.ContainsKey("x-consumer-timeout"))
+            {
+                args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
+            }
+
+            await channel.QueueDeclareAsync(_queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
+
+            if (generateExchange)
+            {
+                await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
+                await channel.QueueBindAsync(_queueName, exchangeName, routingKey);
+            }
+        }
+
+        private async Task ProcessMessageAsync(BasicDeliverEventArgs args)
+        {
+            var channel = _channel;
+            var rootCt = _lifetimeCt;
+
+            try
+            {
+                if (channel == null || !channel.IsOpen)
+                {
+                    return;
+                }
+
+                var body = args.Body.ToArray();
+
+                object? evt;
+                try
+                {
+                    evt = _markerFactory.Deserialize(body, _serializerOptions) ?? throw new Exception("Deserialization returned null");
+                }
+                catch (Exception ex)
+                {
+                    await HandleErrorAsync(channel, args.DeliveryTag, null, ex, rootCt);
+                    return;
+                }
+
+                int remainingAttempts = _rpMax;
+                Exception? lastException = null;
+
+                while (remainingAttempts > 0 && !rootCt.IsCancellationRequested)
+                {
+                    using var attemptCts = new CancellationTokenSource(_timeout);
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(attemptCts.Token, rootCt);
+                    var attemptCt = linked.Token;
+
+                    using var scope = _root.CreateScope();
+
+                    try
+                    {
+                        var messageContext = new RabbitFlowMessageContext(
+                            args.BasicProperties?.MessageId,
+                            args.BasicProperties?.CorrelationId,
+                            args.Exchange,
+                            args.RoutingKey,
+                            args.BasicProperties?.Headers,
+                            args.DeliveryTag,
+                            args.Redelivered);
+
+                        var consumerInstance = scope.ServiceProvider.GetRequiredService(_consumerType);
+
+                        await _markerFactory.InvokeHandleAsync(consumerInstance, evt, messageContext, attemptCt).ConfigureAwait(false);
+
+                        await SafeAckAsync(channel, args.DeliveryTag, rootCt);
+
+                        return;
+                    }
+                    catch (OperationCanceledException ex) when (attemptCts.IsCancellationRequested && !rootCt.IsCancellationRequested)
+                    {
+                        lastException = ex;
+                        await ApplyRetryDelay(remainingAttempts, rootCt);
+                    }
+                    catch (RabbitFlowTransientException ex)
+                    {
+                        lastException = ex;
+                        await ApplyRetryDelay(remainingAttempts, rootCt);
                     }
                     catch (Exception ex)
                     {
-                        await HandleErrorAsync(channel, channelGate, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, null, ex, eventType, serializerOptions, rootCt);
-                        return;
+                        lastException = ex;
+                        remainingAttempts = 0;
                     }
-
-                    int remainingAttempts = maxRetries;
-                    
-                    Exception? lastException = null;
-
-                    while (remainingAttempts > 0 && !rootCt.IsCancellationRequested)
+                    finally
                     {
-                        using var attemptCts = new CancellationTokenSource(channel.ContinuationTimeout);
-                        
-                        using var linked = CancellationTokenSource.CreateLinkedTokenSource(attemptCts.Token, rootCt);
-                        
-                        var attemptCt = linked.Token;
-                        
-                        using var scope = _root.CreateScope();
+                        remainingAttempts--;
+                    }
+                }
 
+                if (remainingAttempts <= 0)
+                {
+                    await HandleErrorAsync(channel, args.DeliveryTag, evt, lastException ?? new Exception("Unknown error"), rootCt);
+
+                    if (_customDeadLetterObj != null && evt != null)
+                    {
                         try
                         {
-                            var messageContext = new RabbitFlowMessageContext(
-                                args.BasicProperties?.MessageId,
-                                args.BasicProperties?.CorrelationId,
-                                args.Exchange,
-                                args.RoutingKey,
-                                args.BasicProperties?.Headers,
-                                args.DeliveryTag,
-                                args.Redelivered);
+                            var queueProp = _customDeadLetterObj.GetType().GetProperty("DeadletterQueueName");
+                            var deadQueue = queueProp?.GetValue(_customDeadLetterObj) as string;
 
-                            var consumer = scope.ServiceProvider.GetRequiredService(consumerType);
-
-                            await markerFactory.InvokeHandleAsync(consumer, evt, messageContext, attemptCt).ConfigureAwait(false);
-                            
-                            await SafeAckAsync(channel, channelGate, args.DeliveryTag, rootCt);
-                            
-                            return;
-                        }
-                        catch (OperationCanceledException ex) when (attemptCts.IsCancellationRequested && !rootCt.IsCancellationRequested)
-                        {
-                            lastException = ex;
-                            
-                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, maxRetryDelay, rootCt);
-                        }
-                        catch (RabbitFlowTransientException ex)
-                        {
-                            lastException = ex;
-                            
-                            await ApplyRetryDelayReflection(retryInterval, exponential, expFactor, maxRetries, remainingAttempts, maxRetryDelay, rootCt);
-                        }
-                        catch (Exception ex)
-                        {
-                            lastException = ex;
-                            
-                            remainingAttempts = 0;
-                        }
-                        finally
-                        {
-                            remainingAttempts--;
-                        }
-                    }
-
-                    if (remainingAttempts <= 0)
-                    {
-                        await HandleErrorAsync(channel, channelGate, args.DeliveryTag, autoAckOnError, extendDeadLetter, deadLetterQueueName, evt, lastException ?? new Exception("Unknown error"), eventType, serializerOptions, rootCt);
-                        
-                        if (customDeadLetterObj != null && evt != null)
-                        {
-                            try
+                            if (!string.IsNullOrWhiteSpace(deadQueue) && _markerFactory.PublishToCustomDeadletter != null)
                             {
-                                var queueProp = customDeadLetterObj.GetType().GetProperty("DeadletterQueueName");
-                                
-                                var deadQueue = queueProp?.GetValue(customDeadLetterObj) as string;
-                                
-                                if (!string.IsNullOrWhiteSpace(deadQueue) && markerFactory.PublishToCustomDeadletter != null)
-                                {
-                                    await markerFactory.PublishToCustomDeadletter(evt, deadQueue!, _root);
-                                }
+                                await _markerFactory.PublishToCustomDeadletter(evt, deadQueue!, _root);
                             }
-                            catch (Exception dlxEx)
-                            {
-                                _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publishing to custom dead-letter queue.");
-                            }
+                        }
+                        catch (Exception dlxEx)
+                        {
+                            _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publishing to custom dead-letter queue.");
                         }
                     }
                 }
-                catch (AlreadyClosedException) { }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "[RABBIT-FLOW]: Unhandled exception in message processing (HostedService).");
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-            };
+            }
+            catch (AlreadyClosedException) { }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[RABBIT-FLOW]: Unhandled exception in message processing (HostedService).");
+            }
+            finally
+            {
+                try { _prefetchSemaphore.Release(); } catch { }
+            }
         }
 
-        private static async Task ApplyRetryDelayReflection(int baseInterval, bool exponential, int expFactor, int maxRetries, int remainingAttempts, int maxRetryDelay, CancellationToken ct)
+        private async Task ApplyRetryDelay(int remainingAttempts, CancellationToken ct)
         {
             if (remainingAttempts <= 1)
             {
                 return;
             }
-            int attemptIndex = maxRetries - remainingAttempts + 1;
-            
-            long delay = baseInterval;
-            
-            if (exponential && attemptIndex > 1)
+
+            int attemptIndex = _rpMax - remainingAttempts + 1;
+            long delay = _rpInterval;
+
+            if (_rpExp && attemptIndex > 1)
             {
                 try
                 {
-                    var computed = checked(baseInterval * (long)Math.Pow(expFactor, attemptIndex - 1));
-                    delay = Math.Min(computed, maxRetryDelay);
+                    var computed = checked(_rpInterval * (long)Math.Pow(_rpFactor, attemptIndex - 1));
+                    delay = Math.Min(computed, _rpMaxDelay);
                 }
-                catch { delay = maxRetryDelay; }
+                catch { delay = _rpMaxDelay; }
             }
-            try 
-            { 
-                await Task.Delay((int)delay, ct); 
-            } 
-            catch { }
+
+            try { await Task.Delay((int)delay, ct); } catch { }
         }
 
-        private static async Task SafeAckAsync(IChannel channel, SemaphoreSlim channelGate, ulong deliveryTag, CancellationToken ct)
+        private async Task SafeAckAsync(IChannel channel, ulong deliveryTag, CancellationToken ct)
         {
-            await channelGate.WaitAsync(ct).ConfigureAwait(false);
+            await _channelGate.WaitAsync(ct).ConfigureAwait(false);
             try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
-            finally { channelGate.Release(); }
+            finally { _channelGate.Release(); }
         }
 
-        private static async Task HandleErrorAsync(IChannel channel, SemaphoreSlim channelGate, ulong deliveryTag, bool autoAck, bool extendDeadletterMessage, string deadletterQueue, object? evt, Exception exception, Type evtType, JsonSerializerOptions serializerOptions, CancellationToken ct)
+        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, Exception exception, CancellationToken ct)
         {
-            await channelGate.WaitAsync(ct).ConfigureAwait(false);
+            await _channelGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-            if (autoAck)
-            {
-                try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
-                return;
-            }
-            if (extendDeadletterMessage && !string.IsNullOrEmpty(deadletterQueue))
-            {
-                var innerExceptions = new List<object>();
-                
-                const int MaxDepth = 10;
-                
-                var temp = exception;
-                
-                var depth = 0;
-                
-                while (temp?.InnerException != null && depth < MaxDepth)
+                if (_autoAckOnError)
                 {
-                    temp = temp.InnerException;
+                    try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
+                    return;
+                }
 
-                    if (temp != null)
+                if (_extendDeadLetter && !string.IsNullOrEmpty(_deadLetterQueueName))
+                {
+                    var innerExceptions = new List<object>();
+                    const int MaxDepth = 10;
+                    var temp = exception;
+                    var depth = 0;
+
+                    while (temp?.InnerException != null && depth < MaxDepth)
                     {
-                        innerExceptions.Add(new { exceptionType = temp.GetType().Name, errorMessage = temp.Message, stackTrace = temp.StackTrace, source = temp.Source });
+                        temp = temp.InnerException;
+                        if (temp != null)
+                        {
+                            innerExceptions.Add(new { exceptionType = temp.GetType().Name, errorMessage = temp.Message, stackTrace = temp.StackTrace, source = temp.Source });
+                        }
+                        depth++;
                     }
-                    depth++;
+
+                    var extendedMessage = new
+                    {
+                        dateUtc = DateTime.UtcNow,
+                        messageType = _eventType.Name,
+                        messageData = evt,
+                        exceptionType = exception?.GetType().Name,
+                        errorMessage = exception?.Message,
+                        stackTrace = exception?.StackTrace,
+                        source = exception?.Source,
+                        innerExceptions
+                    };
+
+                    try
+                    {
+                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, _serializerOptions));
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct);
+                        await channel.BasicAckAsync(deliveryTag, false, ct);
+                    }
+                    catch { }
                 }
-                
-                var extendedMessage = new
+                else
                 {
-                    dateUtc = DateTime.UtcNow,
-                    messageType = evtType.Name,
-                    messageData = evt,
-                    exceptionType = exception?.GetType().Name,
-                    errorMessage = exception?.Message,
-                    stackTrace = exception?.StackTrace,
-                    source = exception?.Source,
-                    innerExceptions
-                };
-                try
-                {
-                    var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, serializerOptions));
-                    
-                    await channel.BasicPublishAsync(exchange: "",
-                        routingKey: deadletterQueue,
-                        body: bytes,
-                        cancellationToken: ct);
-                    
-                    await channel.BasicAckAsync(deliveryTag, false, ct);
+                    try { await channel.BasicNackAsync(deliveryTag, false, false, ct); } catch { }
                 }
-                catch { }
             }
-            else
-            {
-                try { await channel.BasicNackAsync(deliveryTag, false, false, ct); } catch { }
-            }
-            }
-            finally { channelGate.Release(); }
+            finally { _channelGate.Release(); }
         }
 
-        public Task StopAsync(CancellationToken cancellationToken)
+        private Task OnChannelCallbackExceptionAsync(object sender, CallbackExceptionEventArgs args)
         {
-            foreach (var channel in _channels)
-            {
-                try 
-                { 
-                    channel.Dispose(); 
-                } 
-                catch { }
-            }
-
-            foreach (var conn in _connections)
-            {
-                try 
-                { 
-                    conn.Dispose(); 
-                } 
-                catch { }
-            }
-
-            foreach (var gate in _channelGates)
-            {
-                gate.Dispose();
-            }
-
+            _logger.LogWarning(args.Exception, "[RABBIT-FLOW]: Channel callback exception for {Consumer}.", _consumerType.Name);
             return Task.CompletedTask;
+        }
+
+        private Task OnChannelShutdownAsync(object sender, ShutdownEventArgs args)
+        {
+            _logger.LogWarning("[RABBIT-FLOW]: Channel shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", _consumerType.Name, args.ReplyCode, args.ReplyText);
+
+            if (_stopping || args.Initiator == ShutdownInitiator.Application)
+            {
+                return Task.CompletedTask;
+            }
+
+            _ = TriggerRecoveryAsync();
+            return Task.CompletedTask;
+        }
+
+        private Task OnConnectionShutdownAsync(object sender, ShutdownEventArgs args)
+        {
+            _logger.LogWarning("[RABBIT-FLOW]: Connection shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", _consumerType.Name, args.ReplyCode, args.ReplyText);
+
+            if (_stopping || args.Initiator == ShutdownInitiator.Application)
+            {
+                return Task.CompletedTask;
+            }
+
+            _ = TriggerRecoveryAsync();
+            return Task.CompletedTask;
+        }
+
+        private Task OnConnectionCallbackExceptionAsync(object sender, CallbackExceptionEventArgs args)
+        {
+            _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection callback exception for {Consumer}.", _consumerType.Name);
+            return Task.CompletedTask;
+        }
+
+        private Task OnRecoverySucceededAsync(object sender, AsyncEventArgs args)
+        {
+            _logger.LogInformation("[RABBIT-FLOW]: Connection recovery succeeded for {Consumer}.", _consumerType.Name);
+            return Task.CompletedTask;
+        }
+
+        private Task OnConnectionRecoveryErrorAsync(object sender, ConnectionRecoveryErrorEventArgs args)
+        {
+            _logger.LogError(args.Exception, "[RABBIT-FLOW]: Connection recovery error for {Consumer}.", _consumerType.Name);
+            return Task.CompletedTask;
+        }
+
+        private async Task TriggerRecoveryAsync()
+        {
+            if (_stopping)
+            {
+                return;
+            }
+
+            if (!await _recoveryGate.WaitAsync(0))
+            {
+                return;
+            }
+
+            try
+            {
+                int attempt = 0;
+
+                while (!_stopping)
+                {
+                    attempt++;
+
+                    try
+                    {
+                        await EnsureConnectionAsync(_lifetimeCt);
+                        await EnsureChannelAsync(_lifetimeCt);
+
+                        _logger.LogInformation("[RABBIT-FLOW]: Consumer {Consumer} recovered after {Attempts} attempt(s).", _consumerType.Name, attempt);
+                        return;
+                    }
+                    catch (OperationCanceledException) when (_lifetimeCt.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        var delay = Math.Min(1000 * (int)Math.Pow(2, Math.Min(attempt, 6)), 30_000);
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Recovery attempt {Attempt} failed for {Consumer}. Retrying in {Delay}ms.", attempt, _consumerType.Name, delay);
+
+                        try { await Task.Delay(delay, _lifetimeCt); } catch { return; }
+                    }
+                }
+            }
+            finally
+            {
+                _recoveryGate.Release();
+            }
+        }
+
+        private void DisposeChannel()
+        {
+            var ch = _channel;
+            _channel = null;
+            if (ch == null) return;
+
+            try
+            {
+                ch.CallbackExceptionAsync -= OnChannelCallbackExceptionAsync;
+                ch.ChannelShutdownAsync -= OnChannelShutdownAsync;
+            }
+            catch { }
+
+            try { ch.Dispose(); } catch { }
+        }
+
+        private void DisposeConnection()
+        {
+            var conn = _connection;
+            _connection = null;
+            if (conn == null) return;
+
+            try
+            {
+                conn.ConnectionShutdownAsync -= OnConnectionShutdownAsync;
+                conn.CallbackExceptionAsync -= OnConnectionCallbackExceptionAsync;
+                conn.RecoverySucceededAsync -= OnRecoverySucceededAsync;
+                conn.ConnectionRecoveryErrorAsync -= OnConnectionRecoveryErrorAsync;
+            }
+            catch { }
+
+            try { conn.Dispose(); } catch { }
         }
     }
 }

@@ -36,7 +36,7 @@ builder.Services.AddRabbitFlow(settings =>
 
         consumerSettings.ConsumerId = "EmailQueueConsumer";
 
-        consumerSettings.Timeout = TimeSpan.FromMilliseconds(2000);
+        consumerSettings.Timeout = TimeSpan.FromMilliseconds(1890000);
         
         consumerSettings.AutoGenerate = true;
 
