@@ -142,8 +142,26 @@ namespace EasyRabbitFlow.Services
             _timeout = settings.Timeout;
             _prefetch = settings.PrefetchCount;
             _autoGenerate = settings.AutoGenerate;
-            _extendDeadLetter = settings.ExtendDeadletterMessage;
             _autoAckOnError = settings.AutoAckOnError;
+
+            var reprocessObj = root.GetService(typeof(DeadLetterReprocessSettings<>).MakeGenericType(_consumerType));
+
+            var reprocessConfigured = reprocessObj != null
+                && (bool)reprocessObj.GetType().GetProperty(nameof(DeadLetterReprocessSettings<object>.Enabled))!.GetValue(reprocessObj)!;
+
+            var effectiveExtend = settings.ExtendDeadletterMessage;
+
+            if (reprocessConfigured && !_autoGenerate)
+            {
+                logger.LogWarning("[RABBIT-FLOW]: Dead-letter reprocessor configured for {Consumer} but AutoGenerate is disabled. Reprocessor will be ignored.", _consumerType.Name);
+            }
+            else if (reprocessConfigured && _autoGenerate && !effectiveExtend)
+            {
+                logger.LogWarning("[RABBIT-FLOW]: Dead-letter reprocessor enabled for {Consumer}; forcing ExtendDeadletterMessage = true.", _consumerType.Name);
+                effectiveExtend = true;
+            }
+
+            _extendDeadLetter = effectiveExtend;
 
             var retryPolicyObj = root.GetService(typeof(RetryPolicy<>).MakeGenericType(_consumerType))
                                 ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType));
@@ -344,6 +362,10 @@ namespace EasyRabbitFlow.Services
 
                 var body = args.Body.ToArray();
 
+                var reprocessAttempts = RabbitFlowHeaders.ReadReprocessAttempts(args.BasicProperties?.Headers);
+                var msgId = args.BasicProperties?.MessageId;
+                var corrId = args.BasicProperties?.CorrelationId;
+
                 object? evt;
                 try
                 {
@@ -351,7 +373,7 @@ namespace EasyRabbitFlow.Services
                 }
                 catch (Exception ex)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, null, ex, rootCt);
+                    await HandleErrorAsync(channel, args.DeliveryTag, null, body, reprocessAttempts, msgId, corrId, ex, rootCt);
                     return;
                 }
 
@@ -375,7 +397,8 @@ namespace EasyRabbitFlow.Services
                             args.RoutingKey,
                             args.BasicProperties?.Headers,
                             args.DeliveryTag,
-                            args.Redelivered);
+                            args.Redelivered,
+                            reprocessAttempts);
 
                         var consumerInstance = scope.ServiceProvider.GetRequiredService(_consumerType);
 
@@ -408,7 +431,7 @@ namespace EasyRabbitFlow.Services
 
                 if (remainingAttempts <= 0)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, evt, lastException ?? new Exception("Unknown error"), rootCt);
+                    await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, lastException ?? new Exception("Unknown error"), rootCt);
 
                     if (_customDeadLetterObj != null && evt != null)
                     {
@@ -470,7 +493,7 @@ namespace EasyRabbitFlow.Services
             finally { _channelGate.Release(); }
         }
 
-        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, Exception exception, CancellationToken ct)
+        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -483,7 +506,20 @@ namespace EasyRabbitFlow.Services
 
                 if (_extendDeadLetter && !string.IsNullOrEmpty(_deadLetterQueueName))
                 {
-                    var innerExceptions = new List<object>();
+                    var envelope = new DeadLetterEnvelope
+                    {
+                        DateUtc = DateTime.UtcNow,
+                        MessageType = _eventType.Name,
+                        MessageId = messageId,
+                        CorrelationId = correlationId,
+                        MessageData = TryParseJsonElement(body),
+                        ExceptionType = exception?.GetType().Name,
+                        ErrorMessage = exception?.Message,
+                        StackTrace = exception?.StackTrace,
+                        Source = exception?.Source,
+                        ReprocessAttempts = reprocessAttempts
+                    };
+
                     const int MaxDepth = 10;
                     var temp = exception;
                     var depth = 0;
@@ -493,26 +529,20 @@ namespace EasyRabbitFlow.Services
                         temp = temp.InnerException;
                         if (temp != null)
                         {
-                            innerExceptions.Add(new { exceptionType = temp.GetType().Name, errorMessage = temp.Message, stackTrace = temp.StackTrace, source = temp.Source });
+                            envelope.InnerExceptions.Add(new DeadLetterInnerException
+                            {
+                                ExceptionType = temp.GetType().Name,
+                                ErrorMessage = temp.Message,
+                                StackTrace = temp.StackTrace,
+                                Source = temp.Source
+                            });
                         }
                         depth++;
                     }
 
-                    var extendedMessage = new
-                    {
-                        dateUtc = DateTime.UtcNow,
-                        messageType = _eventType.Name,
-                        messageData = evt,
-                        exceptionType = exception?.GetType().Name,
-                        errorMessage = exception?.Message,
-                        stackTrace = exception?.StackTrace,
-                        source = exception?.Source,
-                        innerExceptions
-                    };
-
                     try
                     {
-                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(extendedMessage, _serializerOptions));
+                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                         await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct);
                         await channel.BasicAckAsync(deliveryTag, false, ct);
                     }
@@ -655,6 +685,21 @@ namespace EasyRabbitFlow.Services
             catch { }
 
             try { conn.Dispose(); } catch { }
+        }
+
+        private static JsonElement? TryParseJsonElement(byte[]? body)
+        {
+            if (body == null || body.Length == 0) return null;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                return doc.RootElement.Clone();
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }

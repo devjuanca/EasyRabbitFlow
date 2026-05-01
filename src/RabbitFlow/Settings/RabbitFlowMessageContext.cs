@@ -15,7 +15,8 @@ namespace EasyRabbitFlow.Settings
             string? routingKey,
             IDictionary<string, object?>? headers,
             ulong deliveryTag,
-            bool redelivered)
+            bool redelivered,
+            int reprocessAttempts)
         {
             MessageId = messageId;
             CorrelationId = correlationId;
@@ -24,13 +25,14 @@ namespace EasyRabbitFlow.Settings
             Headers = headers;
             DeliveryTag = deliveryTag;
             Redelivered = redelivered;
+            ReprocessAttempts = reprocessAttempts;
         }
 
         /// <summary>
-        /// Gets the <c>MessageId</c> from <c>BasicProperties</c>.
-        /// When the publisher has <see cref="PublisherOptions.IdempotencyEnabled"/> set to <c>true</c>,
-        /// this contains the unique identifier assigned to the message for deduplication.
-        /// <c>null</c> when the publisher did not set a <c>MessageId</c>.
+        /// Gets the <c>MessageId</c> from <c>BasicProperties</c>. Always populated when the message was published
+        /// via <see cref="Services.IRabbitFlowPublisher"/> (either the deterministic key supplied by the caller
+        /// or an auto-generated GUID). May be <c>null</c> only if the message originated from a third-party publisher
+        /// that did not set <c>BasicProperties.MessageId</c>.
         /// </summary>
         public string? MessageId { get; }
 
@@ -66,5 +68,12 @@ namespace EasyRabbitFlow.Settings
         /// Gets a value indicating whether this message was redelivered by the broker.
         /// </summary>
         public bool Redelivered { get; }
+
+        /// <summary>
+        /// Number of times this message has been re-enqueued from the dead-letter queue back to the main queue
+        /// by the dead-letter reprocessor. <c>0</c> for messages that have not been reprocessed.
+        /// Sourced from the <c>x-reprocess-attempts</c> AMQP header.
+        /// </summary>
+        public int ReprocessAttempts { get; }
     }
 }

@@ -1,3 +1,4 @@
+using EasyRabbitFlow.Exceptions;
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
 using RabbitFlowSample.Events;
@@ -19,11 +20,11 @@ public class WhatsAppConsumer(
 
         var transientGuid = guidTransientService.Guid;
 
-        logger.LogInformation("[WhatsApp] Singleton service GUID: {Guid}", singletonGuid);
+        //logger.LogInformation("[WhatsApp] Singleton service GUID: {Guid}", singletonGuid);
 
-        logger.LogInformation("[WhatsApp] Scoped service GUID: {Guid}", scopedGuid);
+        //logger.LogInformation("[WhatsApp] Scoped service GUID: {Guid}", scopedGuid);
 
-        logger.LogInformation("[WhatsApp] Transient service GUID: {Guid}", transientGuid);
+        //logger.LogInformation("[WhatsApp] Transient service GUID: {Guid}", transientGuid);
 
         if (message.WhatsAppNotificationData is null)
         {
@@ -31,10 +32,23 @@ public class WhatsAppConsumer(
             return;
         }
 
+        if (context.ReprocessAttempts > 0)
+        {
+            logger.LogInformation("Reprocessing message (attempt {N}) after a previous failure.", context.ReprocessAttempts);
+        }
+
+        var roll = Random.Shared.NextDouble();
+
+        if (roll < 0.5)
+        {
+            logger.LogWarning("[WhatsApp] Transient failure encountered. Will be retried if configured.");
+            throw new RabbitFlowTransientException("Simulated transient email send failure.");
+        }
+        
         var latency = Random.Shared.Next(50, 250);
         
-        await Task.Delay(latency, cancellationToken);
-        
+        await Task.Delay(latency, cancellationToken); // Simulate IO
+
         logger.LogInformation("[WhatsApp] Delivered whatsapp message after {Latency}ms: {Payload}", latency, JsonSerializer.Serialize(message.WhatsAppNotificationData));
     }
 }

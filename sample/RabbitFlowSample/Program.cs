@@ -25,7 +25,6 @@ builder.Services.AddRabbitFlow(settings =>
     settings.ConfigurePublisher(publisherSettings =>
     {
         publisherSettings.DisposePublisherConnection = false;
-        publisherSettings.IdempotencyEnabled = true;
     }
     ); // OPTIONAL
 
@@ -37,7 +36,7 @@ builder.Services.AddRabbitFlow(settings =>
         consumerSettings.ConsumerId = "EmailQueueConsumer";
 
         consumerSettings.Timeout = TimeSpan.FromMilliseconds(1890000);
-        
+
         consumerSettings.AutoGenerate = true;
 
         consumerSettings.ConfigureAutoGenerate(opt =>
@@ -61,8 +60,8 @@ builder.Services.AddRabbitFlow(settings =>
 
     settings.AddConsumer<WhatsAppConsumer>(queueName: "whatsapp-queue", consumerSettings =>
     {
-        consumerSettings.Timeout = TimeSpan.FromMilliseconds(3000);
-        
+        consumerSettings.Timeout = TimeSpan.FromSeconds(60);
+
         consumerSettings.AutoGenerate = true;
 
         consumerSettings.ConfigureAutoGenerate(opt =>
@@ -72,7 +71,14 @@ builder.Services.AddRabbitFlow(settings =>
             opt.ExclusiveQueue = false;
         });
 
-        consumerSettings.ExtendDeadletterMessage = true;     
+        consumerSettings.ExtendDeadletterMessage = true;
+
+        consumerSettings.ConfigureDeadLetterReprocess(opt =>
+        {
+            opt.Enabled = true;
+            opt.MaxReprocessAttempts = 2;
+            opt.Interval = TimeSpan.FromHours(1);
+        });
     });
 
 
@@ -96,7 +102,7 @@ app.UseHttpsRedirection();
 // Fanout broadcast (both email & whatsapp consumers receive)
 app.MapPost("/notification", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent eventPayload) =>
 {
-    var result = await publisher.PublishAsync(eventPayload, exchangeName: "notifications", routingKey: "");
+    var result = await publisher.PublishAsync(eventPayload, exchangeName: "notifications", routingKey: "", messageId: $"notification-{Guid.NewGuid()}");
 
     return result.Success
         ? Results.Accepted(value: new { result.MessageId, result.Destination, result.TimestampUtc, Payload = eventPayload })
@@ -135,7 +141,7 @@ app.MapPost("/whatsapp", async ([FromServices] IRabbitFlowPublisher publisher, [
 // Batch publish to fanout exchange (atomic by default - Transactional)
 app.MapPost("/notification/batch", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] NotificationEvent[] events) =>
 {
-    var result = await publisher.PublishBatchAsync(events, exchangeName: "notifications", routingKey: "");
+    var result = await publisher.PublishBatchAsync(events, exchangeName: "notifications", routingKey: "", messageIdSelector: e => $"notification-{Guid.NewGuid()}");
 
     return result.Success
         ? Results.Accepted(value: new { result.MessageCount, result.MessageIds, result.Destination, result.ChannelMode, result.TimestampUtc })
@@ -146,16 +152,16 @@ app.MapPost("/notification/batch", async ([FromServices] IRabbitFlowPublisher pu
 .Produces(StatusCodes.Status202Accepted);
 
 
-app.MapPost("/volatile", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger,  CancellationToken ct) =>
+app.MapPost("/volatile", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger, CancellationToken ct) =>
 {
     var events = Enumerable.Range(0, count).Select(_ => new VolatileEvent()).ToArray();
-    
+
     var processed = await rabbitFlowTemporary.RunAsync(
         messages: events,
         onMessageReceived: async (@event, msgCt) =>
         {
             await Task.Delay(TimeSpan.FromMilliseconds(250), msgCt);
-            throw new Exception("Simulated processing error");
+          
             logger.LogInformation("Processed volatile event {Id}", @event.Id);
         },
         onCompleted: (totalProcessed, errors) =>
@@ -181,7 +187,7 @@ app.MapPost("/volatile", async (int count, [FromServices] IRabbitFlowTemporary r
 .Produces(StatusCodes.Status200OK);
 
 
-app.MapPost("/volatile-fire-and-forget", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger,  CancellationToken ct = default) =>
+app.MapPost("/volatile-fire-and-forget", async (int count, [FromServices] IRabbitFlowTemporary rabbitFlowTemporary, ILogger<Program> logger, CancellationToken ct = default) =>
 {
     var events = Enumerable.Range(0, count).Select(_ => new VolatileEvent()).ToArray();
 
