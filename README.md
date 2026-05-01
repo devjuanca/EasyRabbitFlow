@@ -16,91 +16,75 @@
 
 ---
 
-> ## ⚠️ Breaking Changes (v6.0.0)
->
->
-> **`PublisherOptions.IdempotencyEnabled` removed**
->
-> Every published message now carries a `MessageId` unconditionally. The publisher no longer offers a knob to disable identification — it was a misnamed footgun (auto-GUID per call doesn't actually provide idempotency anyway, since retries get a new GUID).
->
-> **Migration:** delete the line. Behavior is now what `IdempotencyEnabled = true` used to do.
->
-> ```diff
+## ⚠️ Breaking Changes (v6.0.0)
 
-> cfg.ConfigurePublisher(pub =>
-> {
->     pub.DisposePublisherConnection = false;
-> -   pub.IdempotencyEnabled = true;
-> });
-> ```
+**`PublisherOptions.IdempotencyEnabled` removed**
 
->
-> **`PublishAsync` gained a `messageId` parameter; `PublishBatchAsync` gained a `messageIdSelector` parameter**
->
-> For real publish-side idempotency (deterministic key derived from business data), pass the value yourself:
->
-> ```csharp
+Every published message now carries a `MessageId` unconditionally. The publisher no longer offers a knob to disable identification — it was a misnamed footgun (auto-GUID per call doesn't actually provide idempotency anyway, since retries get a new GUID).
 
-> // Single — caller supplies the key
-> await publisher.PublishAsync(order, "orders-queue", messageId: $"order-{order.Id}-created");
->
-> // Batch — selector produces a key per event
-> await publisher.PublishBatchAsync(orders, "orders-queue", messageIdSelector: o => $"order-{o.Id}-created");
-> ```
+**Migration:** delete the line. Behavior is now what `IdempotencyEnabled = true` used to do.
 
->
-> If you don't pass anything, you still get a unique GUID per message — same as before with `IdempotencyEnabled = true`.
->
-> **`PublishResult.MessageId` is now `string` (non-nullable)**
->
-> Always populated. If you had `if (result.MessageId != null) ...`, it's now dead code; just use `result.MessageId` directly.
->
-> **Positional argument breakage**
->
-> `PublishAsync` and `PublishBatchAsync` shifted parameters to insert `messageId` / `messageIdSelector` before `correlationId`. Callers using **named** arguments (`correlationId:`, `routingKey:`, etc.) are unaffected. Positional callers must update.
->
----
->
+ ```diff
 
-> ## ⚠️ Breaking Changes (v5.0.0)
+cfg.ConfigurePublisher(pub =>
+ {
+     pub.DisposePublisherConnection = false;
+    pub.IdempotencyEnabled = true;
+ });
+ ```
 
->
->
-> **`IRabbitFlowConsumer<TEvent>.HandleAsync` signature changed**
->
-> A new `RabbitFlowMessageContext` parameter was added to provide AMQP metadata (MessageId, CorrelationId, headers, delivery info) directly to each consumer.
->
->
-> ```diff
+**`PublishAsync` gained a `messageId` parameter; `PublishBatchAsync` gained a `messageIdSelector` parameter**
 
-> - Task HandleAsync(TEvent message, CancellationToken cancellationToken);
-> + Task HandleAsync(TEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken);
-> ```
+For real publish-side idempotency (deterministic key derived from business data), pass the value yourself:
 
->
-> **How to migrate:** Add the `RabbitFlowMessageContext context` parameter to every `HandleAsync` implementation. If you don't need the context, simply ignore it:
->
->
-> ```csharp
+``` csharp
+// Single — caller supplies the key
+await publisher.PublishAsync(order, "orders-queue", messageId: $"order-{order.Id}-created");
 
-> public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, CancellationToken ct)
-> {
->     // context is available but not required to use
->     return ProcessAsync(message, ct);
-> }
-> ```
+// Batch — selector produces a key per event
+await publisher.PublishBatchAsync(orders, "orders-queue", messageIdSelector: o => $"order-{o.Id}-created");
+```
 
->
-> **Other changes in v5.0.0:**
->
+If you don't pass anything, you still get a unique GUID per message — same as before with `IdempotencyEnabled = true`.
 
-> - `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
+**`PublishResult.MessageId` is now `string` (non-nullable)**
 
->
-> - `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
-> - `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
-> - `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
-> - `PublisherOptions.IdempotencyEnabled` introduced (later removed in v6.0.0; `MessageId` is now always assigned).
+Always populated. If you had `if (result.MessageId != null) ...`, it's now dead code; just use `result.MessageId` directly.
+
+**Positional argument breakage**
+
+`PublishAsync` and `PublishBatchAsync` shifted parameters to insert `messageId` / `messageIdSelector` before `correlationId`. Callers using **named** arguments (`correlationId:`, `routingKey:`, etc.) are unaffected. Positional callers must update.
+
+## ⚠️ Breaking Changes (v5.0.0)
+
+**`IRabbitFlowConsumer<TEvent>.HandleAsync` signature changed**
+
+A new `RabbitFlowMessageContext` parameter was added to provide AMQP metadata (MessageId, CorrelationId, headers, delivery info) directly to each consumer.
+
+```diff
+ - Task HandleAsync(TEvent message, CancellationToken cancellationToken);
+ + Task HandleAsync(TEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken);
+```
+
+**How to migrate:** Add the `RabbitFlowMessageContext context` parameter to every `HandleAsync` implementation. If you don't need the context, simply ignore it:
+
+```csharp
+
+public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, CancellationToken ct)
+{
+    // context is available but not required to use
+    return ProcessAsync(message, ct);
+}
+```
+
+**Other changes in v5.0.0:**
+
+- `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
+
+- `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
+- `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
+- `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
+- `PublisherOptions.IdempotencyEnabled` introduced (later removed in v6.0.0; `MessageId` is now always assigned).
 
 ---
 
@@ -134,7 +118,7 @@
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
 - [Temporary Batch Processing](#temporary-batch-processing)
-- [Transient Exceptions & Custom Retry Logic](#transient-exceptions--custom-retry-logic)
+- [Transient Exceptions and Custom Retry Logic](#transient-exceptions-and-custom-retry-logic)
 - [Full API Reference](#full-api-reference)
 - [Performance Notes](#performance-notes)
 
@@ -571,11 +555,13 @@ If the broker does close a channel (timeout exceeded, protocol violation, etc.),
 >
 > **Options:**
 >
-
-> 1. Delete the queue and let EasyRabbitFlow recreate it.
-
 >
+> 1. Delete the queue and let EasyRabbitFlow recreate it.
+>
+>
+
 > 2. Apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) to the existing queue on the broker and add `x-consumer-timeout` with the same value to `AutoGenerateSettings.Args` so the declare matches.
+
 > 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
 
 ### Custom Dead-Letter Queues
@@ -1089,7 +1075,7 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
 
 ---
 
-## Transient Exceptions & Custom Retry Logic
+## Transient Exceptions and Custom Retry Logic
 
 EasyRabbitFlow distinguishes between **transient** failures (worth retrying) and **permanent** failures (drop straight to the dead-letter queue). The same set is honored by both the in-handler `RetryPolicy` and the [Dead-Letter Reprocessor](#dead-letter-reprocessor).
 
