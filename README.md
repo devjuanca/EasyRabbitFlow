@@ -16,38 +16,97 @@
 
 ---
 
+> ## ⚠️ Breaking Changes (v6.0.0)
+>
+>
+> **`PublisherOptions.IdempotencyEnabled` removed**
+>
+> Every published message now carries a `MessageId` unconditionally. The publisher no longer offers a knob to disable identification — it was a misnamed footgun (auto-GUID per call doesn't actually provide idempotency anyway, since retries get a new GUID).
+>
+> **Migration:** delete the line. Behavior is now what `IdempotencyEnabled = true` used to do.
+>
+> ```diff
+
+> cfg.ConfigurePublisher(pub =>
+> {
+>     pub.DisposePublisherConnection = false;
+> -   pub.IdempotencyEnabled = true;
+> });
+> ```
+
+>
+> **`PublishAsync` gained a `messageId` parameter; `PublishBatchAsync` gained a `messageIdSelector` parameter**
+>
+> For real publish-side idempotency (deterministic key derived from business data), pass the value yourself:
+>
+> ```csharp
+
+> // Single — caller supplies the key
+> await publisher.PublishAsync(order, "orders-queue", messageId: $"order-{order.Id}-created");
+>
+> // Batch — selector produces a key per event
+> await publisher.PublishBatchAsync(orders, "orders-queue", messageIdSelector: o => $"order-{o.Id}-created");
+> ```
+
+>
+> If you don't pass anything, you still get a unique GUID per message — same as before with `IdempotencyEnabled = true`.
+>
+> **`PublishResult.MessageId` is now `string` (non-nullable)**
+>
+> Always populated. If you had `if (result.MessageId != null) ...`, it's now dead code; just use `result.MessageId` directly.
+>
+> **Positional argument breakage**
+>
+> `PublishAsync` and `PublishBatchAsync` shifted parameters to insert `messageId` / `messageIdSelector` before `correlationId`. Callers using **named** arguments (`correlationId:`, `routingKey:`, etc.) are unaffected. Positional callers must update.
+>
+---
+>
+
 > ## ⚠️ Breaking Changes (v5.0.0)
+
+>
 >
 > **`IRabbitFlowConsumer<TEvent>.HandleAsync` signature changed**
 >
 > A new `RabbitFlowMessageContext` parameter was added to provide AMQP metadata (MessageId, CorrelationId, headers, delivery info) directly to each consumer.
 >
+>
 > ```diff
+
 > - Task HandleAsync(TEvent message, CancellationToken cancellationToken);
 > + Task HandleAsync(TEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken);
 > ```
+
 >
 > **How to migrate:** Add the `RabbitFlowMessageContext context` parameter to every `HandleAsync` implementation. If you don't need the context, simply ignore it:
 >
+>
 > ```csharp
+
 > public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, CancellationToken ct)
 > {
 >     // context is available but not required to use
 >     return ProcessAsync(message, ct);
 > }
 > ```
+
 >
 > **Other changes in v5.0.0:**
+>
+
 > - `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
+
+>
 > - `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
 > - `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
 > - `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
-> - `PublisherOptions.IdempotencyEnabled` is new — auto-assigns a unique `MessageId` to every published message.
+> - `PublisherOptions.IdempotencyEnabled` introduced (later removed in v6.0.0; `MessageId` is now always assigned).
 
 ---
 
 ## Table of Contents
 
+- [⚠️ Breaking Changes (v6.0.0)](#️-breaking-changes-v600)
 - [⚠️ Breaking Changes (v5.0.0)](#️-breaking-changes-v500)
 - [Why EasyRabbitFlow?](#why-easyrabbitflow)
 - [Architecture Overview](#architecture-overview)
@@ -65,6 +124,7 @@
   - [Retry Policies](#retry-policies)
   - [Consumer Timeout](#consumer-timeout)
   - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
+  - [Dead-Letter Reprocessor](#dead-letter-reprocessor)
 - [Publishing Messages](#publishing-messages)
   - [Single Message](#single-message)
   - [Batch Publishing](#batch-publishing)
@@ -92,7 +152,7 @@
 | Queue state & purge utilities | ✅ |
 | Full DI integration (scoped/transient/singleton) | ✅ |
 | Publisher confirms (single) & transactional batch | ✅ |
-| Built-in idempotency support (auto `MessageId`) | ✅ |
+| Built-in `MessageId` on every message (auto-GUID or caller-supplied for true idempotency) | ✅ |
 | CorrelationId support (end-to-end tracing) | ✅ |
 | `RabbitFlowMessageContext` per-message metadata | ✅ |
 | Rich `PublishResult` / `BatchPublishResult` types | ✅ |
@@ -103,7 +163,7 @@
 
 ## Architecture Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Your Application                            │
 ├────────────┬──────────────┬──────────────┬──────────────────────────┤
@@ -142,7 +202,7 @@
 
 ### Message Flow
 
-```
+```text
   Publisher                    RabbitMQ                        Consumer
   ────────                    ────────                        ────────
 
@@ -314,14 +374,14 @@ If not configured, the default `JsonSerializerOptions` are used.
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false; // Keep connection alive (default)
-    pub.IdempotencyEnabled = true;          // Auto-assign MessageId to every message
 });
 ```
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DisposePublisherConnection` | bool | `false` | Dispose connection after each publish |
-| `IdempotencyEnabled` | bool | `false` | Auto-assign a unique `MessageId` to every published message for deduplication |
+
+> Every published message always carries a `MessageId`. By default it is an auto-generated GUID; pass a deterministic key via the `messageId` parameter (single) or `messageIdSelector` (batch) when you need true idempotency from business data — see [Idempotency](#idempotency).
 
 ---
 
@@ -412,7 +472,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 
 **Generated topology when `AutoGenerate = true`:**
 
-```
+```text
                         ┌──────────────────────┐
                         │  orders-exchange      │
                         │  (fanout)             │
@@ -463,7 +523,7 @@ c.ConfigureRetryPolicy(r =>
 
 **Example: retry timeline with exponential backoff (factor=2, base=1000ms):**
 
-```
+```text
 Attempt 1 → fail → wait 1000ms
 Attempt 2 → fail → wait 2000ms
 Attempt 3 → fail → wait 4000ms
@@ -495,7 +555,7 @@ RabbitMQ also enforces its own per-queue delivery acknowledgement timeout (defau
 
 When `AutoGenerate = true`, EasyRabbitFlow automatically sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
 
-```
+```text
 x-consumer-timeout = Timeout × MaxRetryCount + Σ RetryIntervals + 30s grace
 ```
 
@@ -510,7 +570,11 @@ If the broker does close a channel (timeout exceeded, protocol violation, etc.),
 > Queue arguments are immutable in RabbitMQ. If you had a queue created by a previous version (without `x-consumer-timeout`), the next startup with `AutoGenerate = true` will fail with `PRECONDITION_FAILED: inequivalent arg 'x-consumer-timeout'`.
 >
 > **Options:**
+>
+
 > 1. Delete the queue and let EasyRabbitFlow recreate it.
+
+>
 > 2. Apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) to the existing queue on the broker and add `x-consumer-timeout` with the same value to `AutoGenerateSettings.Args` so the declare matches.
 > 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
 
@@ -531,14 +595,77 @@ When `ExtendDeadletterMessage = true`, the dead-letter message includes full err
 {
   "dateUtc": "2026-01-15T10:30:00Z",
   "messageType": "OrderCreatedEvent",
+  "messageId": "9f3...",
+  "correlationId": "req-abc-123",
   "messageData": { "orderId": "ORD-123", "total": 99.99 },
   "exceptionType": "TimeoutException",
   "errorMessage": "The operation was canceled.",
   "stackTrace": "...",
   "source": "OrderService",
-  "innerExceptions": []
+  "innerExceptions": [],
+  "reprocessAttempts": 0
 }
 ```
+
+The shape is exposed as the public type `DeadLetterEnvelope` so dead-letter messages can be deserialized with strong typing from any client.
+
+### Dead-Letter Reprocessor
+
+When in-handler retries are not enough — for example, when the failure is caused by a downstream system that takes hours to recover — you can attach a **dead-letter reprocessor** to a consumer. The reprocessor runs on a fixed cadence, drains the consumer's auto-generated dead-letter queue, and re-publishes each message to the main queue until a maximum attempt count is reached.
+
+```csharp
+cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
+{
+    c.AutoGenerate = true;                       // required
+    c.ExtendDeadletterMessage = true;            // forced when reprocessor is enabled
+
+    c.ConfigureRetryPolicy(r => r.MaxRetryCount = 3);
+
+    c.ConfigureDeadLetterReprocess(r =>
+    {
+        r.Enabled = true;
+        r.MaxReprocessAttempts = 5;              // total times the message can be moved DLQ → main
+        r.Interval = TimeSpan.FromHours(3);      // run every 3 hours
+        // r.MaxMessagesPerCycle = 500;          // optional safety cap; defaults to int.MaxValue (drain entire snapshot)
+    });
+});
+```
+
+**Behavior:**
+
+```text
+                          ┌─ DLQ ─┐
+                          │       │
+                          │ env#1 │  ReprocessAttempts < Max → publish payload to main queue
+                          │ env#2 │   (with header x-reprocess-attempts incremented)
+                          │ env#3 │
+                          └───┬───┘
+                              │
+          ┌───────────────────┴───────────────────┐
+          │                                       │
+   Reprocessor cycle                       Main queue picks it up;
+   every `Interval`                        if it fails again, the new
+                                           envelope is written back
+                                           with the bumped counter
+                                           preserved via x-reprocess-attempts.
+```
+
+If a message exhausts its reprocess budget, the reprocessor re-publishes it back to the dead-letter queue (with `reprocessAttempts` reflecting the final count) so it remains visible in any RabbitMQ client and is not silently dropped.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Enabled` | bool | `true` | Whether the reprocessor is active for this consumer |
+| `MaxReprocessAttempts` | int | `3` | Maximum times a message is moved from DLQ back to main queue |
+| `Interval` | TimeSpan | `3h` | Time between reprocessor runs. **Minimum 10 minutes** (hard floor — use the in-handler `RetryPolicy` for tighter retry cadences) |
+| `MaxMessagesPerCycle` | int | `int.MaxValue` | Optional safety cap on messages drained per cycle. By default each cycle drains the whole DLQ snapshot taken at the start of the run; lower this only if you need an explicit ceiling. |
+
+**Constraints:**
+
+- Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning.
+- Forces `ExtendDeadletterMessage = true` so the envelope (including `reprocessAttempts`) is available — a warning is logged if you set it to `false`.
+- Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Messages routed via `ConfigureCustomDeadletter` are not processed.
+- **Only transient failures are reprocessed.** A message is eligible only if its `exceptionType` in the envelope is `OperationCanceledException`, `TaskCanceledException`, or `RabbitFlowTransientException` — the same set the in-handler `RetryPolicy` retries. Permanent failures (validation, deserialization, business-rule violations) stay in the DLQ untouched so they remain visible for inspection.
+- Counter persistence: the reprocessor sets the AMQP header `x-reprocess-attempts` on every message it re-publishes. The consumer reads this header on receipt and seeds the new envelope with that count if processing fails again, so the counter survives the full cycle DLQ → main → DLQ.
 
 ---
 
@@ -604,7 +731,7 @@ Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
 | Property | Type | Description |
 |----------|------|-------------|
 | `Success` | bool | Whether the broker confirmed the message |
-| `MessageId` | string? | Unique ID (when `IdempotencyEnabled = true`) |
+| `MessageId` | string | Identifier of the published message — caller-supplied via `messageId` parameter or auto-generated GUID. Always populated. |
 | `Destination` | string | Target exchange or queue name |
 | `RoutingKey` | string | Routing key used (empty for queue publishes) |
 | `TimestampUtc` | DateTime | When the publish was executed |
@@ -659,7 +786,7 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 |----------|------|-------------|
 | `Success` | bool | Whether all messages were published |
 | `MessageCount` | int | Number of messages in the batch |
-| `MessageIds` | IReadOnlyList\<string\> | IDs per message (when `IdempotencyEnabled = true`) |
+| `MessageIds` | IReadOnlyList\<string\> | Identifiers per message (in input order) — produced by `messageIdSelector` when supplied or auto-generated GUIDs otherwise. Always one entry per published message. |
 | `Destination` | string | Target exchange or queue name |
 | `RoutingKey` | string | Routing key used |
 | `ChannelMode` | ChannelMode | Mode used (`Transactional` or `Confirm`) |
@@ -668,13 +795,48 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 
 ### Idempotency
 
-Enable automatic `MessageId` generation so consumers can deduplicate:
+Every published message carries a `MessageId` set on `BasicProperties.MessageId` and returned in `PublishResult.MessageId` (or `BatchPublishResult.MessageIds`). There is no opt-out — identification is foundational, not optional.
+
+**Default — auto-generated unique GUID per call:**
 
 ```csharp
-cfg.ConfigurePublisher(pub => pub.IdempotencyEnabled = true);
+var result = await publisher.PublishAsync(order, "orders-queue");
+// result.MessageId == "f3a9c1d4..." (GUID, unique per call)
 ```
 
-When enabled, every published message (single or batch) gets a unique `MessageId` set in `BasicProperties.MessageId`. The ID is also returned in `PublishResult.MessageId` or `BatchPublishResult.MessageIds`.
+This is enough for tracing, logs, and per-attempt identification. It is **not** enough for true idempotency — retrying the same logical publish produces a different GUID each time, so consumers can't deduplicate against it.
+
+**True idempotency — caller-supplied deterministic key:**
+
+For dedup-friendly behavior, pass a `messageId` derived from your business data. Retries of the same logical event then carry the same `MessageId` and consumers can short-circuit duplicates.
+
+```csharp
+// Single message — derive the key from business data
+var result = await publisher.PublishAsync(
+    order,
+    "orders-queue",
+    messageId: $"order-{order.Id}-created");
+
+// Batch — selector produces a key per event
+var batchResult = await publisher.PublishBatchAsync(
+    orders,
+    "orders-queue",
+    messageIdSelector: o => $"order-{o.Id}-created");
+```
+
+The selector must return a non-empty string. Returning `null` or an empty string fails the batch (rolled back in `Transactional` mode, partially published in `Confirm` mode).
+
+On the consumer side, deduplicate using `RabbitFlowMessageContext.MessageId`:
+
+```csharp
+public async Task HandleAsync(OrderEvent message, RabbitFlowMessageContext context, CancellationToken ct)
+{
+    if (context.MessageId != null && await _seen.ContainsAsync(context.MessageId, ct))
+        return; // duplicate — already processed
+    await ProcessAsync(message, ct);
+    await _seen.AddAsync(context.MessageId!, ct);
+}
+```
 
 ### Correlation
 
@@ -720,6 +882,12 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
             _logger.LogWarning("Redelivered message, DeliveryTag={Tag}", context.DeliveryTag);
         }
 
+        // Detect messages re-enqueued by the dead-letter reprocessor
+        if (context.ReprocessAttempts > 0)
+        {
+            _logger.LogInformation("Reprocessing message (attempt {N}) after a previous failure.", context.ReprocessAttempts);
+        }
+
         await ProcessOrderAsync(message, ct);
     }
 }
@@ -729,13 +897,14 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `MessageId` | string? | Unique ID from `BasicProperties.MessageId` (set when `IdempotencyEnabled = true`) |
+| `MessageId` | string? | Identifier from `BasicProperties.MessageId`. Always populated for messages published via `IRabbitFlowPublisher` (caller-supplied or auto-GUID). May be `null` only for messages produced by third-party publishers that don't set it. |
 | `CorrelationId` | string? | Correlation ID from `BasicProperties.CorrelationId` (set via `correlationId` parameter) |
 | `Exchange` | string? | Exchange that delivered the message (empty for direct queue publishes) |
 | `RoutingKey` | string? | Routing key used when the message was published |
 | `Headers` | IDictionary? | Custom AMQP headers from `BasicProperties.Headers` |
 | `DeliveryTag` | ulong | Broker-assigned delivery tag for this message |
 | `Redelivered` | bool | Whether the broker redelivered this message |
+| `ReprocessAttempts` | int | Number of times this message was re-enqueued from the DLQ by the [Dead-Letter Reprocessor](#dead-letter-reprocessor). `0` for messages that have never been reprocessed. |
 
 > **Note:** `RabbitFlowMessageContext` is immutable — all properties are read-only and populated automatically from `BasicDeliverEventArgs` before `HandleAsync` is invoked.
 
@@ -796,6 +965,7 @@ await purger.PurgeMessagesAsync(new[] { "orders-queue", "emails-queue", "notific
 `IRabbitFlowTemporary` is designed for **fire-and-forget batch workflows** — process a collection of messages through RabbitMQ with automatic queue creation and cleanup.
 
 **Ideal for:**
+
 - Background jobs (PDF generation, email sending, report calculation)
 - One-time batch processing (database cleanup, data migration)
 - Parallel processing with configurable concurrency
@@ -891,7 +1061,7 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
 
 ### How It Works
 
-```
+```text
   Your Code                   RabbitMQ (Temporary)            Handler
   ─────────                   ──────────────────              ───────
 
@@ -921,7 +1091,23 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
 
 ## Transient Exceptions & Custom Retry Logic
 
-By default, timeouts and `RabbitFlowTransientException` trigger retries. Throw `RabbitFlowTransientException` from your consumer to signal a retryable error:
+EasyRabbitFlow distinguishes between **transient** failures (worth retrying) and **permanent** failures (drop straight to the dead-letter queue). The same set is honored by both the in-handler `RetryPolicy` and the [Dead-Letter Reprocessor](#dead-letter-reprocessor).
+
+### Exceptions auto-recognized as transient
+
+| Exception type | When it fires |
+|---|---|
+| `OperationCanceledException` | Per-attempt timeout (configured via `ConsumerSettings.Timeout`) |
+| `TaskCanceledException` | Same as above, plus most cooperative cancellations — including `HttpClient.Timeout` |
+| `RabbitFlowTransientException` | Explicitly thrown by your consumer to signal a retryable error |
+
+Anything else thrown by your handler is treated as **permanent** and routed to the dead-letter queue without further retry.
+
+> **HttpClient timeouts are covered for free.** When `HttpClient.SendAsync` times out it throws `TaskCanceledException`, which is already in the transient set — no wrapping needed.
+
+### Marking your own errors as transient
+
+If a failure is transient but doesn't fall into the auto-recognized set (a `429 Too Many Requests`, a `503`, a database deadlock…), catch the original exception and rethrow it wrapped in `RabbitFlowTransientException`:
 
 ```csharp
 using EasyRabbitFlow.Exceptions;
@@ -932,23 +1118,61 @@ public class PaymentConsumer : IRabbitFlowConsumer<PaymentEvent>
     {
         try
         {
-            await ProcessPaymentAsync(message);
+            await ProcessPaymentAsync(message, cancellationToken);
         }
         catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable)
         {
-            // This will trigger the retry policy
-            throw new RabbitFlowTransientException("Payment gateway temporarily unavailable", ex);
+            throw new RabbitFlowTransientException("Payment gateway temporarily unavailable (503).", ex);
         }
         // Any other exception → no retry, sent to dead-letter queue
     }
 }
 ```
 
-**Exception types:**
+**Example — making `429 Too Many Requests` transient:**
+
+A rate-limited downstream API responds with `429`. The failure is temporary by definition (waiting helps), so we want it retried by both the in-handler policy and, if the message ends up dead-lettered, by the reprocessor:
+
+```csharp
+using EasyRabbitFlow.Exceptions;
+
+public class NotificationConsumer : IRabbitFlowConsumer<NotificationEvent>
+{
+    private readonly HttpClient _http;
+
+    public NotificationConsumer(HttpClient http) => _http = http;
+
+    public async Task HandleAsync(NotificationEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
+    {
+        HttpResponseMessage response;
+        try
+        {
+            response = await _http.PostAsJsonAsync("https://api.example.com/notify", message, cancellationToken);
+        }
+        catch (HttpRequestException ex)
+        {
+            // Connection refused, DNS failure, socket reset… all worth retrying.
+            throw new RabbitFlowTransientException("Notification API unreachable.", ex);
+        }
+
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            // Mark 429 explicitly as transient so retry / reprocessor pick it up.
+            throw new RabbitFlowTransientException("Notification API rate-limited (429).");
+        }
+
+        response.EnsureSuccessStatusCode(); // 4xx (other than 429) bubbles up as permanent → DLQ
+    }
+}
+```
+
+**Why this matters for the reprocessor:** the reprocessor only re-enqueues messages whose recorded `exceptionType` is one of the three transient types listed above. Wrapping the right errors at the handler level is what makes them eligible for the slow recovery path provided by [`ConfigureDeadLetterReprocess`](#dead-letter-reprocessor).
+
+### Exception types reference
 
 | Exception | Purpose |
 |-----------|---------|
-| `RabbitFlowTransientException` | Signals a retryable error — triggers retry policy |
+| `RabbitFlowTransientException` | User-facing marker. Throw it from your handler to signal a retryable error to both the in-handler retry policy and the dead-letter reprocessor. |
 | `RabbitFlowException` | General library error |
 | `RabbitFlowOverRetriesException` | Thrown internally when all retry attempts are exhausted |
 
@@ -1019,7 +1243,6 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false;         // Reuse connection
-    pub.IdempotencyEnabled = true;                  // Auto-assign MessageId
 });
 ```
 

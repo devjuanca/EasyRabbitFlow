@@ -15,11 +15,11 @@ namespace EasyRabbitFlow.Settings
         public bool Success { get; }
 
         /// <summary>
-        /// Gets the unique identifier assigned to the published message.
-        /// When <see cref="PublisherOptions.IdempotencyEnabled"/> is <c>true</c>, this value is automatically generated
-        /// and can be used for deduplication on the consumer side.
+        /// Gets the identifier assigned to the published message. Always populated:
+        /// either the value supplied by the caller via the <c>messageId</c> parameter (deterministic key for idempotency),
+        /// or a unique GUID generated automatically when no value is supplied.
         /// </summary>
-        public string? MessageId { get; }
+        public string MessageId { get; }
 
         /// <summary>
         /// Gets the destination exchange or queue name used for the publish operation.
@@ -43,7 +43,7 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         public Exception? Error { get; }
 
-        private PublishResult(bool success, string destination, string routingKey, string? messageId, Exception? error)
+        private PublishResult(bool success, string destination, string routingKey, string messageId, Exception? error)
         {
             Success = success;
             Destination = destination;
@@ -53,10 +53,10 @@ namespace EasyRabbitFlow.Settings
             Error = error;
         }
 
-        internal static PublishResult Successful(string destination, string routingKey, string? messageId)
+        internal static PublishResult Successful(string destination, string routingKey, string messageId)
             => new PublishResult(true, destination, routingKey, messageId, null);
 
-        internal static PublishResult Failed(string destination, string routingKey, string? messageId, Exception error)
+        internal static PublishResult Failed(string destination, string routingKey, string messageId, Exception error)
             => new PublishResult(false, destination, routingKey, messageId, error);
     }
 
@@ -89,8 +89,9 @@ namespace EasyRabbitFlow.Settings
         public int MessageCount { get; }
 
         /// <summary>
-        /// Gets the list of message identifiers assigned to each message in the batch.
-        /// Only populated when <see cref="PublisherOptions.IdempotencyEnabled"/> is <c>true</c>.
+        /// Gets the identifiers assigned to each message in the batch, in the same order as the input list.
+        /// Always populated with one entry per published message — either the value produced by the
+        /// <c>messageIdSelector</c> argument or a unique GUID generated automatically when no selector is supplied.
         /// </summary>
         public IReadOnlyList<string> MessageIds { get; }
 

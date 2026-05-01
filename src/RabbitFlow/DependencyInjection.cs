@@ -61,6 +61,8 @@ namespace EasyRabbitFlow
         {
             services.AddHostedService<ConsumerHostedService>();
 
+            services.AddHostedService<DeadLetterReprocessorHostedService>();
+
             return services;
         }
     }

@@ -305,7 +305,8 @@ namespace EasyRabbitFlow
                                 args.RoutingKey,
                                 args.BasicProperties?.Headers,
                                 args.DeliveryTag,
-                                args.Redelivered);
+                                args.Redelivered,
+                                RabbitFlowHeaders.ReadReprocessAttempts(args.BasicProperties?.Headers));
 
                             consumerService = scope.ServiceProvider.GetRequiredService<TConsumer>();
 

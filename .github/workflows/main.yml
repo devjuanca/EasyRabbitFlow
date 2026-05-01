@@ -2,12 +2,6 @@
 name: publish
 on:
   workflow_dispatch: # Allow running the workflow manually from the GitHub UI
-  push:
-    branches:
-      - 'master'       # Run the workflow when pushing to the main branch
-  pull_request:
-    branches:
-      - 'master'       # Run the workflow for pull requests targeting master
   release:
     types:
       - published    # Run the workflow when a new GitHub release is published
@@ -22,6 +16,15 @@ defaults:
     shell: pwsh
 
 jobs:
+  run_test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+    - name: Run tests
+      run: dotnet test --configuration Release
+
   create_nuget:
     runs-on: ubuntu-latest
     steps:
@@ -74,15 +77,6 @@ jobs:
       # using the --excluded-rules or --excluded-rule-ids option
       - name: Validate package
         run: meziantou.validate-nuget-package (Get-ChildItem "${{ env.NuGetDirectory }}/*.nupkg") --excluded-rule-ids 32,111,74,72,61
-
-  run_test:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-    - name: Run tests
-      run: dotnet test --configuration Release
 
   deploy:
     # Publish only when creating a GitHub Release

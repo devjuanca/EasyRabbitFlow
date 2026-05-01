@@ -156,5 +156,25 @@ namespace EasyRabbitFlow.Settings
 
             _services.AddSingleton(customDeasLetter);
         }
+
+        /// <summary>
+        /// Configures the dead-letter reprocessor for the consumer.
+        /// When enabled, a background service periodically drains the consumer's auto-generated dead-letter queue
+        /// and re-publishes messages to the main queue until <see cref="DeadLetterReprocessSettings{TConsumer}.MaxReprocessAttempts"/> is reached.
+        /// </summary>
+        /// <remarks>
+        /// Requires <see cref="AutoGenerate"/> to be <c>true</c>; otherwise the reprocessor is ignored.
+        /// When the reprocessor is active, <see cref="ExtendDeadletterMessage"/> is forced to <c>true</c> because the reprocessor
+        /// relies on the dead-letter envelope wrapping to track attempt counts and recover the original payload.
+        /// </remarks>
+        /// <param name="settings">An action to configure the reprocessor settings.</param>
+        public void ConfigureDeadLetterReprocess(Action<DeadLetterReprocessSettings<TConsumer>> settings)
+        {
+            var reprocessSettings = new DeadLetterReprocessSettings<TConsumer>();
+
+            settings.Invoke(reprocessSettings);
+
+            _services.AddSingleton(reprocessSettings);
+        }
     }
 }

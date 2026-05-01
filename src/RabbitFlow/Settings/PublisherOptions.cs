@@ -13,18 +13,7 @@
         /// If set to <c>false</c>, the connection remains open for reuse, which can improve performance in high-throughput scenarios.
         /// Default value is false.
         /// </summary>
-
         public bool DisposePublisherConnection { get; set; } = false;
-
-
-        /// <summary>
-        /// Gets or sets a value indicating whether idempotency support is enabled for published messages.
-        /// When <c>true</c>, the publisher automatically assigns a unique <c>MessageId</c> to each message
-        /// via <see cref="RabbitMQ.Client.IBasicProperties.MessageId"/>. Consumers can use this value 
-        /// for deduplication. The generated <c>MessageId</c> is also available in <see cref="PublishResult.MessageId"/>.
-        /// Default value is <c>false</c>.
-        /// </summary>
-        public bool IdempotencyEnabled { get; set; } = false;
     }
 
     /// <summary>
