@@ -94,9 +94,9 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         ///  Gets or sets a value indicating whether to extend the dead-letter message with exception details. 
-        ///  Default is false.
+        ///  Default is true.
         /// </summary>
-        public bool ExtendDeadletterMessage { get; set; } = false;
+        public bool ExtendDeadletterMessage { get; set; } = true;
 
         /// <summary>
         /// Gets or sets the number of messages that the consumer can prefetch.

@@ -55,6 +55,36 @@ Always populated. If you had `if (result.MessageId != null) ...`, it's now dead 
 
 `PublishAsync` and `PublishBatchAsync` shifted parameters to insert `messageId` / `messageIdSelector` before `correlationId`. Callers using **named** arguments (`correlationId:`, `routingKey:`, etc.) are unaffected. Positional callers must update.
 
+**`IServiceProvider.InitializeConsumerAsync<TEvent, TConsumer>` removed**
+
+The manual consumer-bootstrap extension — deprecated since v4 in favor of the hosted service registered by `UseRabbitFlowConsumers()` — is gone. All consumers are now started exclusively by the hosted service.
+
+**Migration:** delete any `InitializeConsumerAsync` calls from `Program.cs`/`Startup.cs` and ensure your RabbitFlow registration ends with `.UseRabbitFlowConsumers()`. The hosted service picks up every consumer added via `settings.AddConsumer<TConsumer>(...)` automatically.
+
+```diff
+- await app.Services.InitializeConsumerAsync<OrderEvent, OrderConsumer>();
+- await app.Services.InitializeConsumerAsync<EmailEvent, EmailConsumer>();
++ // nothing to do — UseRabbitFlowConsumers() in your service registration handles it
+```
+
+`ConsumerRegisterSettings` (the options bag taken by that extension) is no longer reachable from public API surface.
+
+**`RetryPolicy.MaxRetryCount` semantics changed — now counts retries, not attempts**
+
+Previously `MaxRetryCount = N` meant "process at most N times" (so `1` was the weird "process once, never retry" default). It now counts **retries after the initial attempt fails**:
+
+- `0` — no retries (1 attempt total). This is the new default.
+- `1` — one retry after the first failure (2 attempts total).
+- `3` — three retries after the first failure (4 attempts total).
+
+**Migration:** any consumer that explicitly set `MaxRetryCount = N` will now perform one extra attempt. To preserve the old behavior, change `MaxRetryCount = N` to `MaxRetryCount = N - 1`. Consumers relying on the default get a behavior change too — the previous default `1` (one attempt, no retry) and the new default `0` are equivalent, so no action needed there. The auto-generated queue's `x-consumer-timeout` follows the new formula `Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace`.
+
+**`ConsumerSettings.ExtendDeadletterMessage` default changed from `false` to `true`**
+
+Failed messages now land on the dead-letter queue wrapped in the `DeadLetterEnvelope` (with exception type, message, stack trace, inner exceptions, `MessageId`, `CorrelationId`, and `reprocessAttempts`) by default. Previously the raw payload was nacked and the broker forwarded it untouched.
+
+**Migration:** if you have downstream tooling that reads the DLQ and expects the original message bytes, either set `c.ExtendDeadletterMessage = false` per consumer to keep the old shape, or update the consumer to deserialize `DeadLetterEnvelope` and read `envelope.MessageData`. Consumers that already set this to `true` (and anyone using the dead-letter reprocessor, which forces it on) are unaffected.
+
 ## ⚠️ Breaking Changes (v5.0.0)
 
 **`IRabbitFlowConsumer<TEvent>.HandleAsync` signature changed**
@@ -429,7 +459,7 @@ cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 | `Timeout` | TimeSpan | `30s` | Processing timeout per message |
 | `AutoAckOnError` | bool | `false` | Auto-acknowledge on error (message lost) |
 | `AutoGenerate` | bool | `false` | Auto-create queue/exchange/DLQ |
-| `ExtendDeadletterMessage` | bool | `false` | Enrich dead-letter messages with error details |
+| `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details |
 
 ### Auto-Generate Topology
 
@@ -497,7 +527,7 @@ Configure how failed messages are retried:
 ```csharp
 c.ConfigureRetryPolicy(r =>
 {
-    r.MaxRetryCount = 5;               // Number of attempts
+    r.MaxRetryCount = 4;               // Number of retries after the initial attempt fails (5 attempts total)
     r.RetryInterval = 1000;            // Base delay in ms
     r.ExponentialBackoff = true;        // Enable exponential backoff
     r.ExponentialBackoffFactor = 2;     // Multiply delay by this factor
@@ -505,7 +535,13 @@ c.ConfigureRetryPolicy(r =>
 });
 ```
 
-**Example: retry timeline with exponential backoff (factor=2, base=1000ms):**
+`MaxRetryCount` counts **retries**, not total attempts:
+
+- `0` — no retries (the initial attempt is the only one).
+- `1` — one retry after the first failure (up to 2 attempts).
+- `4` — four retries after the first failure (up to 5 attempts).
+
+**Example: retry timeline with `MaxRetryCount = 4` and exponential backoff (factor=2, base=1000ms):**
 
 ```text
 Attempt 1 → fail → wait 1000ms
@@ -517,7 +553,7 @@ Attempt 5 → fail → sent to dead-letter queue
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `MaxRetryCount` | int | `1` | Total retry attempts |
+| `MaxRetryCount` | int | `0` | Number of retries after the initial attempt fails (`0` = no retries) |
 | `RetryInterval` | int | `1000` | Base delay between retries (ms) |
 | `ExponentialBackoff` | bool | `false` | Enable exponential backoff |
 | `ExponentialBackoffFactor` | int | `1` | Multiplier for exponential growth |
@@ -540,7 +576,7 @@ RabbitMQ also enforces its own per-queue delivery acknowledgement timeout (defau
 When `AutoGenerate = true`, EasyRabbitFlow automatically sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
 
 ```text
-x-consumer-timeout = Timeout × MaxRetryCount + Σ RetryIntervals + 30s grace
+x-consumer-timeout = Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace
 ```
 
 This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
