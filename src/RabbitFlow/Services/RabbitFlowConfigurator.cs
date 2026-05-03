@@ -54,7 +54,7 @@ namespace EasyRabbitFlow.Services
                 Password = hostSettings.Password,
                 VirtualHost = hostSettings.VirtualHost,
                 AutomaticRecoveryEnabled = hostSettings.AutomaticRecoveryEnabled,
-                TopologyRecoveryEnabled = true,
+                TopologyRecoveryEnabled = hostSettings.TopologyRecoveryEnabled,
                 NetworkRecoveryInterval = hostSettings.NetworkRecoveryInterval,
                 RequestedHeartbeat = hostSettings.RequestedHeartbeat
             };

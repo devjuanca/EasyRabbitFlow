@@ -100,6 +100,7 @@ namespace EasyRabbitFlow.Services
         private readonly bool _autoAckOnError;
 
         private readonly int _rpMax;
+        private readonly int _totalAttempts;
         private readonly int _rpInterval;
         private readonly bool _rpExp;
         private readonly int _rpFactor;
@@ -169,6 +170,8 @@ namespace EasyRabbitFlow.Services
             var rpType = retryPolicyObj.GetType();
 
             _rpMax = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryCount))!.GetValue(retryPolicyObj)!;
+            if (_rpMax < 0) _rpMax = 0;
+            _totalAttempts = _rpMax + 1;
             _rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
             _rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
             _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
@@ -185,7 +188,7 @@ namespace EasyRabbitFlow.Services
 
             long sumRetryDelaysMs = 0;
 
-            for (int attemptIndex = 1; attemptIndex <= _rpMax - 1; attemptIndex++)
+            for (int attemptIndex = 1; attemptIndex <= _rpMax; attemptIndex++)
             {
                 long d = _rpInterval;
 
@@ -204,7 +207,7 @@ namespace EasyRabbitFlow.Services
 
             const long serverTimeoutGraceMs = 30_000;
 
-            _serverConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _rpMax) + sumRetryDelaysMs + serverTimeoutGraceMs;
+            _serverConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _totalAttempts) + sumRetryDelaysMs + serverTimeoutGraceMs;
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -377,7 +380,7 @@ namespace EasyRabbitFlow.Services
                     return;
                 }
 
-                int remainingAttempts = _rpMax;
+                int remainingAttempts = _totalAttempts;
                 Exception? lastException = null;
 
                 while (remainingAttempts > 0 && !rootCt.IsCancellationRequested)
@@ -470,7 +473,7 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
-            int attemptIndex = _rpMax - remainingAttempts + 1;
+            int attemptIndex = _totalAttempts - remainingAttempts + 1;
             long delay = _rpInterval;
 
             if (_rpExp && attemptIndex > 1)

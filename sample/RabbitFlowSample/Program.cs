@@ -20,6 +20,8 @@ builder.Services.AddRabbitFlow(settings =>
         hostSettings.Username = "guest";
         hostSettings.Password = "guest";
         hostSettings.Port = 5672; // Optional (default 5672)
+        hostSettings.AutomaticRecoveryEnabled = true; // Optional (default true)
+        hostSettings.TopologyRecoveryEnabled = true; // Optional (default true)
     });
 
     settings.ConfigurePublisher(publisherSettings =>
@@ -48,7 +50,7 @@ builder.Services.AddRabbitFlow(settings =>
 
         consumerSettings.ConfigureRetryPolicy(retryPolicy =>
         {
-            retryPolicy.MaxRetryCount = 3;
+            retryPolicy.MaxRetryCount = 1;
             retryPolicy.RetryInterval = 1000;
             retryPolicy.ExponentialBackoff = true;
             retryPolicy.ExponentialBackoffFactor = 2;
@@ -81,6 +83,45 @@ builder.Services.AddRabbitFlow(settings =>
         });
     });
 
+    // ─── Topic exchange demo ───────────────────────────────────────────────
+    // Three consumers share the same Topic exchange "orders-topic" but bind
+    // to different patterns. The producer publishes with concrete routing
+    // keys shaped "orders.{region}.{status}" (e.g. "orders.eu.created");
+    // each consumer receives only the messages whose routing key matches
+    // its binding, courtesy of the Topic wildcards * (one word) and # (any words).
+
+    settings.AddConsumer<EuOrdersConsumer>(queueName: "orders-eu-queue", c =>
+    {
+        c.AutoGenerate = true;
+        c.ConfigureAutoGenerate(opt =>
+        {
+            opt.ExchangeName = "orders-topic";
+            opt.ExchangeType = ExchangeType.Topic;
+            opt.RoutingKey = "orders.eu.*";        // every status, EU only
+        });
+    });
+
+    settings.AddConsumer<OrderCreatedConsumer>(queueName: "orders-created-queue", c =>
+    {
+        c.AutoGenerate = true;
+        c.ConfigureAutoGenerate(opt =>
+        {
+            opt.ExchangeName = "orders-topic";
+            opt.ExchangeType = ExchangeType.Topic;
+            opt.RoutingKey = "orders.*.created";   // "created" status, any region
+        });
+    });
+
+    settings.AddConsumer<OrderAuditConsumer>(queueName: "orders-audit-queue", c =>
+    {
+        c.AutoGenerate = true;
+        c.ConfigureAutoGenerate(opt =>
+        {
+            opt.ExchangeName = "orders-topic";
+            opt.ExchangeType = ExchangeType.Topic;
+            opt.RoutingKey = "orders.#";           // catch-all (audit log)
+        });
+    });
 
 }).UseRabbitFlowConsumers();
 
@@ -149,6 +190,80 @@ app.MapPost("/notification/batch", async ([FromServices] IRabbitFlowPublisher pu
 })
 .WithName("PublishNotificationBatch")
 .WithSummary("Publishes a batch of NotificationEvents atomically (Transactional by default).")
+.Produces(StatusCodes.Status202Accepted);
+
+// Topic exchange — publish one OrderEvent. The path segments build the routing key
+// "orders.{region}.{status}", and the broker dispatches it to whichever consumers'
+// bindings match. Try the following from Swagger to see the patterns at work:
+//   POST /orders/eu/created   → audit + EU + created
+//   POST /orders/us/created   → audit + created   (NOT eu)
+//   POST /orders/eu/shipped   → audit + EU        (NOT created)
+//   POST /orders/ap/cancelled → audit only        (no EU, no created)
+app.MapPost("/orders/{region}/{status}", async (
+    string region,
+    string status,
+    [FromServices] IRabbitFlowPublisher publisher,
+    [FromBody] OrderEvent payload) =>
+{
+    payload.Region = region;
+
+    payload.Status = status;
+
+    var routingKey = $"orders.{region.ToLowerInvariant()}.{status.ToLowerInvariant()}";
+
+    var result = await publisher.PublishAsync(
+        payload,
+        exchangeName: "orders-topic",
+        routingKey: routingKey,
+        messageId: $"order-{payload.OrderId}-{status.ToLowerInvariant()}");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageId, result.Destination, RoutingKey = routingKey, Payload = payload })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
+})
+.WithName("PublishOrderEventTopic")
+.WithSummary("Publishes an OrderEvent to topic exchange 'orders-topic' with routing key 'orders.{region}.{status}'.")
+.Produces(StatusCodes.Status202Accepted);
+
+// Topic exchange — bulk publish a random mix of regions/statuses. Useful to watch
+// the three consumers light up at different rates depending on their binding.
+app.MapPost("/orders/random/{count:int}", async (
+    int count,
+    [FromServices] IRabbitFlowPublisher publisher) =>
+{
+    var regions = new[] { "eu", "us", "ap" };
+    var statuses = new[] { "created", "shipped", "cancelled" };
+    var rng = Random.Shared;
+    var produced = new List<object>(count);
+
+    for (var i = 0; i < count; i++)
+    {
+        var region = regions[rng.Next(regions.Length)];
+        var status = statuses[rng.Next(statuses.Length)];
+
+        var order = new OrderEvent
+        {
+            Region = region,
+            Status = status,
+            CustomerEmail = $"customer{i}@example.com",
+            Amount = Math.Round((decimal)(rng.NextDouble() * 500), 2),
+        };
+
+        var routingKey = $"orders.{region}.{status}";
+
+        var result = await publisher.PublishAsync(
+            order,
+            exchangeName: "orders-topic",
+            routingKey: routingKey,
+            messageId: $"order-{order.OrderId}-{status}");
+
+        produced.Add(new { result.MessageId, RoutingKey = routingKey, order.OrderId, order.Amount });
+    }
+
+    return Results.Accepted(value: new { count = produced.Count, items = produced });
+})
+.WithName("PublishOrderEventTopicRandom")
+.WithSummary("Publishes a random burst of OrderEvents across regions and statuses to 'orders-topic'.")
 .Produces(StatusCodes.Status202Accepted);
 
 

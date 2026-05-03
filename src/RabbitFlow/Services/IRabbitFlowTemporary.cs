@@ -593,6 +593,11 @@ namespace EasyRabbitFlow.Services
                 }
             }, cancellationToken);
 
+            using var ctr = cancellationToken.Register(() =>
+            {
+                tcs.TrySetCanceled(cancellationToken);
+            });
+
             try
             {
                 await tcs.Task.ConfigureAwait(false);

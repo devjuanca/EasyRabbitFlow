@@ -9,10 +9,15 @@
     public class RetryPolicy<TConsumer> where TConsumer : class
     {
         /// <summary>
-        /// Gets or sets the maximum number of retry attempts. 
-        /// The default value is 1, meaning there will be one retry attempt after the initial failure.
+        /// Gets or sets the maximum number of retry attempts performed after the initial processing attempt fails.
+        /// <para>
+        /// <c>0</c> = no retries (the message is processed once and not retried after a failure).<br/>
+        /// <c>1</c> = one retry after the first failure (up to 2 total attempts).<br/>
+        /// <c>3</c> = three retries after the first failure (up to 4 total attempts).
+        /// </para>
+        /// The default value is 0.
         /// </summary>
-        public int MaxRetryCount { get; set; } = 1;
+        public int MaxRetryCount { get; set; } = 0;
 
         /// <summary>
         /// Gets or sets the time interval (in milliseconds) between retry attempts.

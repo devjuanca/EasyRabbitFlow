@@ -164,7 +164,7 @@ namespace EasyRabbitFlow.Services
 
             var resolvedMessageId = string.IsNullOrEmpty(messageId) ? Guid.NewGuid().ToString("N") : messageId!;
 
-            var connection = await ResolveConnection(publisherId);
+            var connection = await ResolveConnection(publisherId, cancellationToken);
 
             var serializerOptions = jsonSerializerOptions ?? jsonOptions;
 
@@ -205,7 +205,7 @@ namespace EasyRabbitFlow.Services
 
             var messageIds = new List<string>(messages.Count);
 
-            var connection = await ResolveConnection(publisherId);
+            var connection = await ResolveConnection(publisherId, cancellationToken);
 
             var serializerOptions = jsonSerializerOptions ?? jsonOptions;
 
@@ -313,7 +313,7 @@ namespace EasyRabbitFlow.Services
         {
             if (globalConnection == null)
             {
-                await semaphore.WaitAsync();
+                await semaphore.WaitAsync(cancellationToken);
 
                 try
                 {
