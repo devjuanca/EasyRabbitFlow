@@ -42,10 +42,7 @@ namespace EasyRabbitFlow.Services
 
             var connectionFactory = _root.GetRequiredService<ConnectionFactory>();
 
-            var serializerOptions = _root.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-            };
+            var serializerOptions = _root.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? JsonSerializerOptions.Web;
 
             foreach (var marker in markers)
             {
@@ -87,7 +84,6 @@ namespace EasyRabbitFlow.Services
         private readonly ConnectionFactory _connectionFactory;
         private readonly JsonSerializerOptions _serializerOptions;
         private readonly IConsumerSettingsMarker _marker;
-
         private readonly ConsumerSettingsFactory _markerFactory;
         private readonly Type _consumerType;
         private readonly Type _eventType;
@@ -98,18 +94,16 @@ namespace EasyRabbitFlow.Services
         private readonly bool _autoGenerate;
         private readonly bool _extendDeadLetter;
         private readonly bool _autoAckOnError;
-
+        private readonly bool _unwrapEnvelopes;
         private readonly int _rpMax;
         private readonly int _totalAttempts;
         private readonly int _rpInterval;
         private readonly bool _rpExp;
         private readonly int _rpFactor;
         private readonly int _rpMaxDelay;
-
         private readonly object? _customDeadLetterObj;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
-
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _recoveryGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _prefetchSemaphore;
@@ -136,14 +130,24 @@ namespace EasyRabbitFlow.Services
             var settings = marker.SettingsInstance;
 
             _markerFactory = marker.Factory;
+            
             _consumerType = marker.ConsumerType;
+            
             _eventType = marker.EventType;
+            
             _queueName = settings.QueueName;
+            
             _consumerId = settings.ConsumerId ?? settings.QueueName;
+            
             _timeout = settings.Timeout;
+            
             _prefetch = settings.PrefetchCount;
+            
             _autoGenerate = settings.AutoGenerate;
+
             _autoAckOnError = settings.AutoAckOnError;
+
+            _unwrapEnvelopes = settings.UnwrapDeadLetterEnvelopes;
 
             var reprocessObj = root.GetService(typeof(DeadLetterReprocessSettings<>).MakeGenericType(_consumerType));
 
@@ -170,11 +174,20 @@ namespace EasyRabbitFlow.Services
             var rpType = retryPolicyObj.GetType();
 
             _rpMax = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryCount))!.GetValue(retryPolicyObj)!;
-            if (_rpMax < 0) _rpMax = 0;
+
+            if (_rpMax < 0)
+            {
+                _rpMax = 0;
+            }
+
             _totalAttempts = _rpMax + 1;
+            
             _rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
+            
             _rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
+            
             _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
+            
             _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
 
             _customDeadLetterObj = root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(_consumerType));
@@ -197,9 +210,13 @@ namespace EasyRabbitFlow.Services
                     try
                     {
                         var computed = checked((long)(_rpInterval * Math.Pow(_rpFactor, attemptIndex - 1)));
+                        
                         d = Math.Min(computed, _rpMaxDelay);
                     }
-                    catch { d = _rpMaxDelay; }
+                    catch 
+                    { 
+                        d = _rpMaxDelay; 
+                    }
                 }
 
                 sumRetryDelaysMs += d;
@@ -215,6 +232,7 @@ namespace EasyRabbitFlow.Services
             _lifetimeCt = cancellationToken;
 
             await EnsureConnectionAsync(cancellationToken);
+
             await EnsureChannelAsync(cancellationToken);
         }
 
@@ -223,6 +241,7 @@ namespace EasyRabbitFlow.Services
             _stopping = true;
 
             await _recoveryGate.WaitAsync();
+            
             try
             {
                 DisposeChannel();
@@ -250,8 +269,11 @@ namespace EasyRabbitFlow.Services
             _connection = await _connectionFactory.CreateConnectionAsync($"consumer_{_consumerId}", ct);
 
             _connection.ConnectionShutdownAsync += OnConnectionShutdownAsync;
+            
             _connection.CallbackExceptionAsync += OnConnectionCallbackExceptionAsync;
+            
             _connection.RecoverySucceededAsync += OnRecoverySucceededAsync;
+            
             _connection.ConnectionRecoveryErrorAsync += OnConnectionRecoveryErrorAsync;
         }
 
@@ -267,6 +289,7 @@ namespace EasyRabbitFlow.Services
             _channel = await _connection!.CreateChannelAsync(cancellationToken: ct);
 
             _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
+            
             _channel.ChannelShutdownAsync += OnChannelShutdownAsync;
 
             await _channel.BasicQosAsync(0, _prefetch, false, ct);
@@ -323,15 +346,21 @@ namespace EasyRabbitFlow.Services
             if (generateDeadletter)
             {
                 _deadLetterQueueName = $"{_queueName}-deadletter";
+                
                 var deadLetterExchange = $"{_queueName}-deadletter-exchange";
+                
                 var deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
 
                 await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
+                
                 await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: ct);
+                
                 await channel.QueueBindAsync(_deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
 
                 args ??= new Dictionary<string, object?>();
+                
                 args["x-dead-letter-exchange"] = deadLetterExchange;
+                
                 args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
             }
 
@@ -347,6 +376,7 @@ namespace EasyRabbitFlow.Services
             if (generateExchange)
             {
                 await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
+                
                 await channel.QueueBindAsync(_queueName, exchangeName, routingKey);
             }
         }
@@ -354,6 +384,7 @@ namespace EasyRabbitFlow.Services
         private async Task ProcessMessageAsync(BasicDeliverEventArgs args)
         {
             var channel = _channel;
+            
             var rootCt = _lifetimeCt;
 
             try
@@ -366,10 +397,28 @@ namespace EasyRabbitFlow.Services
                 var body = args.Body.ToArray();
 
                 var reprocessAttempts = RabbitFlowHeaders.ReadReprocessAttempts(args.BasicProperties?.Headers);
+                
                 var msgId = args.BasicProperties?.MessageId;
+
                 var corrId = args.BasicProperties?.CorrelationId;
 
+                if (_unwrapEnvelopes
+                    && LooksLikeDeadLetterEnvelope(body)
+                    && TryUnwrapDeadLetterEnvelope(body, out var unwrappedBody, out var inboundEnvelope))
+                {
+                    body = unwrappedBody;
+
+                    msgId ??= inboundEnvelope!.MessageId;
+
+                    corrId ??= inboundEnvelope!.CorrelationId;
+
+                    _logger.LogWarning(
+                        "[RABBIT-FLOW]: Detected manually replayed DeadLetterEnvelope on queue {Queue} for {Consumer}; unwrapped inner payload. Prefer the DeadLetterReprocessor for replays.",
+                        _queueName, _consumerType.Name);
+                }
+
                 object? evt;
+
                 try
                 {
                     evt = _markerFactory.Deserialize(body, _serializerOptions) ?? throw new Exception("Deserialization returned null");
@@ -381,12 +430,15 @@ namespace EasyRabbitFlow.Services
                 }
 
                 int remainingAttempts = _totalAttempts;
+
                 Exception? lastException = null;
 
                 while (remainingAttempts > 0 && !rootCt.IsCancellationRequested)
                 {
                     using var attemptCts = new CancellationTokenSource(_timeout);
+                    
                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(attemptCts.Token, rootCt);
+                    
                     var attemptCt = linked.Token;
 
                     using var scope = _root.CreateScope();
@@ -499,11 +551,16 @@ namespace EasyRabbitFlow.Services
         private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
+
             try
             {
                 if (_autoAckOnError)
                 {
-                    try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
+                    try 
+                    { 
+                        await channel.BasicAckAsync(deliveryTag, false, ct); 
+                    } 
+                    catch { }
                     return;
                 }
 
@@ -524,12 +581,15 @@ namespace EasyRabbitFlow.Services
                     };
 
                     const int MaxDepth = 10;
+                    
                     var temp = exception;
+                    
                     var depth = 0;
 
                     while (temp?.InnerException != null && depth < MaxDepth)
                     {
                         temp = temp.InnerException;
+
                         if (temp != null)
                         {
                             envelope.InnerExceptions.Add(new DeadLetterInnerException
@@ -546,14 +606,20 @@ namespace EasyRabbitFlow.Services
                     try
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
+                        
                         await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct);
+                        
                         await channel.BasicAckAsync(deliveryTag, false, ct);
                     }
                     catch { }
                 }
                 else
                 {
-                    try { await channel.BasicNackAsync(deliveryTag, false, false, ct); } catch { }
+                    try 
+                    { 
+                        await channel.BasicNackAsync(deliveryTag, false, false, ct);
+
+                    } catch { }
                 }
             }
             finally { _channelGate.Release(); }
@@ -562,6 +628,7 @@ namespace EasyRabbitFlow.Services
         private Task OnChannelCallbackExceptionAsync(object sender, CallbackExceptionEventArgs args)
         {
             _logger.LogWarning(args.Exception, "[RABBIT-FLOW]: Channel callback exception for {Consumer}.", _consumerType.Name);
+
             return Task.CompletedTask;
         }
 
@@ -575,6 +642,7 @@ namespace EasyRabbitFlow.Services
             }
 
             _ = TriggerRecoveryAsync();
+
             return Task.CompletedTask;
         }
 
@@ -588,6 +656,7 @@ namespace EasyRabbitFlow.Services
             }
 
             _ = TriggerRecoveryAsync();
+
             return Task.CompletedTask;
         }
 
@@ -632,6 +701,7 @@ namespace EasyRabbitFlow.Services
                     try
                     {
                         await EnsureConnectionAsync(_lifetimeCt);
+
                         await EnsureChannelAsync(_lifetimeCt);
 
                         _logger.LogInformation("[RABBIT-FLOW]: Consumer {Consumer} recovered after {Attempts} attempt(s).", _consumerType.Name, attempt);
@@ -659,12 +729,18 @@ namespace EasyRabbitFlow.Services
         private void DisposeChannel()
         {
             var ch = _channel;
+
             _channel = null;
-            if (ch == null) return;
+
+            if (ch == null)
+            {
+                return;
+            }
 
             try
             {
                 ch.CallbackExceptionAsync -= OnChannelCallbackExceptionAsync;
+
                 ch.ChannelShutdownAsync -= OnChannelShutdownAsync;
             }
             catch { }
@@ -675,33 +751,118 @@ namespace EasyRabbitFlow.Services
         private void DisposeConnection()
         {
             var conn = _connection;
+
             _connection = null;
-            if (conn == null) return;
+
+            if (conn == null)
+            {
+                return;
+            }
 
             try
             {
                 conn.ConnectionShutdownAsync -= OnConnectionShutdownAsync;
+                
                 conn.CallbackExceptionAsync -= OnConnectionCallbackExceptionAsync;
+                
                 conn.RecoverySucceededAsync -= OnRecoverySucceededAsync;
+                
                 conn.ConnectionRecoveryErrorAsync -= OnConnectionRecoveryErrorAsync;
             }
             catch { }
 
-            try { conn.Dispose(); } catch { }
+            try 
+            { 
+                conn.Dispose(); 
+            } 
+            catch { }
         }
 
         private static JsonElement? TryParseJsonElement(byte[]? body)
         {
-            if (body == null || body.Length == 0) return null;
+            if (body == null || body.Length == 0)
+            {
+                return null;
+            }
 
             try
             {
                 using var doc = JsonDocument.Parse(body);
+
                 return doc.RootElement.Clone();
             }
             catch
             {
                 return null;
+            }
+        }
+
+        private static readonly byte[] EnvelopeKey_MessageData = Encoding.UTF8.GetBytes("\"messageData\"");
+       
+        private static readonly byte[] EnvelopeKey_ExceptionType = Encoding.UTF8.GetBytes("\"exceptionType\"");
+
+        // Cheap byte-level fingerprint to decide whether a body is worth parsing as a DeadLetterEnvelope.
+        
+        // Scans for the two most distinctive envelope keys without touching JsonSerializer.
+        private static bool LooksLikeDeadLetterEnvelope(byte[]? body)
+        {
+            if (body == null || body.Length < 32)
+            {
+                return false;
+            }
+
+            int i = 0;
+
+            while (i < body.Length && (body[i] == (byte)' ' || body[i] == (byte)'\t' || body[i] == (byte)'\r' || body[i] == (byte)'\n'))
+            {
+                i++;
+            }
+
+            if (i >= body.Length || body[i] != (byte)'{')
+            {
+                return false;
+            }
+
+            var span = new ReadOnlySpan<byte>(body);
+
+            return span.IndexOf(EnvelopeKey_MessageData.AsSpan()) >= 0
+                && span.IndexOf(EnvelopeKey_ExceptionType.AsSpan()) >= 0;
+        }
+
+        private bool TryUnwrapDeadLetterEnvelope(byte[]? body, out byte[] innerBody, out DeadLetterEnvelope? envelope)
+        {
+            innerBody = body ?? Array.Empty<byte>();
+
+            envelope = null;
+
+            if (body == null || body.Length == 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                envelope = JsonSerializer.Deserialize<DeadLetterEnvelope>(body, _serializerOptions);
+            }
+            catch
+            {
+                envelope = null;
+                return false;
+            }
+
+            if (envelope == null || envelope.MessageData == null || string.IsNullOrEmpty(envelope.ExceptionType))
+            {
+                return false;
+            }
+
+            try
+            {
+                innerBody = Encoding.UTF8.GetBytes(envelope.MessageData.Value.GetRawText());
+                return true;
+            }
+            catch
+            {
+                return false;
             }
         }
     }

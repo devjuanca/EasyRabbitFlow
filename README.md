@@ -134,11 +134,13 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 - [Consumers](#consumers)
   - [Implementing a Consumer](#implementing-a-consumer)
   - [Registering Consumers](#registering-consumers)
+  - [Reserved Name Substrings](#reserved-name-substrings)
   - [Auto-Generate Topology](#auto-generate-topology)
   - [Retry Policies](#retry-policies)
   - [Consumer Timeout](#consumer-timeout)
   - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
   - [Dead-Letter Reprocessor](#dead-letter-reprocessor)
+  - [Manual DLQ Replay Safety Net](#manual-dlq-replay-safety-net)
 - [Publishing Messages](#publishing-messages)
   - [Single Message](#single-message)
   - [Batch Publishing](#batch-publishing)
@@ -380,7 +382,7 @@ cfg.ConfigureJsonSerializerOptions(json =>
 });
 ```
 
-If not configured, the default `JsonSerializerOptions` are used.
+If not configured, EasyRabbitFlow falls back to `JsonSerializerOptions.Web` — i.e. camelCase property naming with case-insensitive deserialization, the same defaults ASP.NET Core uses for JSON. Override via `ConfigureJsonSerializerOptions` if you need a different policy.
 
 ### Publisher Options
 
@@ -460,6 +462,57 @@ cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 | `AutoAckOnError` | bool | `false` | Auto-acknowledge on error (message lost) |
 | `AutoGenerate` | bool | `false` | Auto-create queue/exchange/DLQ |
 | `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details |
+| `UnwrapDeadLetterEnvelopes` | bool | `false` | Defensive safety net: detect a `DeadLetterEnvelope` arriving on the main queue (e.g. from a manual DLQ replay) and process the inner payload. See [Manual DLQ Replay Safety Net](#manual-dlq-replay-safety-net). |
+| `DisableNameValidation` | bool | `false` | Skip validation of reserved substrings (`deadletter`, `-exchange`, `-routing-key`) against the queue name and any auto-generate names. See [Reserved Name Substrings](#reserved-name-substrings). Only honored when `AutoGenerate = false`. |
+
+### Reserved Name Substrings
+
+When `AutoGenerate = true`, EasyRabbitFlow derives the dead-letter topology by appending fixed substrings to the user-supplied queue name:
+
+```text
+{queueName}-deadletter
+{queueName}-deadletter-exchange
+{queueName}-deadletter-routing-key
+```
+
+To prevent collisions and ambiguous topology, `AddConsumer<T>` validates the supplied `queueName` (and any `ExchangeName` / `RoutingKey` configured via `ConfigureAutoGenerate`) against three reserved substrings — case-insensitive:
+
+- `deadletter`
+- `-exchange`
+- `-routing-key`
+
+If any name contains one of these, registration throws `RabbitFlowException`:
+
+```csharp
+// Throws — "orders-deadletter" collides with the auto-generated DLQ name.
+cfg.AddConsumer<OrderConsumer>("orders-deadletter", c => { /* ... */ });
+```
+
+```csharp
+// Throws — auto-generate exchange/routing-key names follow the same rule.
+cfg.AddConsumer<OrderConsumer>("orders", c =>
+{
+    c.AutoGenerate = true;
+    c.ConfigureAutoGenerate(ag =>
+    {
+        ag.ExchangeName = "orders-exchange"; // throws
+    });
+});
+```
+
+**Opting out (`DisableNameValidation`)**
+
+If you fully own the broker topology — i.e. `AutoGenerate = false` and the framework never derives any dependent names — you can bypass the validation:
+
+```csharp
+cfg.AddConsumer<OrderConsumer>("orders-deadletter-archive", c =>
+{
+    c.AutoGenerate = false;          // required
+    c.DisableNameValidation = true;  // explicitly accept the reserved substring
+});
+```
+
+`DisableNameValidation` is **silently ignored** when `AutoGenerate = true`, because the framework still needs to append the reserved suffixes to derive the DLQ topology and a collision would produce ambiguous queue/exchange names.
 
 ### Auto-Generate Topology
 
@@ -688,6 +741,40 @@ If a message exhausts its reprocess budget, the reprocessor re-publishes it back
 - Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Messages routed via `ConfigureCustomDeadletter` are not processed.
 - **Only transient failures are reprocessed.** A message is eligible only if its `exceptionType` in the envelope is `OperationCanceledException`, `TaskCanceledException`, or `RabbitFlowTransientException` — the same set the in-handler `RetryPolicy` retries. Permanent failures (validation, deserialization, business-rule violations) stay in the DLQ untouched so they remain visible for inspection.
 - Counter persistence: the reprocessor sets the AMQP header `x-reprocess-attempts` on every message it re-publishes. The consumer reads this header on receipt and seeds the new envelope with that count if processing fails again, so the counter survives the full cycle DLQ → main → DLQ.
+
+### Manual DLQ Replay Safety Net
+
+The recommended way to retry dead-lettered messages is the [Dead-Letter Reprocessor](#dead-letter-reprocessor) — it preserves the original payload and the `reprocessAttempts` counter for you. But operators occasionally replay a message manually (Shovel plugin, management UI, ad-hoc script) by copying it from the DLQ back to the main queue. When that happens, the message body is no longer the original event — it is a `DeadLetterEnvelope` JSON, which deserializes into a default-shaped `TEvent` and silently corrupts the consumer's view of the world.
+
+`UnwrapDeadLetterEnvelopes` is an opt-in defense for that scenario:
+
+```csharp
+cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
+{
+    c.AutoGenerate = true;
+    c.ExtendDeadletterMessage = true;
+    c.UnwrapDeadLetterEnvelopes = true;  // safety net for manual replays
+});
+```
+
+**How it works**
+
+For every inbound message, the consumer runs a cheap byte-level fingerprint scan looking for the two most distinctive envelope keys (`"messageData"` and `"exceptionType"`). Only when the fingerprint matches does it parse the body as `DeadLetterEnvelope`, extract the inner `MessageData`, and use it as the actual payload. If the envelope carried a `MessageId` or `CorrelationId`, those are also surfaced via `RabbitFlowMessageContext` when AMQP didn't already provide them.
+
+A warning is logged whenever an unwrap fires, so you can spot manual replays in the logs:
+
+```text
+[RABBIT-FLOW]: Detected manually replayed DeadLetterEnvelope on queue orders-queue for OrderConsumer;
+unwrapped inner payload. Prefer the DeadLetterReprocessor for replays.
+```
+
+**No double-wrapping on re-failure**
+
+If the unwrapped message fails again with `ExtendDeadletterMessage = true`, the new DLQ entry wraps the **original payload**, not the inbound envelope — the dead-letter queue stays at depth 1 instead of accumulating nested envelopes across replays.
+
+**Default is `false`**
+
+The fingerprint check is fast, but it still runs on every message. Leave the flag off unless you actually need the safety net — i.e. unless your operations team manually replays messages from the DLQ. Production deployments that rely exclusively on the reprocessor never need to enable it.
 
 ---
 
