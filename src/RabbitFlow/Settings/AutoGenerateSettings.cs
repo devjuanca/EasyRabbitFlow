@@ -26,12 +26,12 @@ namespace EasyRabbitFlow.Settings
         /// <summary>
         /// Gets or sets the name of the exchange to be generated.
         /// </summary>
-        public string? ExchangeName { get; set; } = null;
+        public string? ExchangeName { get; set; }
 
         /// <summary>
         /// Gets or sets the routing key for the exchange.
         /// </summary>
-        public string? RoutingKey { get; set; } = null;
+        public string? RoutingKey { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether the exchange should be durable. Default is true.

@@ -58,6 +58,7 @@ builder.Services.AddRabbitFlow(settings =>
 
         consumerSettings.ExtendDeadletterMessage = true;
 
+        consumerSettings.UnwrapDeadLetterEnvelopes = true;
     });
 
     settings.AddConsumer<WhatsAppConsumer>(queueName: "whatsapp-queue", consumerSettings =>

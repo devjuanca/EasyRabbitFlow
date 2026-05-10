@@ -104,6 +104,8 @@ namespace EasyRabbitFlow.Services
 
             settings.Invoke(consumerSettings);
 
+            consumerSettings.Validate();
+
 			_services.AddSingleton(consumerSettings);
 
 			var consumerType = typeof(TConsumer);

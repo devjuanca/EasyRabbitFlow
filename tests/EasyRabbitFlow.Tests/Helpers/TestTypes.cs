@@ -28,6 +28,24 @@ public class TestConsumer : IRabbitFlowConsumer<TestEvent>
     }
 }
 
+public class AlwaysFailConsumer : IRabbitFlowConsumer<TestEvent>
+{
+    private static readonly ConcurrentBag<TestEvent> _received = new();
+
+    public static IReadOnlyList<TestEvent> ReceivedMessages => _received.ToList();
+
+    public Task HandleAsync(TestEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
+    {
+        _received.Add(message);
+        throw new InvalidOperationException("AlwaysFailConsumer: intentional failure");
+    }
+
+    public static void Reset()
+    {
+        _received.Clear();
+    }
+}
+
 public class TransientFailConsumer : IRabbitFlowConsumer<TestEvent>
 {
     private static int _callCount;
