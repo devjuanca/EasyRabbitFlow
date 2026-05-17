@@ -1146,6 +1146,33 @@ int processed = await _temporary.RunAsync(
 
 > **Note:** If `onError` itself throws, the exception is caught and logged internally — it will not break the batch processing flow.
 
+### Async Completion Callback
+
+When the completion logic needs to `await` (e.g. flushing state to a database, publishing a follow-up message, calling another service), use the overload that takes `onCompletedAsync` instead of `onCompleted`. The callback receives the processed count, error count, and the operation's `CancellationToken`:
+
+```csharp
+int processed = await _temporary.RunAsync(
+    invoices,
+    onMessageReceived: async (invoice, ct) =>
+    {
+        await ProcessInvoiceAsync(invoice, ct);
+    },
+    onCompletedAsync: async (total, errors, ct) =>
+    {
+        await _metrics.RecordBatchAsync(total, errors, ct);
+        await _publisher.PublishAsync(new BatchCompleted { Total = total, Errors = errors });
+    });
+```
+
+Picking which overload to use:
+
+| Use this | When |
+|----------|------|
+| `onCompleted: (total, errors) => …` | Synchronous wrap-up (logging, in-memory counters) |
+| `onCompletedAsync: async (total, errors, ct) => …` | Wrap-up that needs to `await` I/O |
+
+Both overloads coexist — existing callers using `onCompleted` keep working unchanged.
+
 ### With Result Collection
 
 ```csharp

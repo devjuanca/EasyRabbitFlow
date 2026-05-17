@@ -72,6 +72,44 @@ namespace EasyRabbitFlow.Services
             CancellationToken cancellationToken = default) where T : class;
 
         /// <summary>
+        /// Publishes a collection of messages to a temporary RabbitMQ exchange and consumes them asynchronously.
+        /// Each message is processed using the provided handler function, with support for cancellation and per-message timeout.
+        /// An asynchronous completion callback is invoked once all messages have been processed.
+        /// </summary>
+        /// <typeparam name="T">The type of messages to process. Must be a reference type.</typeparam>
+        /// <param name="messages">The collection of messages to publish and process.</param>
+        /// <param name="onMessageReceived">
+        /// An asynchronous callback executed for each received message.
+        /// Supports cancellation via the provided <see cref="CancellationToken"/>.
+        /// </param>
+        /// <param name="onCompletedAsync">
+        /// An asynchronous callback executed after all messages have been processed.
+        /// <br/>
+        /// <ul>
+        /// <li><b>First parameter:</b> The number of processed messages.</li>
+        /// <li><b>Second parameter:</b> The number of messages that encountered errors.</li>
+        /// <li><b>Third parameter:</b> A <see cref="CancellationToken"/> propagated from the caller.</li>
+        /// </ul>
+        /// </param>
+        /// <param name="onError">
+        /// An optional asynchronous callback executed when a message fails during processing (due to timeout, cancellation, or exception).
+        /// Receives the failed message and a <see cref="CancellationToken"/>.
+        /// Use this to decide what to do with failed messages — e.g., log them, store them in a persistence layer, or republish to another queue.
+        /// <br/>
+        /// If not provided, errors are only logged internally.
+        /// </param>
+        /// <param name="options">Optional configuration settings for the temporary queue behavior.</param>
+        /// <param name="cancellationToken">A token that can be used to cancel the overall operation early.</param>
+        /// <returns>The number of successfully processed messages.</returns>
+        Task<int> RunAsync<T>(
+            IReadOnlyList<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Func<int, int, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class;
+
+        /// <summary>
         /// Publishes a collection of messages to a temporary RabbitMQ queue and processes them asynchronously.
         /// Each message is handled via a user-provided callback, and the results are safely collected into a concurrent queue.
         /// </summary>
@@ -101,12 +139,12 @@ namespace EasyRabbitFlow.Services
         /// <param name="cancellationToken">Token to cancel the operation prematurely.</param>
         /// <returns>The total number of messages successfully processed.</returns>
         Task<int> RunAsync<T, TResult>(
-        IReadOnlyList<T> messages,
-        Func<T, CancellationToken, Task<TResult>> onMessageReceived,
-        Func<int, ConcurrentQueue<TResult>, Task> onCompletedAsync,
-        Func<T, CancellationToken, Task>? onError = null,
-        RunTemporaryOptions? options = null,
-        CancellationToken cancellationToken = default) where T : class;
+            IReadOnlyList<T> messages,
+            Func<T, CancellationToken, Task<TResult>> onMessageReceived,
+            Func<int, ConcurrentQueue<TResult>, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class;
     }
 
     internal sealed class RabbitFlowTemporary : IRabbitFlowTemporary
@@ -122,10 +160,27 @@ namespace EasyRabbitFlow.Services
             _logger = logger;
         }
 
-        public async Task<int> RunAsync<T>(
+        public Task<int> RunAsync<T>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task> onMessageReceived,
             Action<int, int>? onCompleted = null,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class
+        {
+            Func<int, int, CancellationToken, Task> wrapped = (p, e, _) =>
+            {
+                onCompleted?.Invoke(p, e);
+                return Task.CompletedTask;
+            };
+
+            return RunAsync(messages, onMessageReceived, wrapped, onError, options, cancellationToken);
+        }
+
+        public async Task<int> RunAsync<T>(
+            IReadOnlyList<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Func<int, int, CancellationToken, Task> onCompletedAsync,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class
@@ -370,7 +425,7 @@ namespace EasyRabbitFlow.Services
                     _logger.LogDebug("[RabbitFlowTemporary] Executing completion callback. Processed: {processed}, Errors: {errors}, CorrelationId: {correlationId}",
                         processed, errors, correlationId);
 
-                    onCompleted?.Invoke(processed, errors);
+                    await onCompletedAsync(processed, errors, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
