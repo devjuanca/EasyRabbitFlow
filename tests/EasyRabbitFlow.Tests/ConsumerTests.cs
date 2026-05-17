@@ -471,4 +471,71 @@ public class ConsumerTests
 
         await hostedService.StopAsync(CancellationToken.None);
     }
+
+    [Fact]
+    public async Task Consumer_StopAsync_IsIdempotent_SequentialCalls()
+    {
+        // Regression: WebApplicationFactory teardown paths can invoke Host.StopAsync more than once.
+        // The second call used to throw ObjectDisposedException because the internal semaphores
+        // were disposed by the first call.
+        var queueName = $"test-stop-idem-seq-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = false;
+                    ag.AutoDeleteQueue = true;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(200);
+
+        await hostedService.StopAsync(CancellationToken.None);
+        await hostedService.StopAsync(CancellationToken.None);
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_StopAsync_IsIdempotent_ConcurrentCalls()
+    {
+        // Regression: two teardown paths racing on the same hosted service must not corrupt state.
+        var queueName = $"test-stop-idem-conc-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = false;
+                    ag.AutoDeleteQueue = true;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(200);
+
+        var stopA = hostedService.StopAsync(CancellationToken.None);
+        var stopB = hostedService.StopAsync(CancellationToken.None);
+
+        await Task.WhenAll(stopA, stopB);
+    }
 }

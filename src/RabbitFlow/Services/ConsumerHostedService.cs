@@ -24,6 +24,8 @@ namespace EasyRabbitFlow.Services
 
         private readonly List<ConsumerInstance> _instances = new List<ConsumerInstance>();
 
+        private int _stopped;
+
         public ConsumerHostedService(IServiceProvider root, ILogger<ConsumerHostedService> logger)
         {
             _root = root;
@@ -70,9 +72,20 @@ namespace EasyRabbitFlow.Services
 
         public async Task StopAsync(CancellationToken cancellationToken)
         {
+            if (Interlocked.Exchange(ref _stopped, 1) != 0)
+            {
+                return;
+            }
+
             foreach (var instance in _instances)
             {
-                await instance.StopAsync();
+                try
+                {
+                    await instance.StopAsync();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
             }
         }
     }
@@ -112,6 +125,7 @@ namespace EasyRabbitFlow.Services
         private IChannel? _channel;
         private string _deadLetterQueueName = string.Empty;
         private volatile bool _stopping;
+        private int _stopped;
         private CancellationToken _lifetimeCt;
 
         public ConsumerInstance(
@@ -238,23 +252,34 @@ namespace EasyRabbitFlow.Services
 
         public async Task StopAsync()
         {
+            if (Interlocked.Exchange(ref _stopped, 1) != 0)
+            {
+                return;
+            }
+
             _stopping = true;
 
-            await _recoveryGate.WaitAsync();
-            
             try
             {
-                DisposeChannel();
-                DisposeConnection();
+                await _recoveryGate.WaitAsync().ConfigureAwait(false);
+
+                try
+                {
+                    DisposeChannel();
+                    DisposeConnection();
+                }
+                finally
+                {
+                    try { _recoveryGate.Release(); } catch (ObjectDisposedException) { }
+                }
             }
-            finally
+            catch (ObjectDisposedException)
             {
-                _recoveryGate.Release();
             }
 
-            _channelGate.Dispose();
-            _prefetchSemaphore.Dispose();
-            _recoveryGate.Dispose();
+            try { _channelGate.Dispose(); } catch (ObjectDisposedException) { }
+            try { _prefetchSemaphore.Dispose(); } catch (ObjectDisposedException) { }
+            try { _recoveryGate.Dispose(); } catch (ObjectDisposedException) { }
         }
 
         private async Task EnsureConnectionAsync(CancellationToken ct)
@@ -538,14 +563,26 @@ namespace EasyRabbitFlow.Services
                 catch { delay = _rpMaxDelay; }
             }
 
-            try { await Task.Delay((int)delay, ct); } catch { }
+            try 
+            { 
+                await Task.Delay((int)delay, ct); 
+            } 
+            catch { }
         }
 
         private async Task SafeAckAsync(IChannel channel, ulong deliveryTag, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
-            try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
-            finally { _channelGate.Release(); }
+            
+            try 
+            { 
+                await channel.BasicAckAsync(deliveryTag, false, ct); 
+            } 
+            catch { }
+            finally 
+            { 
+                _channelGate.Release(); 
+            }
         }
 
         private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
