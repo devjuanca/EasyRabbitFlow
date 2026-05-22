@@ -117,6 +117,8 @@ namespace EasyRabbitFlow.Services
         private readonly string _consumerName;
         private readonly string _queueName;
         private readonly string _deadLetterQueueName;
+        private readonly string _deadLetterExchangeName;
+        private readonly string _deadLetterRoutingKey;
         private readonly int _maxAttempts;
         private readonly TimeSpan _interval;
         private readonly int _maxMessagesPerCycle;
@@ -139,6 +141,8 @@ namespace EasyRabbitFlow.Services
             _consumerName = consumerName;
             _queueName = queueName;
             _deadLetterQueueName = $"{queueName}-deadletter";
+            _deadLetterExchangeName = $"{queueName}-deadletter-exchange";
+            _deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
             _maxAttempts = maxAttempts;
             _interval = interval;
             _maxMessagesPerCycle = maxMessagesPerCycle;
@@ -300,10 +304,10 @@ namespace EasyRabbitFlow.Services
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                         
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct).ConfigureAwait(false);
-                        
+                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct).ConfigureAwait(false);
+
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
-                        
+
                         exhausted++;
                     }
                     catch (Exception ex)
@@ -331,7 +335,7 @@ namespace EasyRabbitFlow.Services
         {
             try
             {
-                await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
+                await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
                 await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
             }
             catch (Exception ex)

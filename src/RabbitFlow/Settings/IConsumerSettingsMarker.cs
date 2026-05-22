@@ -32,6 +32,5 @@ namespace EasyRabbitFlow.Settings
     {
         public Func<ReadOnlyMemory<byte>, JsonSerializerOptions, object?> Deserialize { get; set; } = default!;
         public Func<object, object, RabbitFlowMessageContext, CancellationToken, Task> InvokeHandleAsync { get; set; } = default!;
-        public Func<object, string, IServiceProvider, Task>? PublishToCustomDeadletter { get; set; }
     }
 }

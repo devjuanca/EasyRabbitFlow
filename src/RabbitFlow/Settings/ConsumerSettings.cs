@@ -199,20 +199,6 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Configures custom dead-letter settings for the consumer.
-        /// Dead-letter settings allow customization of how messages are handled when they cannot be processed successfully.
-        /// </summary>
-        /// <param name="settings">An action to configure custom dead-letter settings.</param>
-        public void ConfigureCustomDeadletter(Action<CustomDeadLetterSettings<TConsumer>> settings)
-        {
-            var customDeasLetter = new CustomDeadLetterSettings<TConsumer>();
-
-            settings.Invoke(customDeasLetter);
-
-            _services.AddSingleton(customDeasLetter);
-        }
-
-        /// <summary>
         /// Configures the dead-letter reprocessor for the consumer.
         /// When enabled, a background service periodically drains the consumer's auto-generated dead-letter queue
         /// and re-publishes messages to the main queue until <see cref="DeadLetterReprocessSettings{TConsumer}.MaxReprocessAttempts"/> is reached.

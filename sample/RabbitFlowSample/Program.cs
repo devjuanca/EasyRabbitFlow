@@ -124,6 +124,64 @@ builder.Services.AddRabbitFlow(settings =>
         });
     });
 
+    // ─── Dead-letter fanout demo ───────────────────────────────────────────
+    // PaymentConsumer auto-generates its main queue plus the dead-letter topology.
+    // The two DeadLetterFanouts attach extra queues to the dead-letter exchange,
+    // so every dead-lettered message is fanned out to:
+    //
+    //   payments-queue-deadletter        primary DLQ (drained by the reprocessor)
+    //   payments-audit                   long-retention copy (30-day TTL), inspected manually
+    //   payments-alerts                  consumed live by PaymentAlertsConsumer
+    //
+    // Try POST /payment with shouldFail=true (or amount<=0) to force a failure
+    // and watch the message appear in all three queues. The alerts consumer
+    // logs each dead-letter event in real time; the audit copy stays put.
+    //
+    // IMPORTANT: this consumer must be registered before PaymentAlertsConsumer
+    // because it owns the declaration of the payments-alerts fanout queue.
+    settings.AddConsumer<PaymentConsumer>(queueName: "payments-queue", c =>
+    {
+        c.AutoGenerate = true;
+        c.ExtendDeadletterMessage = true;          // dead-letter copies carry the full DeadLetterEnvelope
+
+        c.ConfigureRetryPolicy(r =>
+        {
+            r.MaxRetryCount = 1;
+            r.RetryInterval = 500;
+        });
+
+        c.ConfigureAutoGenerate(ag =>
+        {
+            ag.GenerateDeadletterQueue = true;     // required for fanouts
+
+            // Long-retention copy. Nothing consumes this — operators inspect it via the management UI.
+            ag.DeadLetterFanouts.Add(new DeadLetterFanout
+            {
+                QueueName = "payments-audit",
+                Arguments = new Dictionary<string, object?>
+                {
+                    ["x-message-ttl"] = (long)TimeSpan.FromDays(30).TotalMilliseconds   // 30 days
+                }
+            });
+
+            // Live alerting queue — see PaymentAlertsConsumer below.
+            ag.DeadLetterFanouts.Add(new DeadLetterFanout
+            {
+                QueueName = "payments-alerts"
+            });
+        });
+    });
+
+    // Consumes one of the fanout queues. AutoGenerate=false because the queue
+    // is declared by PaymentConsumer's fanout configuration above. The event
+    // type is DeadLetterEnvelope because ExtendDeadletterMessage = true on the
+    // primary consumer; the fanout receives an exact copy of the DLQ payload.
+    settings.AddConsumer<PaymentAlertsConsumer>(queueName: "payments-alerts", c =>
+    {
+        c.AutoGenerate = false;
+        c.ExtendDeadletterMessage = false;         // alerts queue has no DLQ of its own
+    });
+
 }).UseRabbitFlowConsumers();
 
 builder.Services.AddSingleton<GuidSingletonService>();
@@ -265,6 +323,25 @@ app.MapPost("/orders/random/{count:int}", async (
 })
 .WithName("PublishOrderEventTopicRandom")
 .WithSummary("Publishes a random burst of OrderEvents across regions and statuses to 'orders-topic'.")
+.Produces(StatusCodes.Status202Accepted);
+
+
+// Dead-letter fanout demo. Publishes a PaymentEvent to "payments-queue".
+//
+//  - shouldFail=false (the default) and amount>0: PaymentConsumer processes it; no fanout traffic.
+//  - shouldFail=true OR amount<=0: PaymentConsumer throws after retries, the message is dead-lettered,
+//    and RabbitMQ fans it out to payments-queue-deadletter (primary DLQ),
+//    payments-audit (30-day retention copy), and payments-alerts (live consumer logs an alert).
+app.MapPost("/payment", async ([FromServices] IRabbitFlowPublisher publisher, [FromBody] PaymentEvent payment) =>
+{
+    var result = await publisher.PublishAsync(payment, "payments-queue", messageId: $"payment-{payment.PaymentId}");
+
+    return result.Success
+        ? Results.Accepted(value: new { result.MessageId, result.Destination, Payload = payment })
+        : Results.Problem(detail: result.Error?.Message, statusCode: StatusCodes.Status500InternalServerError);
+})
+.WithName("PublishPaymentEvent")
+.WithSummary("Publishes a PaymentEvent. Set shouldFail=true to dead-letter the message and observe fanout to audit + alerts queues.")
 .Produces(StatusCodes.Status202Accepted);
 
 

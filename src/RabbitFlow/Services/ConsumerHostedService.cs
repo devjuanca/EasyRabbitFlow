@@ -114,7 +114,6 @@ namespace EasyRabbitFlow.Services
         private readonly bool _rpExp;
         private readonly int _rpFactor;
         private readonly int _rpMaxDelay;
-        private readonly object? _customDeadLetterObj;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
@@ -124,6 +123,8 @@ namespace EasyRabbitFlow.Services
         private IConnection? _connection;
         private IChannel? _channel;
         private string _deadLetterQueueName = string.Empty;
+        private string _deadLetterExchangeName = string.Empty;
+        private string _deadLetterRoutingKey = string.Empty;
         private volatile bool _stopping;
         private int _stopped;
         private CancellationToken _lifetimeCt;
@@ -203,8 +204,6 @@ namespace EasyRabbitFlow.Services
             _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
             
             _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
-
-            _customDeadLetterObj = root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(_consumerType));
 
             _autoGenObj = _autoGenerate
                 ? (root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType))
@@ -368,25 +367,72 @@ namespace EasyRabbitFlow.Services
 
             IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
 
+            var fanouts = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterFanouts))?.GetValue(autoGenObj) as System.Collections.IEnumerable;
+
             if (generateDeadletter)
             {
                 _deadLetterQueueName = $"{_queueName}-deadletter";
-                
-                var deadLetterExchange = $"{_queueName}-deadletter-exchange";
-                
-                var deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
+
+                _deadLetterExchangeName = $"{_queueName}-deadletter-exchange";
+
+                _deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
 
                 await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
-                
-                await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: ct);
-                
-                await channel.QueueBindAsync(_deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
+
+                await channel.ExchangeDeclareAsync(_deadLetterExchangeName, "direct", durableExchange, cancellationToken: ct);
+
+                await channel.QueueBindAsync(_deadLetterQueueName, _deadLetterExchangeName, _deadLetterRoutingKey);
 
                 args ??= new Dictionary<string, object?>();
-                
-                args["x-dead-letter-exchange"] = deadLetterExchange;
-                
-                args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
+
+                args["x-dead-letter-exchange"] = _deadLetterExchangeName;
+
+                args["x-dead-letter-routing-key"] = _deadLetterRoutingKey;
+
+                if (fanouts != null)
+                {
+                    foreach (var fanout in fanouts)
+                    {
+                        if (fanout == null)
+                        {
+                            continue;
+                        }
+
+                        var fanoutType = fanout.GetType();
+
+                        var fanoutQueue = (string?)fanoutType.GetProperty(nameof(DeadLetterFanout.QueueName))?.GetValue(fanout);
+
+                        if (string.IsNullOrWhiteSpace(fanoutQueue))
+                        {
+                            _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter fanout with empty QueueName for {Consumer}.", _consumerType.Name);
+                            continue;
+                        }
+
+                        var fanoutDurable = (bool?)fanoutType.GetProperty(nameof(DeadLetterFanout.Durable))?.GetValue(fanout) ?? true;
+
+                        var fanoutAutoDelete = (bool?)fanoutType.GetProperty(nameof(DeadLetterFanout.AutoDelete))?.GetValue(fanout) ?? false;
+
+                        var fanoutArgs = fanoutType.GetProperty(nameof(DeadLetterFanout.Arguments))?.GetValue(fanout) as IDictionary<string, object?>;
+
+                        await channel.QueueDeclareAsync(fanoutQueue!, fanoutDurable, false, fanoutAutoDelete, fanoutArgs, cancellationToken: ct);
+
+                        await channel.QueueBindAsync(fanoutQueue!, _deadLetterExchangeName, _deadLetterRoutingKey);
+                    }
+                }
+            }
+            else if (fanouts != null)
+            {
+                var fanoutCount = 0;
+
+                foreach (var _ in fanouts)
+                {
+                    fanoutCount++;
+                }
+
+                if (fanoutCount > 0)
+                {
+                    _logger.LogWarning("[RABBIT-FLOW]: {Consumer} has {Count} DeadLetterFanouts configured but GenerateDeadletterQueue is false. Fanouts ignored.", _consumerType.Name, fanoutCount);
+                }
             }
 
             args ??= new Dictionary<string, object?>();
@@ -512,24 +558,6 @@ namespace EasyRabbitFlow.Services
                 if (remainingAttempts <= 0)
                 {
                     await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, lastException ?? new Exception("Unknown error"), rootCt);
-
-                    if (_customDeadLetterObj != null && evt != null)
-                    {
-                        try
-                        {
-                            var queueProp = _customDeadLetterObj.GetType().GetProperty("DeadletterQueueName");
-                            var deadQueue = queueProp?.GetValue(_customDeadLetterObj) as string;
-
-                            if (!string.IsNullOrWhiteSpace(deadQueue) && _markerFactory.PublishToCustomDeadletter != null)
-                            {
-                                await _markerFactory.PublishToCustomDeadletter(evt, deadQueue!, _root);
-                            }
-                        }
-                        catch (Exception dlxEx)
-                        {
-                            _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publishing to custom dead-letter queue.");
-                        }
-                    }
                 }
             }
             catch (AlreadyClosedException) { }
@@ -644,7 +672,7 @@ namespace EasyRabbitFlow.Services
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                         
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct);
+                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
                         
                         await channel.BasicAckAsync(deliveryTag, false, ct);
                     }

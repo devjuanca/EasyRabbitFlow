@@ -125,12 +125,7 @@ namespace EasyRabbitFlow.Services
             var factory = new ConsumerSettingsFactory
             {
                 Deserialize = GetOrBuildDeserializer(eventType),
-                InvokeHandleAsync = compiledHandleAsync,
-                PublishToCustomDeadletter = (evt, queue, sp) =>
-                {
-                    var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
-                    return publisher.PublishAsync(evt, queue, publisherId: "custom-dead-letter");
-                }
+                InvokeHandleAsync = compiledHandleAsync
             };
 
 
