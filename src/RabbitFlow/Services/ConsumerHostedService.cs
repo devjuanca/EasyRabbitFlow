@@ -367,7 +367,7 @@ namespace EasyRabbitFlow.Services
 
             IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
 
-            var fanouts = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterFanouts))?.GetValue(autoGenObj) as System.Collections.IEnumerable;
+            var replicas = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterReplicas))?.GetValue(autoGenObj) as System.Collections.IEnumerable;
 
             if (generateDeadletter)
             {
@@ -389,49 +389,49 @@ namespace EasyRabbitFlow.Services
 
                 args["x-dead-letter-routing-key"] = _deadLetterRoutingKey;
 
-                if (fanouts != null)
+                if (replicas != null)
                 {
-                    foreach (var fanout in fanouts)
+                    foreach (var replica in replicas)
                     {
-                        if (fanout == null)
+                        if (replica == null)
                         {
                             continue;
                         }
 
-                        var fanoutType = fanout.GetType();
+                        var replicaType = replica.GetType();
 
-                        var fanoutQueue = (string?)fanoutType.GetProperty(nameof(DeadLetterFanout.QueueName))?.GetValue(fanout);
+                        var replicaQueue = (string?)replicaType.GetProperty(nameof(DeadLetterReplica.QueueName))?.GetValue(replica);
 
-                        if (string.IsNullOrWhiteSpace(fanoutQueue))
+                        if (string.IsNullOrWhiteSpace(replicaQueue))
                         {
-                            _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter fanout with empty QueueName for {Consumer}.", _consumerType.Name);
+                            _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter replica with empty QueueName for {Consumer}.", _consumerType.Name);
                             continue;
                         }
 
-                        var fanoutDurable = (bool?)fanoutType.GetProperty(nameof(DeadLetterFanout.Durable))?.GetValue(fanout) ?? true;
+                        var replicaDurable = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.Durable))?.GetValue(replica) ?? true;
 
-                        var fanoutAutoDelete = (bool?)fanoutType.GetProperty(nameof(DeadLetterFanout.AutoDelete))?.GetValue(fanout) ?? false;
+                        var replicaAutoDelete = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.AutoDelete))?.GetValue(replica) ?? false;
 
-                        var fanoutArgs = fanoutType.GetProperty(nameof(DeadLetterFanout.Arguments))?.GetValue(fanout) as IDictionary<string, object?>;
+                        var replicaArgs = replicaType.GetProperty(nameof(DeadLetterReplica.Arguments))?.GetValue(replica) as IDictionary<string, object?>;
 
-                        await channel.QueueDeclareAsync(fanoutQueue!, fanoutDurable, false, fanoutAutoDelete, fanoutArgs, cancellationToken: ct);
+                        await channel.QueueDeclareAsync(replicaQueue!, replicaDurable, false, replicaAutoDelete, replicaArgs, cancellationToken: ct);
 
-                        await channel.QueueBindAsync(fanoutQueue!, _deadLetterExchangeName, _deadLetterRoutingKey);
+                        await channel.QueueBindAsync(replicaQueue!, _deadLetterExchangeName, _deadLetterRoutingKey);
                     }
                 }
             }
-            else if (fanouts != null)
+            else if (replicas != null)
             {
-                var fanoutCount = 0;
+                var replicaCount = 0;
 
-                foreach (var _ in fanouts)
+                foreach (var _ in replicas)
                 {
-                    fanoutCount++;
+                    replicaCount++;
                 }
 
-                if (fanoutCount > 0)
+                if (replicaCount > 0)
                 {
-                    _logger.LogWarning("[RABBIT-FLOW]: {Consumer} has {Count} DeadLetterFanouts configured but GenerateDeadletterQueue is false. Fanouts ignored.", _consumerType.Name, fanoutCount);
+                    _logger.LogWarning("[RABBIT-FLOW]: {Consumer} has {Count} DeadLetterReplicas configured but GenerateDeadletterQueue is false. Replicas ignored.", _consumerType.Name, replicaCount);
                 }
             }
 

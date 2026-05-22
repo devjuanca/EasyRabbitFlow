@@ -3,13 +3,13 @@ using EasyRabbitFlow.Settings;
 
 namespace RabbitFlowSample.Consumers;
 
-// Live alerting consumer attached to one of PaymentConsumer's dead-letter fanouts.
+// Live alerting consumer attached to one of PaymentConsumer's dead-letter replicas.
 // Receives the same DeadLetterEnvelope copy that landed on the primary DLQ, but
 // independently: this consumer can fail, restart, or fall behind without affecting
 // the primary DLQ flow or the reprocessor.
 //
 // Registered with AutoGenerate = false because the queue is declared by
-// PaymentConsumer's fanout configuration. Event type is DeadLetterEnvelope
+// PaymentConsumer's replica configuration. Event type is DeadLetterEnvelope
 // because PaymentConsumer runs with ExtendDeadletterMessage = true.
 public class PaymentAlertsConsumer(ILogger<PaymentAlertsConsumer> logger) : IRabbitFlowConsumer<DeadLetterEnvelope>
 {

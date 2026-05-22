@@ -62,7 +62,7 @@ namespace EasyRabbitFlow.Settings
         /// Extra queues that should be bound to the auto-generated dead-letter exchange in addition to
         /// the primary dead-letter queue. Every entry is declared at startup and bound to
         /// <c>{queueName}-deadletter-exchange</c> with routing key <c>{queueName}-deadletter-routing-key</c>,
-        /// so each dead-lettered message is fanned out to every queue in this list.
+        /// so each dead-lettered message is delivered as a copy to every queue in this list.
         /// <para>
         /// Useful for audit/observability copies, alerting consumers, or any side-channel processing
         /// that must not interfere with the primary dead-letter queue or the reprocessor. Requires
@@ -70,16 +70,16 @@ namespace EasyRabbitFlow.Settings
         /// and a warning is logged at startup.
         /// </para>
         /// </summary>
-        public List<DeadLetterFanout> DeadLetterFanouts { get; set; } = new List<DeadLetterFanout>();
+        public List<DeadLetterReplica> DeadLetterReplicas { get; set; } = new List<DeadLetterReplica>();
     }
 
     /// <summary>
     /// Declares an additional queue that should receive a copy of every message routed to the
-    /// auto-generated dead-letter exchange of a consumer. Use it to fan out dead-lettered messages
-    /// to audit, alerting, or replication consumers without affecting the primary dead-letter queue
-    /// or the reprocessor.
+    /// auto-generated dead-letter exchange of a consumer. Use it to replicate dead-lettered messages
+    /// into audit, alerting, or side-channel processing consumers without affecting the primary
+    /// dead-letter queue or the reprocessor.
     /// </summary>
-    public class DeadLetterFanout
+    public class DeadLetterReplica
     {
         /// <summary>
         /// Name of the queue to declare and bind to the dead-letter exchange. Must be non-empty.

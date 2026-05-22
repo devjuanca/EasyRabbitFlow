@@ -2,11 +2,11 @@ using System.Text.Json.Serialization;
 
 namespace RabbitFlowSample.Events;
 
-// Sample payload used to demonstrate DeadLetterFanouts.
+// Sample payload used to demonstrate DeadLetterReplicas.
 // Set ShouldFail = true or Amount <= 0 to force PaymentConsumer to throw,
-// so the message is dead-lettered and fanned out to:
+// so the message is dead-lettered and replicated to:
 //   - payments-queue-deadletter  (primary DLQ)
-//   - payments-audit             (long-retention copy)
+//   - payments-audit             (long-retention replica)
 //   - payments-alerts            (consumed live by PaymentAlertsConsumer)
 public class PaymentEvent
 {

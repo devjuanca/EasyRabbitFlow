@@ -4,10 +4,10 @@ using RabbitFlowSample.Events;
 
 namespace RabbitFlowSample.Consumers;
 
-// Main payment consumer. Demonstrates the dead-letter fanout feature:
+// Main payment consumer. Demonstrates the dead-letter replica feature:
 // when a message fails here, RabbitMQ routes it via the auto-generated
 // dead-letter exchange to *every* queue bound to that exchange (primary
-// DLQ + every queue listed in AutoGenerateSettings.DeadLetterFanouts).
+// DLQ + every queue listed in AutoGenerateSettings.DeadLetterReplicas).
 public class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFlowConsumer<PaymentEvent>
 {
     public async Task HandleAsync(PaymentEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
@@ -18,7 +18,7 @@ public class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFlowConsu
         if (message.ShouldFail)
         {
             logger.LogError("[Payment] Forced failure flag set on {PaymentId}. Will be dead-lettered.", message.PaymentId);
-            throw new InvalidOperationException("Forced failure for fanout demo.");
+            throw new InvalidOperationException("Forced failure for dead-letter replica demo.");
         }
 
         if (message.Amount <= 0)

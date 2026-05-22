@@ -20,12 +20,12 @@
 
 **`ConfigureCustomDeadletter` and `CustomDeadLetterSettings<TConsumer>` removed**
 
-The custom dead-letter feature has been replaced by `AutoGenerateSettings<TConsumer>.DeadLetterFanouts` (see [Dead-Letter Fanouts](#dead-letter-fanouts)). The new mechanism is strictly more capable:
+The custom dead-letter feature has been replaced by `AutoGenerateSettings<TConsumer>.DeadLetterReplicas` (see [Dead-Letter Replicas](#dead-letter-replicas)). The new mechanism is strictly more capable:
 
-- Fans out to any number of extra queues, not just one.
+- Replicates the dead-lettered message to any number of extra queues, not just one.
 - Catches **all** failure modes — including messages that fail to deserialize. The old feature only fired when the message was successfully deserialized.
 - Declares and binds the extra queues itself; no external topology setup required.
-- Routes through the dead-letter exchange instead of issuing an extra publish call, so each fanout queue receives the same payload as the primary DLQ (`DeadLetterEnvelope` when `ExtendDeadletterMessage = true`, raw body otherwise).
+- Routes through the dead-letter exchange instead of issuing an extra publish call, so each replica queue receives the same payload as the primary DLQ (`DeadLetterEnvelope` when `ExtendDeadletterMessage = true`, raw body otherwise).
 
 **Migration:** replace
 
@@ -43,7 +43,7 @@ c.AutoGenerate = true;                  // required
 c.ConfigureAutoGenerate(ag =>
 {
     ag.GenerateDeadletterQueue = true;  // required
-    ag.DeadLetterFanouts.Add(new DeadLetterFanout
+    ag.DeadLetterReplicas.Add(new DeadLetterReplica
     {
         QueueName = "custom-errors-queue"
     });
@@ -56,7 +56,7 @@ If you previously consumed `"custom-errors-queue"` expecting the raw deserialize
 
 Previously, the manual `DeadLetterEnvelope` publish from the consumer's error handler and the reprocessor's re-publish to the DLQ used the default exchange (`""`) with the queue name as routing key. They now publish via `{queueName}-deadletter-exchange` / `{queueName}-deadletter-routing-key` — the same path RabbitMQ uses for native dead-lettering.
 
-**Migration:** no code change is required if you only consume the DLQ. The destination queue is identical and routing is transparent. This change is required for `DeadLetterFanouts` to work uniformly: extra queues bound to the DLX now receive a copy of every dead-lettered message, regardless of whether it arrived via native nack-driven dead-lettering or via the manual envelope path.
+**Migration:** no code change is required if you only consume the DLQ. The destination queue is identical and routing is transparent. This change is required for `DeadLetterReplicas` to work uniformly: extra queues bound to the DLX now receive a copy of every dead-lettered message, regardless of whether it arrived via native nack-driven dead-lettering or via the manual envelope path.
 
 ---
 
@@ -182,7 +182,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
   - [Auto-Generate Topology](#auto-generate-topology)
   - [Retry Policies](#retry-policies)
   - [Consumer Timeout](#consumer-timeout)
-  - [Dead-Letter Fanouts](#dead-letter-fanouts)
+  - [Dead-Letter Replicas](#dead-letter-replicas)
   - [Dead-Letter Reprocessor](#dead-letter-reprocessor)
   - [Manual DLQ Replay Safety Net](#manual-dlq-replay-safety-net)
 - [Publishing Messages](#publishing-messages)
@@ -616,7 +616,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 | `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
 | `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
 | `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
-| `DeadLetterFanouts` | List&lt;DeadLetterFanout&gt; | empty | Extra queues to bind to the dead-letter exchange. See [Dead-Letter Fanouts](#dead-letter-fanouts). |
+| `DeadLetterReplicas` | List&lt;DeadLetterReplica&gt; | empty | Extra queues to bind to the dead-letter exchange. See [Dead-Letter Replicas](#dead-letter-replicas). |
 
 ### Retry Policies
 
@@ -698,9 +698,9 @@ If the broker does close a channel (timeout exceeded, protocol violation, etc.),
 
 > 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
 
-### Dead-Letter Fanouts
+### Dead-Letter Replicas
 
-Bind additional queues to the auto-generated dead-letter exchange so every dead-lettered message is fanned out to multiple destinations. Useful for audit / observability copies with their own retention, alerting consumers, or replication into a separate processing pipeline — all without affecting the primary DLQ or the reprocessor.
+Bind additional queues to the auto-generated dead-letter exchange so every dead-lettered message is delivered as a copy to multiple destinations. Useful for audit / observability replicas with their own retention, alerting consumers, or replication into a separate processing pipeline — all without affecting the primary DLQ or the reprocessor.
 
 ```csharp
 cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
@@ -711,7 +711,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
     {
         ag.GenerateDeadletterQueue = true;
 
-        ag.DeadLetterFanouts.Add(new DeadLetterFanout
+        ag.DeadLetterReplicas.Add(new DeadLetterReplica
         {
             QueueName = "orders-deadletter-audit",
             Arguments = new Dictionary<string, object?>
@@ -720,7 +720,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
             }
         });
 
-        ag.DeadLetterFanouts.Add(new DeadLetterFanout
+        ag.DeadLetterReplicas.Add(new DeadLetterReplica
         {
             QueueName = "orders-deadletter-alerts"
         });
@@ -733,14 +733,14 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 ```text
                                           ┌─ orders-queue-deadletter      (primary DLQ — reprocessor reads this one)
                                           │
-orders-queue-deadletter-exchange ─────────┼─ orders-deadletter-audit       (30-day audit copy)
+orders-queue-deadletter-exchange ─────────┼─ orders-deadletter-audit       (30-day audit replica)
    (direct)                               │
                                           └─ orders-deadletter-alerts      (alerting consumer)
 ```
 
-All bound queues receive an identical copy of every dead-lettered message — RabbitMQ routes them through the same direct exchange and routing key. EasyRabbitFlow declares the fanout queues at consumer startup; no extra topology setup is required.
+All bound queues receive an identical copy of every dead-lettered message — RabbitMQ routes them through the same direct exchange and routing key. EasyRabbitFlow declares the replica queues at consumer startup; no extra topology setup is required.
 
-The payload shape is whatever the consumer's `ExtendDeadletterMessage` setting produces — with `true` (the default), each fanout receives the full `DeadLetterEnvelope`:
+The payload shape is whatever the consumer's `ExtendDeadletterMessage` setting produces — with `true` (the default), each replica receives the full `DeadLetterEnvelope`:
 
 ```json
 {
@@ -769,10 +769,10 @@ The shape is the public type `DeadLetterEnvelope` so dead-letter messages can be
 
 **Notes:**
 
-- The fanout queues are bound with the same routing key as the primary DLQ, so they receive **every** dead-lettered message — there is no per-queue filtering.
+- The replica queues are bound with the same routing key as the primary DLQ, so they receive **every** dead-lettered message — there is no per-queue filtering.
 - Requires `GenerateDeadletterQueue = true`. If `false`, the list is ignored and a warning is logged at startup.
-- The [Dead-Letter Reprocessor](#dead-letter-reprocessor) reads only the primary DLQ (`{queue}-deadletter`). Messages re-enqueued by the reprocessor are not fanned out a second time — only their original arrival on the DLQ is. Fanout queues are independent and never drained by the reprocessor.
-- Fanout queue names are *not* validated against the [reserved substrings](#reserved-name-substrings) — they are caller-owned destinations, not auto-generated topology.
+- The [Dead-Letter Reprocessor](#dead-letter-reprocessor) reads only the primary DLQ (`{queue}-deadletter`). Messages re-enqueued by the reprocessor are not replicated a second time — only their original arrival on the DLQ is. Replica queues are independent and never drained by the reprocessor.
+- Replica queue names are *not* validated against the [reserved substrings](#reserved-name-substrings) — they are caller-owned destinations, not auto-generated topology.
 
 ### Dead-Letter Reprocessor
 
@@ -828,7 +828,7 @@ If a message exhausts its reprocess budget, the reprocessor re-publishes it back
 
 - Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning.
 - Forces `ExtendDeadletterMessage = true` so the envelope (including `reprocessAttempts`) is available — a warning is logged if you set it to `false`.
-- Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Any [Dead-Letter Fanouts](#dead-letter-fanouts) bound to the same DLX are independent and never drained by the reprocessor.
+- Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Any [Dead-Letter Replicas](#dead-letter-replicas) bound to the same DLX are independent and never drained by the reprocessor.
 - **Only transient failures are reprocessed.** A message is eligible only if its `exceptionType` in the envelope is `OperationCanceledException`, `TaskCanceledException`, or `RabbitFlowTransientException` — the same set the in-handler `RetryPolicy` retries. Permanent failures (validation, deserialization, business-rule violations) stay in the DLQ untouched so they remain visible for inspection.
 - Counter persistence: the reprocessor sets the AMQP header `x-reprocess-attempts` on every message it re-publishes. The consumer reads this header on receipt and seeds the new envelope with that count if processing fails again, so the counter survives the full cycle DLQ → main → DLQ.
 
