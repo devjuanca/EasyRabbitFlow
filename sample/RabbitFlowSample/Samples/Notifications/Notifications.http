@@ -1,0 +1,69 @@
+@host = https://localhost:7097
+
+### Fanout broadcast — reaches BOTH the email and whatsapp consumers
+POST {{host}}/notifications/broadcast
+Content-Type: application/json
+
+{
+  "emailData": {
+    "email": "alice@example.com",
+    "subject": "Welcome",
+    "body": "Hi Alice, thanks for signing up."
+  },
+  "whatsappData": {
+    "phoneNumber": "+34600000000",
+    "message": "Welcome aboard, Alice!"
+  }
+}
+
+### Fanout broadcast — only email data (whatsapp consumer no-ops)
+POST {{host}}/notifications/broadcast
+Content-Type: application/json
+
+{
+  "emailData": {
+    "email": "bob@example.com",
+    "subject": "Password reset",
+    "body": "Click the link to reset your password."
+  }
+}
+
+### Direct publish to the email queue only (bypasses fanout)
+POST {{host}}/notifications/email
+Content-Type: application/json
+
+{
+  "emailData": {
+    "email": "direct@example.com",
+    "subject": "Direct send",
+    "body": "This bypassed the exchange."
+  }
+}
+
+### Direct publish to the whatsapp queue only (bypasses fanout)
+POST {{host}}/notifications/whatsapp
+Content-Type: application/json
+
+{
+  "whatsappData": {
+    "phoneNumber": "+34611111111",
+    "message": "Direct whatsapp only — no email path involved."
+  }
+}
+
+### Atomic batch publish to the fanout exchange (3 events in a single transaction)
+POST {{host}}/notifications/broadcast/batch
+Content-Type: application/json
+
+[
+  {
+    "emailData": { "email": "user1@example.com", "subject": "Batch 1", "body": "Item 1" }
+  },
+  {
+    "emailData": { "email": "user2@example.com", "subject": "Batch 2", "body": "Item 2" },
+    "whatsappData": { "phoneNumber": "+34622222222", "message": "Hi from batch 2" }
+  },
+  {
+    "whatsappData": { "phoneNumber": "+34633333333", "message": "Whatsapp-only batch entry" }
+  }
+]

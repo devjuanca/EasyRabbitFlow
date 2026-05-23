@@ -1,14 +1,14 @@
 using System.Text.Json.Serialization;
 
-namespace RabbitFlowSample.Events;
+namespace RabbitFlowSample.Samples.Payments;
 
-// Sample payload used to demonstrate DeadLetterReplicas.
-// Set ShouldFail = true or Amount <= 0 to force PaymentConsumer to throw,
-// so the message is dead-lettered and replicated to:
-//   - payments-queue-deadletter  (primary DLQ)
-//   - payments-audit             (long-retention replica)
+// Payload used to demonstrate DeadLetterReplicas.
+// Set ShouldFail = true or Amount <= 0 to force PaymentConsumer to throw, so the message
+// is dead-lettered and replicated to:
+//   - payments-queue-deadletter  (primary DLQ, drained by the reprocessor)
+//   - payments-audit             (long-retention replica, inspected manually)
 //   - payments-alerts            (consumed live by PaymentAlertsConsumer)
-public class PaymentEvent
+public sealed class PaymentEvent
 {
     [JsonPropertyName("paymentId")]
     public Guid PaymentId { get; set; } = Guid.NewGuid();

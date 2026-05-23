@@ -1,0 +1,77 @@
+@host = https://localhost:7097
+
+### Submit one Critical ticket (AMQP priority 9)
+POST {{host}}/support/tickets
+Content-Type: application/json
+
+{
+  "customerEmail": "ceo@example.com",
+  "subject": "Production is down",
+  "severity": "Critical"
+}
+
+### Submit one Normal ticket (AMQP priority 3)
+POST {{host}}/support/tickets
+Content-Type: application/json
+
+{
+  "customerEmail": "alice@example.com",
+  "subject": "Cannot reset my password",
+  "severity": "Normal"
+}
+
+### Submit one Low-severity ticket (AMQP priority 1)
+POST {{host}}/support/tickets
+Content-Type: application/json
+
+{
+  "customerEmail": "bob@example.com",
+  "subject": "Typo in the help page",
+  "severity": "Low"
+}
+
+### Burst — publishes 10 Low, 5 Normal, 3 High, 2 Critical IN THAT ORDER
+### Consumer drains them in REVERSE order (Critical → High → Normal → Low) thanks to the priority queue
+POST {{host}}/support/tickets/burst
+Content-Type: application/json
+
+{
+  "lowCount": 10,
+  "normalCount": 5,
+  "highCount": 3,
+  "criticalCount": 2
+}
+
+### Burst — only-Lows backlog to verify there is no traffic without priorities involved
+POST {{host}}/support/tickets/burst
+Content-Type: application/json
+
+{
+  "lowCount": 5,
+  "normalCount": 0,
+  "highCount": 0,
+  "criticalCount": 0
+}
+
+### Mid-burst priority bypass: send a backlog of Lows, wait a couple of seconds,
+### then send a single Critical. Watch the Critical jump the queue and be picked
+### next as soon as the consumer finishes its current ticket.
+POST {{host}}/support/tickets/burst
+Content-Type: application/json
+
+{
+  "lowCount": 30,
+  "normalCount": 10,
+  "highCount": 1,
+  "criticalCount": 1
+}
+
+###
+POST {{host}}/support/tickets
+Content-Type: application/json
+
+{
+  "customerEmail": "vip@example.com",
+  "subject": "VIP outage — jumps the queue",
+  "severity": "Critical"
+}

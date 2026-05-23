@@ -1,13 +1,12 @@
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
-using RabbitFlowSample.Events;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSample.Samples.Orders;
 
-// Topic binding: "orders.*.created" — receives ONLY "created" events, regardless of region.
+// Topic binding: "orders.*.created" — only "created" events, regardless of region.
 // "*" matches exactly one word, so "orders.eu.created" and "orders.us.created" both arrive,
 // while "orders.eu.shipped" or "orders.eu.created.priority" do NOT.
-public class OrderCreatedConsumer(ILogger<OrderCreatedConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
+public sealed class OrderCreatedConsumer(ILogger<OrderCreatedConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
 {
     public Task HandleAsync(OrderEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {

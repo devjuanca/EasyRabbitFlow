@@ -1,0 +1,31 @@
+@host = https://localhost:7097
+
+### Happy path — processed successfully; no replica traffic
+POST {{host}}/payments
+Content-Type: application/json
+
+{
+  "amount": 49.99,
+  "currency": "EUR",
+  "shouldFail": false
+}
+
+### Forced failure — dead-lettered after retries; copied to payments-queue-deadletter, payments-audit, payments-alerts
+POST {{host}}/payments
+Content-Type: application/json
+
+{
+  "amount": 49.99,
+  "currency": "EUR",
+  "shouldFail": true
+}
+
+### Invalid amount — dead-lettered via ArgumentOutOfRangeException; same replica fanout as above
+POST {{host}}/payments
+Content-Type: application/json
+
+{
+  "amount": 0,
+  "currency": "EUR",
+  "shouldFail": false
+}

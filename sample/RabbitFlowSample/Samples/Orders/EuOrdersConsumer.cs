@@ -1,13 +1,12 @@
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
-using RabbitFlowSample.Events;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSample.Samples.Orders;
 
-// Topic binding: "orders.eu.*" — receives EVERY status for the EU region only.
-// Will see "orders.eu.created", "orders.eu.shipped", "orders.eu.cancelled",
-// but NOT "orders.us.created" or any non-EU routing key.
-public class EuOrdersConsumer(ILogger<EuOrdersConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
+// Topic binding: "orders.eu.*" — every status for the EU region only.
+// Receives:  "orders.eu.created", "orders.eu.shipped", "orders.eu.cancelled"
+// Skips:     "orders.us.created", "orders.ap.*", anything non-EU.
+public sealed class EuOrdersConsumer(ILogger<EuOrdersConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
 {
     public Task HandleAsync(OrderEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {

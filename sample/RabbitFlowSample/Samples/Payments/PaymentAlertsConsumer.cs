@@ -1,7 +1,7 @@
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSample.Samples.Payments;
 
 // Live alerting consumer attached to one of PaymentConsumer's dead-letter replicas.
 // Receives the same DeadLetterEnvelope copy that landed on the primary DLQ, but
@@ -11,7 +11,7 @@ namespace RabbitFlowSample.Consumers;
 // Registered with AutoGenerate = false because the queue is declared by
 // PaymentConsumer's replica configuration. Event type is DeadLetterEnvelope
 // because PaymentConsumer runs with ExtendDeadletterMessage = true.
-public class PaymentAlertsConsumer(ILogger<PaymentAlertsConsumer> logger) : IRabbitFlowConsumer<DeadLetterEnvelope>
+public sealed class PaymentAlertsConsumer(ILogger<PaymentAlertsConsumer> logger) : IRabbitFlowConsumer<DeadLetterEnvelope>
 {
     public Task HandleAsync(DeadLetterEnvelope envelope, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
@@ -22,7 +22,7 @@ public class PaymentAlertsConsumer(ILogger<PaymentAlertsConsumer> logger) : IRab
             envelope.ErrorMessage ?? "(no error message)",
             envelope.MessageId ?? "(none)");
 
-        // Real-world hook: send to Slack/PagerDuty/email, write to alerting DB, etc.
+        // Real-world hook would dispatch to Slack/PagerDuty/email, write to an alerting DB, etc.
 
         return Task.CompletedTask;
     }

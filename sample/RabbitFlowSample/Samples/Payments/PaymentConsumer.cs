@@ -1,23 +1,23 @@
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
-using RabbitFlowSample.Events;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSample.Samples.Payments;
 
-// Main payment consumer. Demonstrates the dead-letter replica feature:
-// when a message fails here, RabbitMQ routes it via the auto-generated
-// dead-letter exchange to *every* queue bound to that exchange (primary
-// DLQ + every queue listed in AutoGenerateSettings.DeadLetterReplicas).
-public class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFlowConsumer<PaymentEvent>
+// Main payment consumer. Demonstrates DeadLetterReplicas: when a message fails here,
+// RabbitMQ routes it via the auto-generated dead-letter exchange to every queue bound
+// to that exchange — the primary DLQ plus every queue listed in
+// AutoGenerateSettings.DeadLetterReplicas.
+public sealed class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFlowConsumer<PaymentEvent>
 {
     public async Task HandleAsync(PaymentEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
-        logger.LogInformation("[Payment] Processing {PaymentId} for {Amount} {Currency} (MessageId={MessageId})",
+        logger.LogInformation(
+            "[Payment] Processing {PaymentId} for {Amount} {Currency} (MessageId={MessageId})",
             message.PaymentId, message.Amount, message.Currency, context.MessageId ?? "(none)");
 
         if (message.ShouldFail)
         {
-            logger.LogError("[Payment] Forced failure flag set on {PaymentId}. Will be dead-lettered.", message.PaymentId);
+            logger.LogError("[Payment] Forced-failure flag set on {PaymentId}. Will be dead-lettered.", message.PaymentId);
             throw new InvalidOperationException("Forced failure for dead-letter replica demo.");
         }
 

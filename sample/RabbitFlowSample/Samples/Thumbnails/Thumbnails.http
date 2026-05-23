@@ -1,0 +1,43 @@
+@host = https://localhost:7097
+
+### Await completion — submit 4 jobs and get per-image results back
+POST {{host}}/thumbnails
+Content-Type: application/json
+
+[
+  { "imageUrl": "https://example.com/img/cat.jpg",   "width": 256, "height": 256 },
+  { "imageUrl": "https://example.com/img/dog.jpg",   "width": 128, "height": 128 },
+  { "imageUrl": "https://example.com/img/tree.jpg",  "width": 512, "height": 512 },
+  { "imageUrl": "https://example.com/img/house.jpg", "width": 64,  "height": 64  }
+]
+
+### Await completion — single job, default size
+POST {{host}}/thumbnails
+Content-Type: application/json
+
+[
+  { "imageUrl": "https://example.com/img/portrait.jpg" }
+]
+
+### Fire-and-forget — batch of 10 jobs runs in the background; returns 202 immediately
+POST {{host}}/thumbnails/fire-and-forget
+Content-Type: application/json
+
+[
+  { "imageUrl": "https://example.com/img/a.jpg" },
+  { "imageUrl": "https://example.com/img/b.jpg" },
+  { "imageUrl": "https://example.com/img/c.jpg" },
+  { "imageUrl": "https://example.com/img/d.jpg" },
+  { "imageUrl": "https://example.com/img/e.jpg" },
+  { "imageUrl": "https://example.com/img/f.jpg" },
+  { "imageUrl": "https://example.com/img/g.jpg" },
+  { "imageUrl": "https://example.com/img/h.jpg" },
+  { "imageUrl": "https://example.com/img/i.jpg" },
+  { "imageUrl": "https://example.com/img/j.jpg" }
+]
+
+### Validation — empty body returns 400
+POST {{host}}/thumbnails
+Content-Type: application/json
+
+[]

@@ -1,0 +1,40 @@
+@host = https://localhost:7097
+
+### EU + created → reaches EuOrders, OrderCreated, and OrderAudit
+POST {{host}}/orders/eu/created
+Content-Type: application/json
+
+{
+  "customerEmail": "alice@example.com",
+  "amount": 129.95
+}
+
+### US + created → reaches OrderCreated and OrderAudit (NOT EuOrders)
+POST {{host}}/orders/us/created
+Content-Type: application/json
+
+{
+  "customerEmail": "bob@example.com",
+  "amount": 49.50
+}
+
+### EU + shipped → reaches EuOrders and OrderAudit (NOT OrderCreated)
+POST {{host}}/orders/eu/shipped
+Content-Type: application/json
+
+{
+  "customerEmail": "carol@example.com",
+  "amount": 75.00
+}
+
+### AP + cancelled → reaches OrderAudit only (no EU, no created)
+POST {{host}}/orders/ap/cancelled
+Content-Type: application/json
+
+{
+  "customerEmail": "dan@example.com",
+  "amount": 0
+}
+
+### Random burst — 20 events sprayed across all regions and statuses
+POST {{host}}/orders/random/20

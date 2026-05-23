@@ -1,13 +1,12 @@
 using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
-using RabbitFlowSample.Events;
 
-namespace RabbitFlowSample.Consumers;
+namespace RabbitFlowSample.Samples.Orders;
 
-// Topic binding: "orders.#" — receives EVERY order event, every region, every status.
-// "#" matches zero or more dotted words, so this is the audit-log pattern: it will see
-// "orders.eu.created", "orders.us.shipped.priority", and even just "orders" itself.
-public class OrderAuditConsumer(ILogger<OrderAuditConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
+// Topic binding: "orders.#" — every order event, every region, every status.
+// "#" matches zero or more dotted words, so this is the catch-all audit pattern:
+// "orders.eu.created", "orders.us.shipped.priority", and even bare "orders" all arrive here.
+public sealed class OrderAuditConsumer(ILogger<OrderAuditConsumer> logger) : IRabbitFlowConsumer<OrderEvent>
 {
     public Task HandleAsync(OrderEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {

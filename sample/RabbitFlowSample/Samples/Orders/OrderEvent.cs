@@ -1,11 +1,11 @@
 using System.Text.Json.Serialization;
 
-namespace RabbitFlowSample.Events;
+namespace RabbitFlowSample.Samples.Orders;
 
-// Sample payload published to a Topic exchange ("orders-topic") with routing keys
-// shaped like "orders.{region}.{status}" — e.g. "orders.eu.created", "orders.us.shipped".
-// Each subscriber binds to a different pattern (see the OrderEvent consumers).
-public class OrderEvent
+// Payload published to the "orders-topic" exchange with routing keys shaped
+// "orders.{region}.{status}" — e.g. "orders.eu.created", "orders.us.shipped".
+// Each subscriber binds to a different pattern (see the three OrderEvent consumers).
+public sealed class OrderEvent
 {
     [JsonPropertyName("orderId")]
     public Guid OrderId { get; set; } = Guid.NewGuid();
