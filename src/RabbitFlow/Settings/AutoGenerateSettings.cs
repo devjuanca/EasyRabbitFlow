@@ -59,6 +59,22 @@ namespace EasyRabbitFlow.Settings
         public IDictionary<string, object?>? Args { get; set; } = null;
 
         /// <summary>
+        /// When set, declares the auto-generated queue as a priority queue with the given maximum priority,
+        /// emitting the <c>x-max-priority</c> queue argument. Required for the broker to honor the
+        /// <c>Priority</c> field set via <see cref="PublishOptions.Priority"/> — messages published with a
+        /// priority to a non-priority queue are delivered in FIFO order regardless.
+        /// <para>
+        /// RabbitMQ recommends a small value (1–10) since each priority level allocates internal resources.
+        /// If <see cref="Args"/> already contains <c>x-max-priority</c>, that explicit entry wins and this
+        /// property is ignored.
+        /// </para>
+        /// <para>
+        /// Default is <c>null</c> (the queue is declared without <c>x-max-priority</c>).
+        /// </para>
+        /// </summary>
+        public byte? MaxPriority { get; set; } = null;
+
+        /// <summary>
         /// Extra queues that should be bound to the auto-generated dead-letter exchange in addition to
         /// the primary dead-letter queue. Every entry is declared at startup and bound to
         /// <c>{queueName}-deadletter-exchange</c> with routing key <c>{queueName}-deadletter-routing-key</c>,

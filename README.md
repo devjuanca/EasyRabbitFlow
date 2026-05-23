@@ -58,6 +58,46 @@ Previously, the manual `DeadLetterEnvelope` publish from the consumer's error ha
 
 **Migration:** no code change is required if you only consume the DLQ. The destination queue is identical and routing is transparent. This change is required for `DeadLetterReplicas` to work uniformly: extra queues bound to the DLX now receive a copy of every dead-lettered message, regardless of whether it arrived via native nack-driven dead-lettering or via the manual envelope path.
 
+**`PublisherOptions` renamed to `PublisherConnectionOptions`**
+
+Cosmetic rename to avoid the one-letter visual collision with the new per-call `PublishOptions` type (see next entry). The shape is the same as before, plus the new `PublisherId` property (see below).
+
+**Migration:** rename the type at the call site. If you only use the `pub => ...` lambda form, you won't see the change.
+
+```diff
+- cfg.ConfigurePublisher((PublisherOptions pub) =>
++ cfg.ConfigurePublisher((PublisherConnectionOptions pub) =>
+  {
+      pub.DisposePublisherConnection = false;
+  });
+```
+
+**`PublishAsync` / `PublishBatchAsync`: `publisherId` and `jsonOptions` parameters replaced by `PublishOptions? options`**
+
+The four publish overloads used to take `string publisherId = ""` and `JsonSerializerOptions? jsonOptions = null` as the last two parameters before `cancellationToken`. Both are gone, replaced by a single `PublishOptions? options = null` parameter that also exposes per-call AMQP metadata (`DeliveryMode`, `Headers`, `Type`, `AppId`, `Expiration`, `Priority`, `Timestamp`, `ReplyTo`, `ContentType`).
+
+- `jsonOptions` per-call moved to `PublishOptions.JsonOptions`.
+- `publisherId` is no longer per-call — it is now configured once via `PublisherConnectionOptions.PublisherId`. The previous per-call behavior was misleading: since the publisher caches a single connection internally, only the first call's value ever shaped the connection name; subsequent calls reused the cached connection regardless of what was passed.
+
+**Migration:**
+
+```diff
+- await publisher.PublishAsync(order, "orders-queue",
+-     correlationId: requestId,
+-     publisherId: "checkout",
+-     jsonOptions: customJson);
++
++ // Once, at startup:
++ cfg.ConfigurePublisher(pub => pub.PublisherId = "checkout");
++
++ // Per call:
++ await publisher.PublishAsync(order, "orders-queue",
++     correlationId: requestId,
++     options: new PublishOptions { JsonOptions = customJson });
+```
+
+Callers using only `messageId:` / `correlationId:` named arguments are unaffected. Positional callers, and any callers using `publisherId:` or `jsonOptions:` named arguments, must update.
+
 ---
 
 ## ⚠️ Breaking Changes (v6.0.0)
@@ -190,6 +230,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
   - [Batch Publishing](#batch-publishing)
   - [Idempotency](#idempotency)
   - [Correlation](#correlation)
+  - [Per-Call AMQP Options (`PublishOptions`)](#per-call-amqp-options-publishoptions)
 - [Message Context](#message-context)
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
@@ -616,6 +657,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 | `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
 | `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
 | `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
+| `MaxPriority` | byte? | `null` | Declares the queue as a priority queue with this max priority via `x-max-priority`. Required for the broker to honor messages published with [`PublishOptions.Priority`](#per-call-amqp-options-publishoptions); without it, priority is silently ignored and messages flow FIFO. Keep small (1–10). If `Args` already contains `x-max-priority`, that explicit entry wins. |
 | `DeadLetterReplicas` | List&lt;DeadLetterReplica&gt; | empty | Extra queues to bind to the dead-letter exchange. See [Dead-Letter Replicas](#dead-letter-replicas). |
 
 ### Retry Policies
@@ -914,14 +956,14 @@ public class OrderService
 ```csharp
 // Publish to exchange (with routing key) — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    string? messageId = null, string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Publish directly to queue — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    string? messageId = null, string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -966,16 +1008,18 @@ var result = await publisher.PublishBatchAsync(
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string exchangeName, string routingKey,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    Func<TEvent, string>? messageIdSelector = null,
+    string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Batch to queue
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string queueName,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    Func<TEvent, string>? messageIdSelector = null,
+    string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -1054,6 +1098,52 @@ await publisher.PublishBatchAsync(events, "orders-queue", correlationId: batchId
 
 The `correlationId` is set on `BasicProperties.CorrelationId` and received by consumers via `RabbitFlowMessageContext.CorrelationId`.
 
+### Per-Call AMQP Options (`PublishOptions`)
+
+`PublishAsync` and `PublishBatchAsync` accept an optional `PublishOptions` parameter that bundles AMQP metadata applied to the published message(s) plus an optional JSON serializer override. All fields are nullable (`null` = not written to the wire) except `DeliveryMode`, which defaults to `Transient`.
+
+```csharp
+await publisher.PublishAsync(
+    order,
+    "orders-queue",
+    messageId: $"order-{order.Id}-created",
+    correlationId: requestId,
+    options: new PublishOptions
+    {
+        DeliveryMode = MessageDeliveryMode.Persistent,   // survive broker restart (queue must be durable)
+        Type = "OrderCreated",                            // logical event name
+        AppId = "checkout-svc",                           // publishing application
+        Expiration = TimeSpan.FromMinutes(5),             // per-message TTL
+        Priority = 7,                                     // requires MaxPriority on the queue (see below)
+        Timestamp = DateTimeOffset.UtcNow,
+        ReplyTo = "orders-replies",
+        ContentType = "application/json",
+        Headers = new Dictionary<string, object?>
+        {
+            ["tenant"] = "acme",
+            ["region"] = "eu"
+        },
+        JsonOptions = customJsonOptions                   // per-call serializer override
+    });
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` is in-memory only. |
+| `Type` | string? | `null` | AMQP `type` — typically a logical event name independent of the .NET CLR type. |
+| `AppId` | string? | `null` | AMQP `app-id` — identifies the publishing application. |
+| `Expiration` | TimeSpan? | `null` | Per-message TTL. Broker discards or dead-letters after this window. Serialized as a millisecond string. |
+| `Priority` | byte? | `null` | AMQP `priority` (0–9). **Requires the destination queue to be declared with [`MaxPriority`](#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
+| `Timestamp` | DateTimeOffset? | `null` | AMQP `timestamp` — serialized as Unix seconds. |
+| `ReplyTo` | string? | `null` | AMQP `reply-to` — names the queue/exchange a consumer should reply on (RPC-style flows). |
+| `ContentType` | string? | `null` | AMQP `content-type`. Not set by default to preserve historical wire format; set to `"application/json"` if your consumers need it. |
+| `Headers` | IDictionary? | `null` | AMQP headers table. Use for business metadata or routing on headers exchanges. |
+| `JsonOptions` | JsonSerializerOptions? | `null` | Per-call override for the JSON serializer. When `null`, the publisher uses the globally configured serializer. |
+
+Consumers read every field above (except `JsonOptions`, which is publisher-side only) via [`RabbitFlowMessageContext`](#message-context).
+
+> **Priority footgun:** setting `options.Priority` on a queue that was **not** declared with `x-max-priority` is silently ignored by the broker — messages are delivered in FIFO order regardless. For auto-generated queues, configure [`AutoGenerateSettings.MaxPriority`](#auto-generate-topology); for queues declared externally, add `x-max-priority` to the queue arguments yourself.
+
 ---
 
 ## Message Context
@@ -1104,6 +1194,14 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 | `DeliveryTag` | ulong | Broker-assigned delivery tag for this message |
 | `Redelivered` | bool | Whether the broker redelivered this message |
 | `ReprocessAttempts` | int | Number of times this message was re-enqueued from the DLQ by the [Dead-Letter Reprocessor](#dead-letter-reprocessor). `0` for messages that have never been reprocessed. |
+| `DeliveryMode` | MessageDeliveryMode? | AMQP `delivery-mode`. `null` when the publisher did not set it explicitly (the broker treats absent as `Transient`). |
+| `Type` | string? | AMQP `type` — typically a logical event name independent of the .NET CLR type. `null` when not set on the wire. |
+| `AppId` | string? | AMQP `app-id` — identifies the publishing application. `null` when not set on the wire. |
+| `Expiration` | TimeSpan? | AMQP `expiration` decoded from its millisecond string. `null` when not set on the wire. The broker enforces the TTL; this value is informational. |
+| `Priority` | byte? | AMQP `priority`. `null` when not set on the wire. Only meaningful on priority queues (see [`MaxPriority`](#auto-generate-topology)). |
+| `Timestamp` | DateTimeOffset? | AMQP `timestamp` decoded from AMQP Unix seconds. `null` when not set on the wire. |
+| `ReplyTo` | string? | AMQP `reply-to`. `null` when not set on the wire. |
+| `ContentType` | string? | AMQP `content-type`. `null` when not set on the wire. |
 
 > **Note:** `RabbitFlowMessageContext` is immutable — all properties are read-only and populated automatically from `BasicDeliverEventArgs` before `HandleAsync` is invoked.
 
@@ -1433,7 +1531,7 @@ IServiceCollection UseRabbitFlowConsumers(this IServiceCollection services);
 |--------|-------------|
 | `ConfigureHost(Action<HostSettings>)` | Set RabbitMQ connection details |
 | `ConfigureJsonSerializerOptions(Action<JsonSerializerOptions>)` | Customize JSON serialization |
-| `ConfigurePublisher(Action<PublisherOptions>?)` | Configure publisher behavior |
+| `ConfigurePublisher(Action<PublisherConnectionOptions>?)` | Configure publisher behavior |
 | `AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>>)` | Register a consumer |
 
 ---

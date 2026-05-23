@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace EasyRabbitFlow.Settings
@@ -16,7 +17,15 @@ namespace EasyRabbitFlow.Settings
             IDictionary<string, object?>? headers,
             ulong deliveryTag,
             bool redelivered,
-            int reprocessAttempts)
+            int reprocessAttempts,
+            MessageDeliveryMode? deliveryMode,
+            string? type,
+            string? appId,
+            TimeSpan? expiration,
+            byte? priority,
+            DateTimeOffset? timestamp,
+            string? replyTo,
+            string? contentType)
         {
             MessageId = messageId;
             CorrelationId = correlationId;
@@ -26,6 +35,14 @@ namespace EasyRabbitFlow.Settings
             DeliveryTag = deliveryTag;
             Redelivered = redelivered;
             ReprocessAttempts = reprocessAttempts;
+            DeliveryMode = deliveryMode;
+            Type = type;
+            AppId = appId;
+            Expiration = expiration;
+            Priority = priority;
+            Timestamp = timestamp;
+            ReplyTo = replyTo;
+            ContentType = contentType;
         }
 
         /// <summary>
@@ -75,5 +92,53 @@ namespace EasyRabbitFlow.Settings
         /// Sourced from the <c>x-reprocess-attempts</c> AMQP header.
         /// </summary>
         public int ReprocessAttempts { get; }
+
+        /// <summary>
+        /// AMQP <c>delivery-mode</c>. <c>null</c> when the publisher did not set it explicitly
+        /// (the broker treats absent as <see cref="MessageDeliveryMode.Transient"/>).
+        /// </summary>
+        public MessageDeliveryMode? DeliveryMode { get; }
+
+        /// <summary>
+        /// AMQP <c>type</c> property — typically a logical event name set by the publisher
+        /// independently of the .NET CLR type. <c>null</c> when not set on the wire.
+        /// </summary>
+        public string? Type { get; }
+
+        /// <summary>
+        /// AMQP <c>app-id</c> property — identifies the publishing application.
+        /// <c>null</c> when not set on the wire.
+        /// </summary>
+        public string? AppId { get; }
+
+        /// <summary>
+        /// AMQP <c>expiration</c> (per-message TTL) decoded from its millisecond string representation.
+        /// <c>null</c> when not set on the wire. The broker enforces the TTL; this value is informational.
+        /// </summary>
+        public TimeSpan? Expiration { get; }
+
+        /// <summary>
+        /// AMQP <c>priority</c> property (0–9). <c>null</c> when not set on the wire.
+        /// Only meaningful on priority queues — declare the queue via
+        /// <see cref="AutoGenerateSettings{TConsumer}.MaxPriority"/> for the broker to honor it.
+        /// </summary>
+        public byte? Priority { get; }
+
+        /// <summary>
+        /// AMQP <c>timestamp</c> property decoded from AMQP Unix seconds.
+        /// <c>null</c> when not set on the wire.
+        /// </summary>
+        public DateTimeOffset? Timestamp { get; }
+
+        /// <summary>
+        /// AMQP <c>reply-to</c> property. Names the queue/exchange the publisher expects a reply on
+        /// (common in RPC-style flows). <c>null</c> when not set on the wire.
+        /// </summary>
+        public string? ReplyTo { get; }
+
+        /// <summary>
+        /// AMQP <c>content-type</c> property. <c>null</c> when not set on the wire.
+        /// </summary>
+        public string? ContentType { get; }
     }
 }

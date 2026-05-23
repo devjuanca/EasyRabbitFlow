@@ -4,7 +4,7 @@
     /// Represents options for configuring the behavior of the RabbitFlow publisher service.
     /// This class provides configuration for how the publisher manages its connection to RabbitMQ.
     /// </summary>
-    public class PublisherOptions
+    public class PublisherConnectionOptions
     {
         /// <summary>
         /// Gets or sets a value indicating whether the publisher connection to RabbitMQ should be disposed after each usage.
@@ -14,6 +14,13 @@
         /// Default value is false.
         /// </summary>
         public bool DisposePublisherConnection { get; set; } = false;
+
+        /// <summary>
+        /// Label appended to the publisher connection name as <c>"Publisher_{PublisherId}"</c> in the RabbitMQ
+        /// management UI and broker logs. Purely cosmetic — it does not affect routing, identity, or connection pooling.
+        /// Default is empty (connection name is <c>"Publisher_"</c>).
+        /// </summary>
+        public string PublisherId { get; set; } = "";
     }
 
     /// <summary>

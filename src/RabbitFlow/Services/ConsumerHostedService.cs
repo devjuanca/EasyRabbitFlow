@@ -367,6 +367,18 @@ namespace EasyRabbitFlow.Services
 
             IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
 
+            var maxPriority = (byte?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.MaxPriority))?.GetValue(autoGenObj);
+
+            if (maxPriority.HasValue)
+            {
+                args ??= new Dictionary<string, object?>();
+
+                if (!args.ContainsKey("x-max-priority"))
+                {
+                    args["x-max-priority"] = (int)maxPriority.Value;
+                }
+            }
+
             var replicas = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterReplicas))?.GetValue(autoGenObj) as System.Collections.IEnumerable;
 
             if (generateDeadletter)
@@ -524,7 +536,15 @@ namespace EasyRabbitFlow.Services
                             args.BasicProperties?.Headers,
                             args.DeliveryTag,
                             args.Redelivered,
-                            reprocessAttempts);
+                            reprocessAttempts,
+                            ReadDeliveryMode(args.BasicProperties),
+                            ReadType(args.BasicProperties),
+                            ReadAppId(args.BasicProperties),
+                            ReadExpiration(args.BasicProperties),
+                            ReadPriority(args.BasicProperties),
+                            ReadTimestamp(args.BasicProperties),
+                            ReadReplyTo(args.BasicProperties),
+                            ReadContentType(args.BasicProperties));
 
                         var consumerInstance = scope.ServiceProvider.GetRequiredService(_consumerType);
 
@@ -689,6 +709,56 @@ namespace EasyRabbitFlow.Services
             }
             finally { _channelGate.Release(); }
         }
+
+        private static MessageDeliveryMode? ReadDeliveryMode(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsDeliveryModePresent())
+            {
+                return null;
+            }
+
+            return (MessageDeliveryMode)(byte)properties.DeliveryMode;
+        }
+
+        private static string? ReadType(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsTypePresent() ? properties.Type : null;
+
+        private static string? ReadAppId(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsAppIdPresent() ? properties.AppId : null;
+
+        private static TimeSpan? ReadExpiration(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsExpirationPresent())
+            {
+                return null;
+            }
+
+            if (long.TryParse(properties.Expiration, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var ms))
+            {
+                return TimeSpan.FromMilliseconds(ms);
+            }
+
+            return null;
+        }
+
+        private static byte? ReadPriority(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsPriorityPresent() ? properties.Priority : (byte?)null;
+
+        private static DateTimeOffset? ReadTimestamp(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsTimestampPresent())
+            {
+                return null;
+            }
+
+            return DateTimeOffset.FromUnixTimeSeconds(properties.Timestamp.UnixTime);
+        }
+
+        private static string? ReadReplyTo(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsReplyToPresent() ? properties.ReplyTo : null;
+
+        private static string? ReadContentType(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsContentTypePresent() ? properties.ContentType : null;
 
         private Task OnChannelCallbackExceptionAsync(object sender, CallbackExceptionEventArgs args)
         {
