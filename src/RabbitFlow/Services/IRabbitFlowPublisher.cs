@@ -31,11 +31,22 @@ namespace EasyRabbitFlow.Services
         /// a unique GUID is generated automatically.
         /// </param>
         /// <param name="correlationId">An optional correlation identifier for tracing related messages.</param>
-        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
-        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="options">
+        /// Optional publish settings: AMQP metadata (delivery mode, custom headers, type, app-id, expiration,
+        /// priority, timestamp, reply-to, content-type) and a per-call JSON serializer override.
+        /// When <c>null</c>, library defaults are used (transient delivery, no custom headers,
+        /// JSON serializer from DI).
+        /// </param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>A <see cref="PublishResult"/> describing the outcome of the publish operation.</returns>
-        Task<PublishResult> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey, string? messageId = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonOptions = null, CancellationToken cancellationToken = default) where TEvent : class;
+        Task<PublishResult> PublishAsync<TEvent>(
+            TEvent message, 
+            string exchangeName, 
+            string routingKey, 
+            string? messageId = null, 
+            string? correlationId = null, 
+            PublishOptions? options = null, 
+            CancellationToken cancellationToken = default) where TEvent : class;
 
 
         /// <summary>
@@ -52,11 +63,21 @@ namespace EasyRabbitFlow.Services
         /// a unique GUID is generated automatically.
         /// </param>
         /// <param name="correlationId">An optional correlation identifier for tracing related messages.</param>
-        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
-        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="options">
+        /// Optional publish settings: AMQP metadata (delivery mode, custom headers, type, app-id, expiration,
+        /// priority, timestamp, reply-to, content-type) and a per-call JSON serializer override.
+        /// When <c>null</c>, library defaults are used (transient delivery, no custom headers,
+        /// JSON serializer from DI).
+        /// </param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>A <see cref="PublishResult"/> describing the outcome of the publish operation.</returns>
-        Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName, string? messageId = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonOptions = null, CancellationToken cancellationToken = default) where TEvent : class;
+        Task<PublishResult> PublishAsync<TEvent>(
+            TEvent message, 
+            string queueName, 
+            string? messageId = null, 
+            string? correlationId = null, 
+            PublishOptions? options = null, 
+            CancellationToken cancellationToken = default) where TEvent : class;
 
         /// <summary>
         /// Asynchronously publishes a batch of messages to a RabbitMQ exchange.
@@ -78,11 +99,23 @@ namespace EasyRabbitFlow.Services
         /// non-empty string; an empty/null result causes the batch to fail (rolled back in <c>Transactional</c> mode).
         /// </param>
         /// <param name="correlationId">An optional correlation identifier shared by all messages in the batch.</param>
-        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
-        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="options">
+        /// Optional publish settings applied to every message in the batch: AMQP metadata (delivery mode, custom
+        /// headers, type, app-id, expiration, priority, timestamp, reply-to, content-type) and a per-call JSON
+        /// serializer override. If you need per-message metadata, publish each message individually with
+        /// <see cref="PublishAsync{TEvent}(TEvent, string, string, string?, string?, PublishOptions?, CancellationToken)"/> instead.
+        /// </param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>A <see cref="BatchPublishResult"/> describing the outcome of the batch publish operation.</returns>
-        Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string exchangeName, string routingKey, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonOptions = null, CancellationToken cancellationToken = default) where TEvent : class;
+        Task<BatchPublishResult> PublishBatchAsync<TEvent>(
+            IReadOnlyList<TEvent> messages, 
+            string exchangeName, 
+            string routingKey, 
+            ChannelMode channelMode = ChannelMode.Transactional, 
+            Func<TEvent, string>? messageIdSelector = null, 
+            string? correlationId = null, 
+            PublishOptions? options = null, 
+            CancellationToken cancellationToken = default) where TEvent : class;
 
         /// <summary>
         /// Asynchronously publishes a batch of messages to a RabbitMQ queue.
@@ -103,18 +136,29 @@ namespace EasyRabbitFlow.Services
         /// non-empty string; an empty/null result causes the batch to fail (rolled back in <c>Transactional</c> mode).
         /// </param>
         /// <param name="correlationId">An optional correlation identifier shared by all messages in the batch.</param>
-        /// <param name="publisherId">An optional identifier for the publisher connection.</param>
-        /// <param name="jsonOptions">Optional JSON serializer options.</param>
+        /// <param name="options">
+        /// Optional publish settings applied to every message in the batch: AMQP metadata (delivery mode, custom
+        /// headers, type, app-id, expiration, priority, timestamp, reply-to, content-type) and a per-call JSON
+        /// serializer override. If you need per-message metadata, publish each message individually with
+        /// <see cref="PublishAsync{TEvent}(TEvent, string, string?, string?, PublishOptions?, CancellationToken)"/> instead.
+        /// </param>
         /// <param name="cancellationToken">A token to cancel the operation.</param>
         /// <returns>A <see cref="BatchPublishResult"/> describing the outcome of the batch publish operation.</returns>
-        Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string queueName, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonOptions = null, CancellationToken cancellationToken = default) where TEvent : class;
+        Task<BatchPublishResult> PublishBatchAsync<TEvent>(
+            IReadOnlyList<TEvent> messages, 
+            string queueName, 
+            ChannelMode channelMode = ChannelMode.Transactional, 
+            Func<TEvent, string>? messageIdSelector = null, 
+            string? correlationId = null, 
+            PublishOptions? options = null, 
+            CancellationToken cancellationToken = default) where TEvent : class;
     }
 
     internal sealed class RabbitFlowPublisher : IRabbitFlowPublisher
     {
         private readonly ConnectionFactory connectionFactory;
         private readonly JsonSerializerOptions jsonOptions;
-        private readonly PublisherOptions publisherOptions;
+        private readonly PublisherConnectionOptions publisherOptions;
         private readonly ILogger<RabbitFlowPublisher> logger;
         private IConnection? globalConnection;
         private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
@@ -125,54 +169,52 @@ namespace EasyRabbitFlow.Services
         private static readonly CreateChannelOptions PlainChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: false, publisherConfirmationTrackingEnabled: false);
 
-        public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherOptions? publisherOptions = null, [FromKeyedServices("RabbitFlowJsonSerializer")] JsonSerializerOptions? jsonOptions = null)
+        public RabbitFlowPublisher(ConnectionFactory connectionFactory, ILogger<RabbitFlowPublisher> logger, PublisherConnectionOptions? publisherOptions = null, [FromKeyedServices("RabbitFlowJsonSerializer")] JsonSerializerOptions? jsonOptions = null)
         {
             this.connectionFactory = connectionFactory;
             this.logger = logger;
             this.jsonOptions = jsonOptions ?? JsonSerializerOptions.Web;
-            this.publisherOptions = publisherOptions ?? new PublisherOptions();
+            this.publisherOptions = publisherOptions ?? new PublisherConnectionOptions();
         }
 
-        public async Task<PublishResult> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string? messageId = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) where TEvent : class
+        public async Task<PublishResult> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string? messageId = null, string? correlationId = null, PublishOptions? options = null, CancellationToken cancellationToken = default) where TEvent : class
         {
-            return await PublishMessageAsync(@event, exchangeName, routingKey, messageId, correlationId, publisherId, jsonSerializerOptions, isQueue: false, cancellationToken);
+            return await PublishMessageAsync(@event, exchangeName, routingKey, messageId, correlationId, options, isQueue: false, cancellationToken);
         }
 
-        public async Task<PublishResult> PublishAsync<TEvent>(TEvent @event, string queueName, string? messageId = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) where TEvent : class
+        public async Task<PublishResult> PublishAsync<TEvent>(TEvent @event, string queueName, string? messageId = null, string? correlationId = null, PublishOptions? options = null, CancellationToken cancellationToken = default) where TEvent : class
         {
-            return await PublishMessageAsync(@event, queueName, "", messageId, correlationId, publisherId, jsonSerializerOptions, isQueue: true, cancellationToken);
+            return await PublishMessageAsync(@event, queueName, "", messageId, correlationId, options, isQueue: true, cancellationToken);
         }
 
-        public async Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string exchangeName, string routingKey, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) where TEvent : class
+        public async Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string exchangeName, string routingKey, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, PublishOptions? options = null, CancellationToken cancellationToken = default) where TEvent : class
         {
-            return await PublishBatchInternalAsync(messages, exchangeName, routingKey, channelMode, messageIdSelector, correlationId, publisherId, jsonSerializerOptions, isQueue: false, cancellationToken);
+            return await PublishBatchInternalAsync(messages, exchangeName, routingKey, channelMode, messageIdSelector, correlationId, options, isQueue: false, cancellationToken);
         }
 
-        public async Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string queueName, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, string publisherId = "", JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) where TEvent : class
+        public async Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages, string queueName, ChannelMode channelMode = ChannelMode.Transactional, Func<TEvent, string>? messageIdSelector = null, string? correlationId = null, PublishOptions? options = null, CancellationToken cancellationToken = default) where TEvent : class
         {
-            return await PublishBatchInternalAsync(messages, queueName, "", channelMode, messageIdSelector, correlationId, publisherId, jsonSerializerOptions, isQueue: true, cancellationToken);
+            return await PublishBatchInternalAsync(messages, queueName, "", channelMode, messageIdSelector, correlationId, options, isQueue: true, cancellationToken);
         }
 
-        private async Task<PublishResult> PublishMessageAsync<TEvent>(TEvent @event, string destination, string routingKey, string? messageId, string? correlationId, string publisherId, JsonSerializerOptions? jsonSerializerOptions, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
+        private async Task<PublishResult> PublishMessageAsync<TEvent>(TEvent @event, string destination, string routingKey, string? messageId, string? correlationId, PublishOptions? options, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
         {
             if (@event is null)
             {
                 throw new ArgumentNullException(nameof(@event));
             }
 
-            publisherId ??= isQueue ? destination : string.Concat(destination, "_", routingKey);
-
             var resolvedMessageId = string.IsNullOrEmpty(messageId) ? Guid.NewGuid().ToString("N") : messageId!;
 
-            var connection = await ResolveConnection(publisherId, cancellationToken);
+            var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
-            var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+            var serializerOptions = options?.JsonOptions ?? jsonOptions;
 
             using var channel = await connection.CreateChannelAsync(ConfirmChannelOptions, cancellationToken);
 
             try
             {
-                await PublishToChannelAsync(channel, @event, destination, routingKey, serializerOptions, isQueue, resolvedMessageId, correlationId, cancellationToken);
+                await PublishToChannelAsync(channel, @event, destination, routingKey, serializerOptions, isQueue, resolvedMessageId, correlationId, options, cancellationToken);
 
                 logger.LogDebug("[RABBIT-FLOW]: Message of type {MessageType} published to {Destination}. MessageId={MessageId}",
                     typeof(TEvent).FullName, destination, resolvedMessageId);
@@ -194,20 +236,18 @@ namespace EasyRabbitFlow.Services
             }
         }
 
-        private async Task<BatchPublishResult> PublishBatchInternalAsync<TEvent>(IReadOnlyList<TEvent> messages, string destination, string routingKey, ChannelMode channelMode, Func<TEvent, string>? messageIdSelector, string? correlationId, string publisherId, JsonSerializerOptions? jsonSerializerOptions, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
+        private async Task<BatchPublishResult> PublishBatchInternalAsync<TEvent>(IReadOnlyList<TEvent> messages, string destination, string routingKey, ChannelMode channelMode, Func<TEvent, string>? messageIdSelector, string? correlationId, PublishOptions? options, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
         {
             if (messages is null || messages.Count == 0)
             {
                 throw new ArgumentException("Messages collection must not be null or empty.", nameof(messages));
             }
 
-            publisherId ??= isQueue ? destination : string.Concat(destination, "_", routingKey);
-
             var messageIds = new List<string>(messages.Count);
 
-            var connection = await ResolveConnection(publisherId, cancellationToken);
+            var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
-            var serializerOptions = jsonSerializerOptions ?? jsonOptions;
+            var serializerOptions = options?.JsonOptions ?? jsonOptions;
 
             var channelOptions = channelMode == ChannelMode.Transactional ? PlainChannelOptions : ConfirmChannelOptions;
 
@@ -244,7 +284,7 @@ namespace EasyRabbitFlow.Services
                         messageId = Guid.NewGuid().ToString("N");
                     }
 
-                    await PublishToChannelAsync(channel, msg, destination, routingKey, serializerOptions, isQueue, messageId, correlationId, cancellationToken);
+                    await PublishToChannelAsync(channel, msg, destination, routingKey, serializerOptions, isQueue, messageId, correlationId, options, cancellationToken);
 
                     messageIds.Add(messageId);
                 }
@@ -287,7 +327,7 @@ namespace EasyRabbitFlow.Services
         }
 
 
-        private ValueTask PublishToChannelAsync<TEvent>(IChannel channel, TEvent @event, string destination, string routingKey, JsonSerializerOptions serializerOptions, bool isQueue, string? messageId, string? correlationId, CancellationToken cancellationToken = default) where TEvent : class
+        private ValueTask PublishToChannelAsync<TEvent>(IChannel channel, TEvent @event, string destination, string routingKey, JsonSerializerOptions serializerOptions, bool isQueue, string? messageId, string? correlationId, PublishOptions? options, CancellationToken cancellationToken = default) where TEvent : class
         {
             var body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
 
@@ -295,18 +335,52 @@ namespace EasyRabbitFlow.Services
 
             var rk = isQueue ? destination : routingKey;
 
-            if (messageId != null || correlationId != null)
+            if (messageId == null && correlationId == null && options == null)
             {
-                var properties = new BasicProperties
-                {
-                    MessageId = messageId,
-                    CorrelationId = correlationId
-                };
-
-                return channel.BasicPublishAsync(exchange, rk, false, properties, body, cancellationToken);
+                return channel.BasicPublishAsync(exchange, rk, body, cancellationToken);
             }
 
-            return channel.BasicPublishAsync(exchange, rk, body, cancellationToken);
+            var properties = new BasicProperties
+            {
+                MessageId = messageId,
+                CorrelationId = correlationId
+            };
+
+            if (options != null)
+            {
+                properties.DeliveryMode = (DeliveryModes)(byte)options.DeliveryMode;
+
+                if (options.Type != null) 
+                    properties.Type = options.Type;
+
+                if (options.AppId != null) 
+                    properties.AppId = options.AppId;
+                
+                if (options.Priority.HasValue) 
+                    properties.Priority = options.Priority.Value;
+                
+                if (options.ReplyTo != null) 
+                    properties.ReplyTo = options.ReplyTo;
+
+                if (options.ContentType != null) 
+                    properties.ContentType = options.ContentType;
+
+                if (options.Expiration.HasValue)
+                {
+                    var ms = (long)options.Expiration.Value.TotalMilliseconds;
+                    properties.Expiration = ms.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+                
+                if (options.Timestamp.HasValue)
+                {
+                    properties.Timestamp = new AmqpTimestamp(options.Timestamp.Value.ToUnixTimeSeconds());
+                }
+
+                if (options.Headers != null) 
+                    properties.Headers = options.Headers;
+            }
+
+            return channel.BasicPublishAsync(exchange, rk, false, properties, body, cancellationToken);
         }
 
         private async Task<IConnection> ResolveConnection(string connectionId, CancellationToken cancellationToken = default)

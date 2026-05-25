@@ -681,3 +681,6 @@ MigrationBackup/
 FodyWeavers.xsd
 
 # End of https://www.toptal.com/developers/gitignore/api/aspnetcore,dotnetcore,visualstudio,visualstudiocode,jetbrains,linux,windows,macos
+
+# Claude Code workspace
+.claude/

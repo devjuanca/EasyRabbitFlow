@@ -1,19 +1,20 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 
-namespace RabbitFlowSample.Events;
+namespace RabbitFlowSample.Samples.Notifications;
 
-public class NotificationEvent
+// Composite payload published to the "notifications" fanout exchange.
+// Each subscriber inspects its own slice (email or whatsapp) and ignores the rest,
+// so producers can broadcast a multi-channel event without coordinating per-channel publishes.
+public sealed class NotificationEvent
 {
     [JsonPropertyName("emailData")]
     public EmailNotification? EmailNotificationData { get; set; }
-
 
     [JsonPropertyName("whatsappData")]
     public WhatsAppNotification? WhatsAppNotificationData { get; set; }
 }
 
-
-public class EmailNotification
+public sealed class EmailNotification
 {
     [JsonPropertyName("email")]
     public string Email { get; set; } = string.Empty;
@@ -25,7 +26,7 @@ public class EmailNotification
     public string Body { get; set; } = string.Empty;
 }
 
-public class WhatsAppNotification
+public sealed class WhatsAppNotification
 {
     [JsonPropertyName("phoneNumber")]
     public string PhoneNumber { get; set; } = string.Empty;

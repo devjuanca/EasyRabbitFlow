@@ -81,9 +81,9 @@ namespace EasyRabbitFlow.Services
         /// Configures publisher options for message publishing.
         /// This method allows customization of the behavior of message publishers, such as managing RabbitMQ connections.
         /// </summary>
-        public void ConfigurePublisher(Action<PublisherOptions>? settings = null)
+        public void ConfigurePublisher(Action<PublisherConnectionOptions>? settings = null)
         {
-            var publisherOptions = new PublisherOptions();
+            var publisherOptions = new PublisherConnectionOptions();
 
             settings?.Invoke(publisherOptions);
 
@@ -125,12 +125,7 @@ namespace EasyRabbitFlow.Services
             var factory = new ConsumerSettingsFactory
             {
                 Deserialize = GetOrBuildDeserializer(eventType),
-                InvokeHandleAsync = compiledHandleAsync,
-                PublishToCustomDeadletter = (evt, queue, sp) =>
-                {
-                    var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
-                    return publisher.PublishAsync(evt, queue, publisherId: "custom-dead-letter");
-                }
+                InvokeHandleAsync = compiledHandleAsync
             };
 
 

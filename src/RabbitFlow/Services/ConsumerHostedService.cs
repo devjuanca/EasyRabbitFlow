@@ -24,6 +24,8 @@ namespace EasyRabbitFlow.Services
 
         private readonly List<ConsumerInstance> _instances = new List<ConsumerInstance>();
 
+        private int _stopped;
+
         public ConsumerHostedService(IServiceProvider root, ILogger<ConsumerHostedService> logger)
         {
             _root = root;
@@ -70,9 +72,20 @@ namespace EasyRabbitFlow.Services
 
         public async Task StopAsync(CancellationToken cancellationToken)
         {
+            if (Interlocked.Exchange(ref _stopped, 1) != 0)
+            {
+                return;
+            }
+
             foreach (var instance in _instances)
             {
-                await instance.StopAsync();
+                try
+                {
+                    await instance.StopAsync();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
             }
         }
     }
@@ -101,7 +114,6 @@ namespace EasyRabbitFlow.Services
         private readonly bool _rpExp;
         private readonly int _rpFactor;
         private readonly int _rpMaxDelay;
-        private readonly object? _customDeadLetterObj;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
@@ -111,7 +123,10 @@ namespace EasyRabbitFlow.Services
         private IConnection? _connection;
         private IChannel? _channel;
         private string _deadLetterQueueName = string.Empty;
+        private string _deadLetterExchangeName = string.Empty;
+        private string _deadLetterRoutingKey = string.Empty;
         private volatile bool _stopping;
+        private int _stopped;
         private CancellationToken _lifetimeCt;
 
         public ConsumerInstance(
@@ -190,8 +205,6 @@ namespace EasyRabbitFlow.Services
             
             _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
 
-            _customDeadLetterObj = root.GetService(typeof(CustomDeadLetterSettings<>).MakeGenericType(_consumerType));
-
             _autoGenObj = _autoGenerate
                 ? (root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType))
                     ?? Activator.CreateInstance(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType)))
@@ -238,23 +251,34 @@ namespace EasyRabbitFlow.Services
 
         public async Task StopAsync()
         {
+            if (Interlocked.Exchange(ref _stopped, 1) != 0)
+            {
+                return;
+            }
+
             _stopping = true;
 
-            await _recoveryGate.WaitAsync();
-            
             try
             {
-                DisposeChannel();
-                DisposeConnection();
+                await _recoveryGate.WaitAsync().ConfigureAwait(false);
+
+                try
+                {
+                    DisposeChannel();
+                    DisposeConnection();
+                }
+                finally
+                {
+                    try { _recoveryGate.Release(); } catch (ObjectDisposedException) { }
+                }
             }
-            finally
+            catch (ObjectDisposedException)
             {
-                _recoveryGate.Release();
             }
 
-            _channelGate.Dispose();
-            _prefetchSemaphore.Dispose();
-            _recoveryGate.Dispose();
+            try { _channelGate.Dispose(); } catch (ObjectDisposedException) { }
+            try { _prefetchSemaphore.Dispose(); } catch (ObjectDisposedException) { }
+            try { _recoveryGate.Dispose(); } catch (ObjectDisposedException) { }
         }
 
         private async Task EnsureConnectionAsync(CancellationToken ct)
@@ -343,25 +367,84 @@ namespace EasyRabbitFlow.Services
 
             IDictionary<string, object?>? args = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) is IDictionary<string, object?> argsVal ? new Dictionary<string, object?>(argsVal) : null;
 
+            var maxPriority = (byte?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.MaxPriority))?.GetValue(autoGenObj);
+
+            if (maxPriority.HasValue)
+            {
+                args ??= new Dictionary<string, object?>();
+
+                if (!args.ContainsKey("x-max-priority"))
+                {
+                    args["x-max-priority"] = (int)maxPriority.Value;
+                }
+            }
+
+            var replicas = autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterReplicas))?.GetValue(autoGenObj) as System.Collections.IEnumerable;
+
             if (generateDeadletter)
             {
                 _deadLetterQueueName = $"{_queueName}-deadletter";
-                
-                var deadLetterExchange = $"{_queueName}-deadletter-exchange";
-                
-                var deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
+
+                _deadLetterExchangeName = $"{_queueName}-deadletter-exchange";
+
+                _deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
 
                 await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
-                
-                await channel.ExchangeDeclareAsync(deadLetterExchange, "direct", durableExchange, cancellationToken: ct);
-                
-                await channel.QueueBindAsync(_deadLetterQueueName, deadLetterExchange, deadLetterRoutingKey);
+
+                await channel.ExchangeDeclareAsync(_deadLetterExchangeName, "direct", durableExchange, cancellationToken: ct);
+
+                await channel.QueueBindAsync(_deadLetterQueueName, _deadLetterExchangeName, _deadLetterRoutingKey);
 
                 args ??= new Dictionary<string, object?>();
-                
-                args["x-dead-letter-exchange"] = deadLetterExchange;
-                
-                args["x-dead-letter-routing-key"] = deadLetterRoutingKey;
+
+                args["x-dead-letter-exchange"] = _deadLetterExchangeName;
+
+                args["x-dead-letter-routing-key"] = _deadLetterRoutingKey;
+
+                if (replicas != null)
+                {
+                    foreach (var replica in replicas)
+                    {
+                        if (replica == null)
+                        {
+                            continue;
+                        }
+
+                        var replicaType = replica.GetType();
+
+                        var replicaQueue = (string?)replicaType.GetProperty(nameof(DeadLetterReplica.QueueName))?.GetValue(replica);
+
+                        if (string.IsNullOrWhiteSpace(replicaQueue))
+                        {
+                            _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter replica with empty QueueName for {Consumer}.", _consumerType.Name);
+                            continue;
+                        }
+
+                        var replicaDurable = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.Durable))?.GetValue(replica) ?? true;
+
+                        var replicaAutoDelete = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.AutoDelete))?.GetValue(replica) ?? false;
+
+                        var replicaArgs = replicaType.GetProperty(nameof(DeadLetterReplica.Arguments))?.GetValue(replica) as IDictionary<string, object?>;
+
+                        await channel.QueueDeclareAsync(replicaQueue!, replicaDurable, false, replicaAutoDelete, replicaArgs, cancellationToken: ct);
+
+                        await channel.QueueBindAsync(replicaQueue!, _deadLetterExchangeName, _deadLetterRoutingKey);
+                    }
+                }
+            }
+            else if (replicas != null)
+            {
+                var replicaCount = 0;
+
+                foreach (var _ in replicas)
+                {
+                    replicaCount++;
+                }
+
+                if (replicaCount > 0)
+                {
+                    _logger.LogWarning("[RABBIT-FLOW]: {Consumer} has {Count} DeadLetterReplicas configured but GenerateDeadletterQueue is false. Replicas ignored.", _consumerType.Name, replicaCount);
+                }
             }
 
             args ??= new Dictionary<string, object?>();
@@ -453,7 +536,15 @@ namespace EasyRabbitFlow.Services
                             args.BasicProperties?.Headers,
                             args.DeliveryTag,
                             args.Redelivered,
-                            reprocessAttempts);
+                            reprocessAttempts,
+                            ReadDeliveryMode(args.BasicProperties),
+                            ReadType(args.BasicProperties),
+                            ReadAppId(args.BasicProperties),
+                            ReadExpiration(args.BasicProperties),
+                            ReadPriority(args.BasicProperties),
+                            ReadTimestamp(args.BasicProperties),
+                            ReadReplyTo(args.BasicProperties),
+                            ReadContentType(args.BasicProperties));
 
                         var consumerInstance = scope.ServiceProvider.GetRequiredService(_consumerType);
 
@@ -487,24 +578,6 @@ namespace EasyRabbitFlow.Services
                 if (remainingAttempts <= 0)
                 {
                     await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, lastException ?? new Exception("Unknown error"), rootCt);
-
-                    if (_customDeadLetterObj != null && evt != null)
-                    {
-                        try
-                        {
-                            var queueProp = _customDeadLetterObj.GetType().GetProperty("DeadletterQueueName");
-                            var deadQueue = queueProp?.GetValue(_customDeadLetterObj) as string;
-
-                            if (!string.IsNullOrWhiteSpace(deadQueue) && _markerFactory.PublishToCustomDeadletter != null)
-                            {
-                                await _markerFactory.PublishToCustomDeadletter(evt, deadQueue!, _root);
-                            }
-                        }
-                        catch (Exception dlxEx)
-                        {
-                            _logger.LogError(dlxEx, "[RABBIT-FLOW]: Error publishing to custom dead-letter queue.");
-                        }
-                    }
                 }
             }
             catch (AlreadyClosedException) { }
@@ -538,14 +611,26 @@ namespace EasyRabbitFlow.Services
                 catch { delay = _rpMaxDelay; }
             }
 
-            try { await Task.Delay((int)delay, ct); } catch { }
+            try 
+            { 
+                await Task.Delay((int)delay, ct); 
+            } 
+            catch { }
         }
 
         private async Task SafeAckAsync(IChannel channel, ulong deliveryTag, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
-            try { await channel.BasicAckAsync(deliveryTag, false, ct); } catch { }
-            finally { _channelGate.Release(); }
+            
+            try 
+            { 
+                await channel.BasicAckAsync(deliveryTag, false, ct); 
+            } 
+            catch { }
+            finally 
+            { 
+                _channelGate.Release(); 
+            }
         }
 
         private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
@@ -607,7 +692,7 @@ namespace EasyRabbitFlow.Services
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                         
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _deadLetterQueueName, body: bytes, cancellationToken: ct);
+                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
                         
                         await channel.BasicAckAsync(deliveryTag, false, ct);
                     }
@@ -624,6 +709,56 @@ namespace EasyRabbitFlow.Services
             }
             finally { _channelGate.Release(); }
         }
+
+        private static MessageDeliveryMode? ReadDeliveryMode(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsDeliveryModePresent())
+            {
+                return null;
+            }
+
+            return (MessageDeliveryMode)(byte)properties.DeliveryMode;
+        }
+
+        private static string? ReadType(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsTypePresent() ? properties.Type : null;
+
+        private static string? ReadAppId(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsAppIdPresent() ? properties.AppId : null;
+
+        private static TimeSpan? ReadExpiration(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsExpirationPresent())
+            {
+                return null;
+            }
+
+            if (long.TryParse(properties.Expiration, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var ms))
+            {
+                return TimeSpan.FromMilliseconds(ms);
+            }
+
+            return null;
+        }
+
+        private static byte? ReadPriority(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsPriorityPresent() ? properties.Priority : (byte?)null;
+
+        private static DateTimeOffset? ReadTimestamp(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null || !properties.IsTimestampPresent())
+            {
+                return null;
+            }
+
+            return DateTimeOffset.FromUnixTimeSeconds(properties.Timestamp.UnixTime);
+        }
+
+        private static string? ReadReplyTo(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsReplyToPresent() ? properties.ReplyTo : null;
+
+        private static string? ReadContentType(IReadOnlyBasicProperties? properties)
+            => properties != null && properties.IsContentTypePresent() ? properties.ContentType : null;
 
         private Task OnChannelCallbackExceptionAsync(object sender, CallbackExceptionEventArgs args)
         {

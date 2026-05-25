@@ -16,6 +16,90 @@
 
 ---
 
+## ⚠️ Breaking Changes (v7.0.0)
+
+**`ConfigureCustomDeadletter` and `CustomDeadLetterSettings<TConsumer>` removed**
+
+The custom dead-letter feature has been replaced by `AutoGenerateSettings<TConsumer>.DeadLetterReplicas` (see [Dead-Letter Replicas](#dead-letter-replicas)). The new mechanism is strictly more capable:
+
+- Replicates the dead-lettered message to any number of extra queues, not just one.
+- Catches **all** failure modes — including messages that fail to deserialize. The old feature only fired when the message was successfully deserialized.
+- Declares and binds the extra queues itself; no external topology setup required.
+- Routes through the dead-letter exchange instead of issuing an extra publish call, so each replica queue receives the same payload as the primary DLQ (`DeadLetterEnvelope` when `ExtendDeadletterMessage = true`, raw body otherwise).
+
+**Migration:** replace
+
+```csharp
+c.ConfigureCustomDeadletter(dl =>
+{
+    dl.DeadletterQueueName = "custom-errors-queue";
+});
+```
+
+with
+
+```csharp
+c.AutoGenerate = true;                  // required
+c.ConfigureAutoGenerate(ag =>
+{
+    ag.GenerateDeadletterQueue = true;  // required
+    ag.DeadLetterReplicas.Add(new DeadLetterReplica
+    {
+        QueueName = "custom-errors-queue"
+    });
+});
+```
+
+If you previously consumed `"custom-errors-queue"` expecting the raw deserialized event, switch to consuming the `DeadLetterEnvelope` shape (or set `ExtendDeadletterMessage = false` if you only need the original body, at the cost of losing the error metadata on the primary DLQ).
+
+**Dead-letter envelope and reprocessor publications now route through the named DLX**
+
+Previously, the manual `DeadLetterEnvelope` publish from the consumer's error handler and the reprocessor's re-publish to the DLQ used the default exchange (`""`) with the queue name as routing key. They now publish via `{queueName}-deadletter-exchange` / `{queueName}-deadletter-routing-key` — the same path RabbitMQ uses for native dead-lettering.
+
+**Migration:** no code change is required if you only consume the DLQ. The destination queue is identical and routing is transparent. This change is required for `DeadLetterReplicas` to work uniformly: extra queues bound to the DLX now receive a copy of every dead-lettered message, regardless of whether it arrived via native nack-driven dead-lettering or via the manual envelope path.
+
+**`PublisherOptions` renamed to `PublisherConnectionOptions`**
+
+Cosmetic rename to avoid the one-letter visual collision with the new per-call `PublishOptions` type (see next entry). The shape is the same as before, plus the new `PublisherId` property (see below).
+
+**Migration:** rename the type at the call site. If you only use the `pub => ...` lambda form, you won't see the change.
+
+```diff
+- cfg.ConfigurePublisher((PublisherOptions pub) =>
++ cfg.ConfigurePublisher((PublisherConnectionOptions pub) =>
+  {
+      pub.DisposePublisherConnection = false;
+  });
+```
+
+**`PublishAsync` / `PublishBatchAsync`: `publisherId` and `jsonOptions` parameters replaced by `PublishOptions? options`**
+
+The four publish overloads used to take `string publisherId = ""` and `JsonSerializerOptions? jsonOptions = null` as the last two parameters before `cancellationToken`. Both are gone, replaced by a single `PublishOptions? options = null` parameter that also exposes per-call AMQP metadata (`DeliveryMode`, `Headers`, `Type`, `AppId`, `Expiration`, `Priority`, `Timestamp`, `ReplyTo`, `ContentType`).
+
+- `jsonOptions` per-call moved to `PublishOptions.JsonOptions`.
+- `publisherId` is no longer per-call — it is now configured once via `PublisherConnectionOptions.PublisherId`. The previous per-call behavior was misleading: since the publisher caches a single connection internally, only the first call's value ever shaped the connection name; subsequent calls reused the cached connection regardless of what was passed.
+
+**Migration:**
+
+```diff
+- await publisher.PublishAsync(order, "orders-queue",
+-     correlationId: requestId,
+-     publisherId: "checkout",
+-     jsonOptions: customJson);
++
++ // Once, at startup:
++ cfg.ConfigurePublisher(pub => pub.PublisherId = "checkout");
++
++ // Per call:
++ await publisher.PublishAsync(order, "orders-queue",
++     correlationId: requestId,
++     options: new PublishOptions { JsonOptions = customJson });
+```
+
+Callers using only `messageId:` / `correlationId:` named arguments are unaffected. Positional callers, and any callers using `publisherId:` or `jsonOptions:` named arguments, must update.
+
+---
+
 ## ⚠️ Breaking Changes (v6.0.0)
 
 **`PublisherOptions.IdempotencyEnabled` removed**
@@ -138,7 +222,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
   - [Auto-Generate Topology](#auto-generate-topology)
   - [Retry Policies](#retry-policies)
   - [Consumer Timeout](#consumer-timeout)
-  - [Custom Dead-Letter Queues](#custom-dead-letter-queues)
+  - [Dead-Letter Replicas](#dead-letter-replicas)
   - [Dead-Letter Reprocessor](#dead-letter-reprocessor)
   - [Manual DLQ Replay Safety Net](#manual-dlq-replay-safety-net)
 - [Publishing Messages](#publishing-messages)
@@ -146,6 +230,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
   - [Batch Publishing](#batch-publishing)
   - [Idempotency](#idempotency)
   - [Correlation](#correlation)
+  - [Per-Call AMQP Options (`PublishOptions`)](#per-call-amqp-options-publishoptions)
 - [Message Context](#message-context)
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
@@ -572,6 +657,8 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 | `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
 | `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
 | `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
+| `MaxPriority` | byte? | `null` | Declares the queue as a priority queue with this max priority via `x-max-priority`. Required for the broker to honor messages published with [`PublishOptions.Priority`](#per-call-amqp-options-publishoptions); without it, priority is silently ignored and messages flow FIFO. Keep small (1–10). If `Args` already contains `x-max-priority`, that explicit entry wins. |
+| `DeadLetterReplicas` | List&lt;DeadLetterReplica&gt; | empty | Extra queues to bind to the dead-letter exchange. See [Dead-Letter Replicas](#dead-letter-replicas). |
 
 ### Retry Policies
 
@@ -653,18 +740,49 @@ If the broker does close a channel (timeout exceeded, protocol violation, etc.),
 
 > 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
 
-### Custom Dead-Letter Queues
+### Dead-Letter Replicas
 
-Route failed messages to a specific dead-letter queue:
+Bind additional queues to the auto-generated dead-letter exchange so every dead-lettered message is delivered as a copy to multiple destinations. Useful for audit / observability replicas with their own retention, alerting consumers, or replication into a separate processing pipeline — all without affecting the primary DLQ or the reprocessor.
 
 ```csharp
-c.ConfigureCustomDeadletter(dl =>
+cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 {
-    dl.DeadletterQueueName = "custom-errors-queue";
+    c.AutoGenerate = true;
+    c.ExtendDeadletterMessage = true;
+    c.ConfigureAutoGenerate(ag =>
+    {
+        ag.GenerateDeadletterQueue = true;
+
+        ag.DeadLetterReplicas.Add(new DeadLetterReplica
+        {
+            QueueName = "orders-deadletter-audit",
+            Arguments = new Dictionary<string, object?>
+            {
+                ["x-message-ttl"] = (long)TimeSpan.FromDays(30).TotalMilliseconds   // 30 days
+            }
+        });
+
+        ag.DeadLetterReplicas.Add(new DeadLetterReplica
+        {
+            QueueName = "orders-deadletter-alerts"
+        });
+    });
 });
 ```
 
-When `ExtendDeadletterMessage = true`, the dead-letter message includes full error details:
+**Resulting topology:**
+
+```text
+                                          ┌─ orders-queue-deadletter      (primary DLQ — reprocessor reads this one)
+                                          │
+orders-queue-deadletter-exchange ─────────┼─ orders-deadletter-audit       (30-day audit replica)
+   (direct)                               │
+                                          └─ orders-deadletter-alerts      (alerting consumer)
+```
+
+All bound queues receive an identical copy of every dead-lettered message — RabbitMQ routes them through the same direct exchange and routing key. EasyRabbitFlow declares the replica queues at consumer startup; no extra topology setup is required.
+
+The payload shape is whatever the consumer's `ExtendDeadletterMessage` setting produces — with `true` (the default), each replica receives the full `DeadLetterEnvelope`:
 
 ```json
 {
@@ -682,7 +800,21 @@ When `ExtendDeadletterMessage = true`, the dead-letter message includes full err
 }
 ```
 
-The shape is exposed as the public type `DeadLetterEnvelope` so dead-letter messages can be deserialized with strong typing from any client.
+The shape is the public type `DeadLetterEnvelope` so dead-letter messages can be deserialized with strong typing from any client.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `QueueName` | string | required | Name of the extra queue to declare and bind |
+| `Durable` | bool | `true` | Queue survives broker restarts |
+| `AutoDelete` | bool | `false` | Delete queue when last consumer disconnects |
+| `Arguments` | IDictionary? | `null` | Additional queue arguments (`x-message-ttl`, `x-max-length`, etc.) |
+
+**Notes:**
+
+- The replica queues are bound with the same routing key as the primary DLQ, so they receive **every** dead-lettered message — there is no per-queue filtering.
+- Requires `GenerateDeadletterQueue = true`. If `false`, the list is ignored and a warning is logged at startup.
+- The [Dead-Letter Reprocessor](#dead-letter-reprocessor) reads only the primary DLQ (`{queue}-deadletter`). Messages re-enqueued by the reprocessor are not replicated a second time — only their original arrival on the DLQ is. Replica queues are independent and never drained by the reprocessor.
+- Replica queue names are *not* validated against the [reserved substrings](#reserved-name-substrings) — they are caller-owned destinations, not auto-generated topology.
 
 ### Dead-Letter Reprocessor
 
@@ -738,7 +870,7 @@ If a message exhausts its reprocess budget, the reprocessor re-publishes it back
 
 - Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning.
 - Forces `ExtendDeadletterMessage = true` so the envelope (including `reprocessAttempts`) is available — a warning is logged if you set it to `false`.
-- Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Messages routed via `ConfigureCustomDeadletter` are not processed.
+- Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Any [Dead-Letter Replicas](#dead-letter-replicas) bound to the same DLX are independent and never drained by the reprocessor.
 - **Only transient failures are reprocessed.** A message is eligible only if its `exceptionType` in the envelope is `OperationCanceledException`, `TaskCanceledException`, or `RabbitFlowTransientException` — the same set the in-handler `RetryPolicy` retries. Permanent failures (validation, deserialization, business-rule violations) stay in the DLQ untouched so they remain visible for inspection.
 - Counter persistence: the reprocessor sets the AMQP header `x-reprocess-attempts` on every message it re-publishes. The consumer reads this header on receipt and seeds the new envelope with that count if processing fails again, so the counter survives the full cycle DLQ → main → DLQ.
 
@@ -824,14 +956,14 @@ public class OrderService
 ```csharp
 // Publish to exchange (with routing key) — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string exchangeName, string routingKey,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    string? messageId = null, string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Publish directly to queue — always uses publisher confirms
 Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    string? messageId = null, string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -876,16 +1008,18 @@ var result = await publisher.PublishBatchAsync(
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string exchangeName, string routingKey,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    Func<TEvent, string>? messageIdSelector = null,
+    string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 
 // Batch to queue
 Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> messages,
     string queueName,
     ChannelMode channelMode = ChannelMode.Transactional,
-    string? correlationId = null, string publisherId = "",
-    JsonSerializerOptions? jsonOptions = null,
+    Func<TEvent, string>? messageIdSelector = null,
+    string? correlationId = null,
+    PublishOptions? options = null,
     CancellationToken cancellationToken = default) where TEvent : class;
 ```
 
@@ -964,6 +1098,52 @@ await publisher.PublishBatchAsync(events, "orders-queue", correlationId: batchId
 
 The `correlationId` is set on `BasicProperties.CorrelationId` and received by consumers via `RabbitFlowMessageContext.CorrelationId`.
 
+### Per-Call AMQP Options (`PublishOptions`)
+
+`PublishAsync` and `PublishBatchAsync` accept an optional `PublishOptions` parameter that bundles AMQP metadata applied to the published message(s) plus an optional JSON serializer override. All fields are nullable (`null` = not written to the wire) except `DeliveryMode`, which defaults to `Transient`.
+
+```csharp
+await publisher.PublishAsync(
+    order,
+    "orders-queue",
+    messageId: $"order-{order.Id}-created",
+    correlationId: requestId,
+    options: new PublishOptions
+    {
+        DeliveryMode = MessageDeliveryMode.Persistent,   // survive broker restart (queue must be durable)
+        Type = "OrderCreated",                            // logical event name
+        AppId = "checkout-svc",                           // publishing application
+        Expiration = TimeSpan.FromMinutes(5),             // per-message TTL
+        Priority = 7,                                     // requires MaxPriority on the queue (see below)
+        Timestamp = DateTimeOffset.UtcNow,
+        ReplyTo = "orders-replies",
+        ContentType = "application/json",
+        Headers = new Dictionary<string, object?>
+        {
+            ["tenant"] = "acme",
+            ["region"] = "eu"
+        },
+        JsonOptions = customJsonOptions                   // per-call serializer override
+    });
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` is in-memory only. |
+| `Type` | string? | `null` | AMQP `type` — typically a logical event name independent of the .NET CLR type. |
+| `AppId` | string? | `null` | AMQP `app-id` — identifies the publishing application. |
+| `Expiration` | TimeSpan? | `null` | Per-message TTL. Broker discards or dead-letters after this window. Serialized as a millisecond string. |
+| `Priority` | byte? | `null` | AMQP `priority` (0–9). **Requires the destination queue to be declared with [`MaxPriority`](#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
+| `Timestamp` | DateTimeOffset? | `null` | AMQP `timestamp` — serialized as Unix seconds. |
+| `ReplyTo` | string? | `null` | AMQP `reply-to` — names the queue/exchange a consumer should reply on (RPC-style flows). |
+| `ContentType` | string? | `null` | AMQP `content-type`. Not set by default to preserve historical wire format; set to `"application/json"` if your consumers need it. |
+| `Headers` | IDictionary? | `null` | AMQP headers table. Use for business metadata or routing on headers exchanges. |
+| `JsonOptions` | JsonSerializerOptions? | `null` | Per-call override for the JSON serializer. When `null`, the publisher uses the globally configured serializer. |
+
+Consumers read every field above (except `JsonOptions`, which is publisher-side only) via [`RabbitFlowMessageContext`](#message-context).
+
+> **Priority footgun:** setting `options.Priority` on a queue that was **not** declared with `x-max-priority` is silently ignored by the broker — messages are delivered in FIFO order regardless. For auto-generated queues, configure [`AutoGenerateSettings.MaxPriority`](#auto-generate-topology); for queues declared externally, add `x-max-priority` to the queue arguments yourself.
+
 ---
 
 ## Message Context
@@ -1014,6 +1194,14 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 | `DeliveryTag` | ulong | Broker-assigned delivery tag for this message |
 | `Redelivered` | bool | Whether the broker redelivered this message |
 | `ReprocessAttempts` | int | Number of times this message was re-enqueued from the DLQ by the [Dead-Letter Reprocessor](#dead-letter-reprocessor). `0` for messages that have never been reprocessed. |
+| `DeliveryMode` | MessageDeliveryMode? | AMQP `delivery-mode`. `null` when the publisher did not set it explicitly (the broker treats absent as `Transient`). |
+| `Type` | string? | AMQP `type` — typically a logical event name independent of the .NET CLR type. `null` when not set on the wire. |
+| `AppId` | string? | AMQP `app-id` — identifies the publishing application. `null` when not set on the wire. |
+| `Expiration` | TimeSpan? | AMQP `expiration` decoded from its millisecond string. `null` when not set on the wire. The broker enforces the TTL; this value is informational. |
+| `Priority` | byte? | AMQP `priority`. `null` when not set on the wire. Only meaningful on priority queues (see [`MaxPriority`](#auto-generate-topology)). |
+| `Timestamp` | DateTimeOffset? | AMQP `timestamp` decoded from AMQP Unix seconds. `null` when not set on the wire. |
+| `ReplyTo` | string? | AMQP `reply-to`. `null` when not set on the wire. |
+| `ContentType` | string? | AMQP `content-type`. `null` when not set on the wire. |
 
 > **Note:** `RabbitFlowMessageContext` is immutable — all properties are read-only and populated automatically from `BasicDeliverEventArgs` before `HandleAsync` is invoked.
 
@@ -1145,6 +1333,33 @@ int processed = await _temporary.RunAsync(
 ```
 
 > **Note:** If `onError` itself throws, the exception is caught and logged internally — it will not break the batch processing flow.
+
+### Async Completion Callback
+
+When the completion logic needs to `await` (e.g. flushing state to a database, publishing a follow-up message, calling another service), use the overload that takes `onCompletedAsync` instead of `onCompleted`. The callback receives the processed count, error count, and the operation's `CancellationToken`:
+
+```csharp
+int processed = await _temporary.RunAsync(
+    invoices,
+    onMessageReceived: async (invoice, ct) =>
+    {
+        await ProcessInvoiceAsync(invoice, ct);
+    },
+    onCompletedAsync: async (total, errors, ct) =>
+    {
+        await _metrics.RecordBatchAsync(total, errors, ct);
+        await _publisher.PublishAsync(new BatchCompleted { Total = total, Errors = errors });
+    });
+```
+
+Picking which overload to use:
+
+| Use this | When |
+|----------|------|
+| `onCompleted: (total, errors) => …` | Synchronous wrap-up (logging, in-memory counters) |
+| `onCompletedAsync: async (total, errors, ct) => …` | Wrap-up that needs to `await` I/O |
+
+Both overloads coexist — existing callers using `onCompleted` keep working unchanged.
 
 ### With Result Collection
 
@@ -1316,7 +1531,7 @@ IServiceCollection UseRabbitFlowConsumers(this IServiceCollection services);
 |--------|-------------|
 | `ConfigureHost(Action<HostSettings>)` | Set RabbitMQ connection details |
 | `ConfigureJsonSerializerOptions(Action<JsonSerializerOptions>)` | Customize JSON serialization |
-| `ConfigurePublisher(Action<PublisherOptions>?)` | Configure publisher behavior |
+| `ConfigurePublisher(Action<PublisherConnectionOptions>?)` | Configure publisher behavior |
 | `AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>>)` | Register a consumer |
 
 ---
