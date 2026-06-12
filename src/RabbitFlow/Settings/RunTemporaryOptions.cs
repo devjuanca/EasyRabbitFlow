@@ -44,6 +44,27 @@ namespace EasyRabbitFlow.Settings
         private TimeSpan? _timeout;
 
         /// <summary>
+        /// Optional timeout for the whole run, acting as a safety net against runs that can never finish
+        /// (e.g. messages lost to a broker failure). When it elapses, in-progress handlers are canceled
+        /// cooperatively, pending messages are reported as failed, and the run completes with the partial result.
+        /// Unlike <see cref="Timeout"/>, which applies per message, this bounds the total duration of the run.
+        /// </summary>
+        public TimeSpan? RunTimeout
+        {
+            get => _runTimeout;
+            set
+            {
+                if (value.HasValue && value.Value <= TimeSpan.Zero)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(RunTimeout), "RunTimeout must be greater than zero.");
+                }
+                _runTimeout = value;
+            }
+        }
+
+        private TimeSpan? _runTimeout;
+
+        /// <summary>
         /// Optional prefix used to customize the generated queue name.
         /// </summary>
         public string? QueuePrefixName { get; set; }
