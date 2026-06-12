@@ -16,6 +16,37 @@
 
 ---
 
+## ⚠️ Breaking Changes (v8.0.0)
+
+**`IRabbitFlowTemporary.RunAsync` now returns `TemporaryRunResult` instead of `int`**
+
+All three overloads return a rich result (`TotalMessages`, `PublishedMessages`, `ProcessedMessages`, `SucceededMessages`, `FailedMessages`, `Success`, `Duration`, `Errors`); the `<T, TResult>` overload returns `TemporaryRunResult<TResult>` with a `Results` collection. See [Temporary Batch Processing](#temporary-batch-processing).
+
+**Migration:** replace `int processed = await temporary.RunAsync(...)` with `var run = await temporary.RunAsync(...)` and read `run.ProcessedMessages` (or the richer counters). The `onCompleted` / `onCompletedAsync` callbacks are unchanged.
+
+**`IRabbitFlowState` has two new interface members**
+
+`GetQueueStateAsync` and `GetQueuesStateAsync` were added (see [Queue State Inspection](#queue-state-inspection)). No change for callers; custom implementations of the interface (e.g. test mocks) must add the new members.
+
+**Transient classification broadened (behavior change)**
+
+The in-process retry policy, the dead-letter envelope, and the reprocessor now share one inheritance-aware classifier: subclasses of `RabbitFlowTransientException`, `TimeoutException`, and transient HTTP failures (`HttpRequestException` with no response or status 408/429/502/503/504) are retried automatically — including through the inner-exception chain. Previously these required manual wrapping; messages that used to go straight to the DLQ may now be retried first. See [Transient Exceptions](#transient-exceptions-and-custom-retry-logic).
+
+**Dead-letter reprocessor parks non-reprocessable messages (behavior change)**
+
+Exhausted, permanent, and malformed messages are moved once to `{queue}-deadletter-parking` (declared durable by the reprocessor) instead of rotating through the DLQ on every cycle. Tooling or operators that inspected those messages in the DLQ should look at the parking queue instead. See [Dead-Letter Reprocessor](#dead-letter-reprocessor).
+
+**Other changes (non-breaking but notable)**
+
+- Multi-targeting: `netstandard2.1` + `net8.0`.
+- OpenTelemetry-ready observability: `ActivitySource` spans with W3C trace-context propagation, a `Meter` with message counters and duration histograms, and a native health check. See [Observability](#observability).
+- Temporary runs support a whole-run `RunTimeout` and end early (with a `ConnectionLost` error entry) when the broker connection drops, instead of hanging.
+- `onError` in temporary runs now also fires for publish failures, and `TemporaryRunError.MessageIndex` identifies the failed input message.
+- The dead-letter envelope captures the original AMQP properties (`DeliveryMode`, headers, `Type`, `AppId`, …) and the reprocessor restores them on replay — persistent messages stay persistent.
+- Consumers drain in-flight handlers (bounded) during shutdown before closing channels, avoiding redeliveries after deploys.
+
+---
+
 ## ⚠️ Breaking Changes (v7.0.0)
 
 **`ConfigureCustomDeadletter` and `CustomDeadLetterSettings<TConsumer>` removed**
@@ -204,6 +235,8 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 
 ## Table of Contents
 
+- [⚠️ Breaking Changes (v8.0.0)](#️-breaking-changes-v800)
+- [⚠️ Breaking Changes (v7.0.0)](#️-breaking-changes-v700)
 - [⚠️ Breaking Changes (v6.0.0)](#️-breaking-changes-v600)
 - [⚠️ Breaking Changes (v5.0.0)](#️-breaking-changes-v500)
 - [Why EasyRabbitFlow?](#why-easyrabbitflow)
@@ -235,7 +268,12 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 - [Queue State Inspection](#queue-state-inspection)
 - [Queue Purging](#queue-purging)
 - [Temporary Batch Processing](#temporary-batch-processing)
+- [Observability](#observability)
+  - [Distributed Tracing](#distributed-tracing)
+  - [Metrics](#metrics)
+  - [Health Check](#health-check)
 - [Transient Exceptions and Custom Retry Logic](#transient-exceptions-and-custom-retry-logic)
+- [Sample Project](#sample-project)
 - [Full API Reference](#full-api-reference)
 - [Performance Notes](#performance-notes)
 
@@ -253,12 +291,16 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 | Queue state & purge utilities | ✅ |
 | Full DI integration (scoped/transient/singleton) | ✅ |
 | Publisher confirms (single) & transactional batch | ✅ |
-| Built-in `MessageId` on every message (auto-GUID or caller-supplied for true idempotency) | ✅ |
+| Built-in `MessageId` metadata on every message (auto-GUID or caller-supplied deterministic key) | ✅ |
 | CorrelationId support (end-to-end tracing) | ✅ |
+| `ActivitySource` spans + W3C trace context propagation (OpenTelemetry-ready) | ✅ |
+| Built-in metrics (`Meter`) — counters + processing-duration histogram | ✅ |
+| Native health check (`AddHealthChecks().AddRabbitFlow()`) | ✅ |
+| Graceful shutdown: bounded drain of in-flight handlers before closing channels | ✅ |
 | `RabbitFlowMessageContext` per-message metadata | ✅ |
 | Rich `PublishResult` / `BatchPublishResult` types | ✅ |
 | Thread-safe channel operations | ✅ |
-| .NET Standard 2.1 (works with .NET 6, 7, 8, 9+) | ✅ |
+| Multi-targeted: .NET Standard 2.1 (works with .NET 6, 7+) and .NET 8 (used by .NET 8, 9+) | ✅ |
 
 ---
 
@@ -857,7 +899,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
                                            preserved via x-reprocess-attempts.
 ```
 
-If a message exhausts its reprocess budget, the reprocessor re-publishes it back to the dead-letter queue (with `reprocessAttempts` reflecting the final count) so it remains visible in any RabbitMQ client and is not silently dropped.
+If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -871,8 +913,9 @@ If a message exhausts its reprocess budget, the reprocessor re-publishes it back
 - Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning.
 - Forces `ExtendDeadletterMessage = true` so the envelope (including `reprocessAttempts`) is available — a warning is logged if you set it to `false`.
 - Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Any [Dead-Letter Replicas](#dead-letter-replicas) bound to the same DLX are independent and never drained by the reprocessor.
-- **Only transient failures are reprocessed.** A message is eligible only if its `exceptionType` in the envelope is `OperationCanceledException`, `TaskCanceledException`, or `RabbitFlowTransientException` — the same set the in-handler `RetryPolicy` retries. Permanent failures (validation, deserialization, business-rule violations) stay in the DLQ untouched so they remain visible for inspection.
+- **Only transient failures are reprocessed.** A message is eligible only if its envelope's `isTransient` flag is `true` — classified at failure time by the same rules the in-handler `RetryPolicy` uses (see [Transient Exceptions](#transient-exceptions-and-custom-retry-logic)): `RabbitFlowTransientException` and derived types, cancellation/timeout, and transient HTTP failures. Permanent failures (validation, deserialization, business-rule violations) are moved to the parking queue so they remain visible for inspection without churning through the DLQ. Envelopes from older versions (without the flag) fall back to exact type-name matching.
 - Counter persistence: the reprocessor sets the AMQP header `x-reprocess-attempts` on every message it re-publishes. The consumer reads this header on receipt and seeds the new envelope with that count if processing fails again, so the counter survives the full cycle DLQ → main → DLQ.
+- **AMQP properties are restored on replay.** The envelope captures the original message's `DeliveryMode`, `Type`, `AppId`, `Priority`, `ContentType`, `ReplyTo`, and headers (including `traceparent`) at failure time, and the reprocessor restores them when re-enqueueing — a persistent message stays persistent after a replay. Header values are preserved as strings (binary values are decoded as UTF-8).
 
 ### Manual DLQ Replay Safety Net
 
@@ -1049,9 +1092,9 @@ var result = await publisher.PublishAsync(order, "orders-queue");
 
 This is enough for tracing, logs, and per-attempt identification. It is **not** enough for true idempotency — retrying the same logical publish produces a different GUID each time, so consumers can't deduplicate against it.
 
-**True idempotency — caller-supplied deterministic key:**
+**Idempotency-friendly publishing — caller-supplied deterministic key:**
 
-For dedup-friendly behavior, pass a `messageId` derived from your business data. Retries of the same logical event then carry the same `MessageId` and consumers can short-circuit duplicates.
+For dedup-friendly behavior, pass a `messageId` derived from your business data. Retries of the same logical event then carry the same `MessageId`, giving consumers a stable key they can use in their own deduplication logic.
 
 ```csharp
 // Single message — derive the key from business data
@@ -1069,17 +1112,67 @@ var batchResult = await publisher.PublishBatchAsync(
 
 The selector must return a non-empty string. Returning `null` or an empty string fails the batch (rolled back in `Transactional` mode, partially published in `Confirm` mode).
 
+EasyRabbitFlow intentionally does **not** include a built-in idempotency store. Idempotency is usually a domain concern: preventing a duplicate payment, duplicate order, duplicate email, or duplicate inventory adjustment must be coordinated with the same database, external provider, or business invariant that owns the side effect. The library gives you the stable metadata (`MessageId`, `CorrelationId`, `Redelivered`, `ReprocessAttempts`); your application decides what "already processed" means.
+
+Recommended responsibilities:
+
+| Layer | Responsibility |
+|-------|----------------|
+| Publisher | Provide a deterministic `messageId` for logical operations that may be retried. |
+| EasyRabbitFlow | Preserve `MessageId` on the wire and expose it through `RabbitFlowMessageContext`. |
+| Consumer/application | Deduplicate using domain storage, unique constraints, transactions, or provider idempotency keys. |
+
+Common keys:
+
+| Use case | Example key |
+|----------|-------------|
+| Order created | `order-{OrderId}-created` |
+| Payment captured | `payment-{PaymentId}-capture` |
+| Email notification | `email-{TemplateId}-{Recipient}-{BusinessId}` |
+| Inventory reservation | `inventory-{ReservationId}` |
+
 On the consumer side, deduplicate using `RabbitFlowMessageContext.MessageId`:
 
 ```csharp
 public async Task HandleAsync(OrderEvent message, RabbitFlowMessageContext context, CancellationToken ct)
 {
-    if (context.MessageId != null && await _seen.ContainsAsync(context.MessageId, ct))
+    var messageId = context.MessageId ?? $"order-{message.OrderId}-created";
+
+    var inserted = await _processedMessages.TryInsertAsync(messageId, ct);
+
+    if (!inserted)
+    {
+        // Duplicate delivery: RabbitFlow will ACK when the handler returns.
         return; // duplicate — already processed
+    }
+
     await ProcessAsync(message, ct);
-    await _seen.AddAsync(context.MessageId!, ct);
 }
 ```
+
+For database-backed consumers, prefer an atomic pattern:
+
+1. Insert `MessageId` into a table with a unique constraint.
+2. If the insert fails because the key already exists, return without applying the side effect.
+3. Apply the side effect in the same transaction when possible.
+4. Commit before the handler returns, so the RabbitMQ ACK only happens after your durable state is safe.
+
+For external providers, forward the same deterministic key when the provider supports idempotency keys:
+
+```csharp
+public async Task HandleAsync(PaymentCaptured message, RabbitFlowMessageContext context, CancellationToken ct)
+{
+    var idempotencyKey = context.MessageId ?? $"payment-{message.PaymentId}-capture";
+
+    await _paymentGateway.CaptureAsync(
+        message.PaymentId,
+        message.Amount,
+        idempotencyKey,
+        ct);
+}
+```
+
+If a message comes from a third-party publisher without `MessageId`, either derive a domain key from the payload (preferred) or treat it as non-idempotent and rely on your business operation to be safe on repeat.
 
 ### Correlation
 
@@ -1096,7 +1189,7 @@ await publisher.PublishAsync(event, "notifications", routingKey: "new", correlat
 await publisher.PublishBatchAsync(events, "orders-queue", correlationId: batchId);
 ```
 
-The `correlationId` is set on `BasicProperties.CorrelationId` and received by consumers via `RabbitFlowMessageContext.CorrelationId`.
+The `correlationId` is set on `BasicProperties.CorrelationId` and received by consumers via `RabbitFlowMessageContext.CorrelationId`. For distributed tracing across services, see [Observability](#observability) — the W3C trace context travels in AMQP headers automatically.
 
 ### Per-Call AMQP Options (`PublishOptions`)
 
@@ -1209,7 +1302,7 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 
 ## Queue State Inspection
 
-Use `IRabbitFlowState` to query queue metadata at runtime:
+Use `IRabbitFlowState` to query queue metadata at runtime. For health checks and dashboards, prefer `GetQueueStateAsync` — it returns everything in a **single broker round trip** (each individual method opens its own connection):
 
 ```csharp
 public class HealthCheckService
@@ -1221,21 +1314,26 @@ public class HealthCheckService
         _state = state;
     }
 
-    public async Task<object> GetQueueHealthAsync(string queueName)
+    public async Task<QueueState> GetQueueHealthAsync(string queueName)
     {
-        return new
-        {
-            IsEmpty = await _state.IsEmptyQueueAsync(queueName),
-            MessageCount = await _state.GetQueueLengthAsync(queueName),
-            ConsumerCount = await _state.GetConsumersCountAsync(queueName),
-            HasConsumers = await _state.HasConsumersAsync(queueName)
-        };
+        // One connection, one round trip: Exists, MessageCount, ConsumerCount, IsEmpty, HasConsumers
+        return await _state.GetQueueStateAsync(queueName);
+    }
+
+    public async Task<IReadOnlyList<QueueState>> GetAllQueuesHealthAsync(string[] queueNames)
+    {
+        // One shared connection for the whole batch
+        return await _state.GetQueuesStateAsync(queueNames);
     }
 }
 ```
 
+`GetQueueStateAsync` does **not throw** when the queue is missing — it reports `Exists = false` with zero counts, which is what a health endpoint usually wants. The granular methods remain available and still throw on missing queues:
+
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `GetQueueStateAsync(queueName)` | `Task<QueueState>` | Full snapshot in one round trip: `Exists`, `MessageCount`, `ConsumerCount`, `IsEmpty`, `HasConsumers` |
+| `GetQueuesStateAsync(queueNames)` | `Task<IReadOnlyList<QueueState>>` | Snapshots for several queues over a single connection, in input order |
 | `IsEmptyQueueAsync(queueName)` | `Task<bool>` | Is the queue empty? |
 | `GetQueueLengthAsync(queueName)` | `Task<uint>` | Number of messages in the queue |
 | `GetConsumersCountAsync(queueName)` | `Task<uint>` | Number of active consumers |
@@ -1281,7 +1379,7 @@ public class InvoiceService
 
     public async Task ProcessInvoiceBatchAsync(List<Invoice> invoices)
     {
-        int processed = await _temporary.RunAsync(
+        TemporaryRunResult run = await _temporary.RunAsync(
             invoices,
             onMessageReceived: async (invoice, ct) =>
             {
@@ -1298,16 +1396,18 @@ public class InvoiceService
                 Timeout = TimeSpan.FromSeconds(30),
                 CorrelationId = Guid.NewGuid().ToString()
             });
+
+        Console.WriteLine($"Succeeded: {run.SucceededMessages}, Failed: {run.FailedMessages}");
     }
 }
 ```
 
 ### Error Handling with `onError`
 
-The `onError` callback is invoked whenever a message fails during processing (timeout, cancellation, or exception). Use it to decide what to do with failed messages — log them, persist them, or republish to another queue:
+The `onError` callback is invoked whenever a message fails to publish or fails during processing (timeout, cancellation, or exception). Use it to decide what to do with failed messages — log them, persist them, or republish to another queue:
 
 ```csharp
-int processed = await _temporary.RunAsync(
+TemporaryRunResult run = await _temporary.RunAsync(
     invoices,
     onMessageReceived: async (invoice, ct) =>
     {
@@ -1330,6 +1430,11 @@ int processed = await _temporary.RunAsync(
         PrefetchCount = 10,
         Timeout = TimeSpan.FromSeconds(30)
     });
+
+if (!run.Success)
+{
+    Console.WriteLine($"Temporary batch completed with {run.FailedMessages} failures.");
+}
 ```
 
 > **Note:** If `onError` itself throws, the exception is caught and logged internally — it will not break the batch processing flow.
@@ -1339,7 +1444,7 @@ int processed = await _temporary.RunAsync(
 When the completion logic needs to `await` (e.g. flushing state to a database, publishing a follow-up message, calling another service), use the overload that takes `onCompletedAsync` instead of `onCompleted`. The callback receives the processed count, error count, and the operation's `CancellationToken`:
 
 ```csharp
-int processed = await _temporary.RunAsync(
+TemporaryRunResult run = await _temporary.RunAsync(
     invoices,
     onMessageReceived: async (invoice, ct) =>
     {
@@ -1364,7 +1469,7 @@ Both overloads coexist — existing callers using `onCompleted` keep working unc
 ### With Result Collection
 
 ```csharp
-int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
+TemporaryRunResult<InvoiceResult> run = await _temporary.RunAsync<Invoice, InvoiceResult>(
     invoices,
     onMessageReceived: async (invoice, ct) =>
     {
@@ -1381,6 +1486,8 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
     {
         await _failedMessageStore.SaveAsync(failedInvoice, ct);
     });
+
+Console.WriteLine($"Collected {run.Results.Count} successful invoice results.");
 ```
 
 ### How It Works
@@ -1401,15 +1508,95 @@ int processed = await _temporary.RunAsync<Invoice, InvoiceResult>(
        ◄──────────────────── Delete temp queue
        │                     Call onCompleted()
        │
-  return count
+  return TemporaryRunResult
 ```
+
+`TemporaryRunResult` exposes `TotalMessages`, `PublishedMessages`, `ProcessedMessages`,
+`SucceededMessages`, `FailedMessages`, `Success`, `Duration`, and `Errors`. Each entry in
+`Errors` records the run stage where the failure happened (`Publish`, `Deserialize`, `Process`,
+`Timeout`, `Cancellation`, `Completion`); publish-stage errors also carry the `MessageIndex`
+of the failed input message. The `RunAsync<T, TResult>` overload returns
+`TemporaryRunResult<TResult>`, adding a `Results` collection with the values returned by
+successful handlers. You can still ignore the returned task result in fire-and-forget flows
+and rely on `onCompleted` / `onCompletedAsync` for background bookkeeping.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `PrefetchCount` | ushort | `1` | Parallel message processing (>0) |
 | `Timeout` | TimeSpan? | `null` | Per-message timeout |
+| `RunTimeout` | TimeSpan? | `null` | Whole-run timeout: cancels in-progress handlers, reports pending messages as failed, and returns the partial result |
 | `QueuePrefixName` | string? | `null` | Custom prefix for the temp queue name |
 | `CorrelationId` | string? | `Guid` | Correlation ID for tracing/logging |
+
+The run also ends early — instead of waiting forever — if the underlying connection or channel
+is shut down mid-run (broker restart, network failure): in-flight handlers are drained, the
+undelivered messages are reported as failed with a `ConnectionLost` error entry, and the
+partial result is returned.
+
+---
+
+## Observability
+
+EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Everything is zero-cost until a listener subscribes.
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource(RabbitFlowDiagnostics.ActivitySourceName)
+        .AddAspNetCoreInstrumentation())
+    .WithMetrics(metrics => metrics
+        .AddMeter(RabbitFlowDiagnostics.MeterName)
+        .AddAspNetCoreInstrumentation())
+    .UseOtlpExporter();
+```
+
+### Distributed Tracing
+
+EasyRabbitFlow propagates the **W3C trace context** (`traceparent` / `tracestate`) as AMQP headers — so a trace started in an HTTP request continues through the broker into the consumer, across service boundaries.
+
+What you get:
+
+- **`{destination} publish`** (`Producer` span) per `PublishAsync` / `PublishBatchAsync`, tagged with `messaging.system=rabbitmq`, destination, routing key, `messaging.message.id`, and `messaging.message.conversation_id` (the correlation id). Failed publishes set error status.
+- **`{queue} process`** (`Consumer` span) per delivered message, parented to the publisher's remote context extracted from the `traceparent` header. Your handler runs inside this span, so any spans you create (HTTP calls, DB queries) nest under it. Exhausted retries set error status.
+
+Notes:
+
+- If there is an ambient `Activity` (e.g. an ASP.NET Core request) when publishing, its context is propagated in headers **even without** an OpenTelemetry listener — consumers on other services can still continue the trace.
+- Caller-supplied `traceparent` / `tracestate` entries in `PublishOptions.Headers` are respected and never overwritten.
+- Messages replayed by the [Dead-Letter Reprocessor](#dead-letter-reprocessor) keep their original `traceparent` (captured in the envelope), so the replay links back to the original trace.
+- This complements (does not replace) `CorrelationId`, which remains a first-class AMQP property.
+
+### Metrics
+
+| Instrument | Type | Tags | Description |
+|------------|------|------|-------------|
+| `easyrabbitflow.messages.published` | Counter | `destination` | Messages successfully published (batches count each message) |
+| `easyrabbitflow.messages.publish_failures` | Counter | `destination` | Failed publish operations |
+| `easyrabbitflow.messages.consumed` | Counter | `queue`, `outcome` | Messages reaching a terminal consume state (`success` / `failure`) |
+| `easyrabbitflow.messages.retried` | Counter | `queue` | In-process retry attempts (transient failures / per-attempt timeouts) |
+| `easyrabbitflow.messages.dead_lettered` | Counter | `queue` | Messages routed to a dead-letter queue |
+| `easyrabbitflow.messages.reprocessed` | Counter | `queue` | Messages re-enqueued from the DLQ by the reprocessor |
+| `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Messages moved to the parking queue (`exhausted` / `permanent` / `malformed`) |
+| `easyrabbitflow.consumer.message.duration` | Histogram (s) | `queue`, `outcome` | End-to-end processing time per delivery, including in-process retries |
+
+### Health Check
+
+A native `IHealthCheck` integrates with the standard health checks pipeline, built on the single-round-trip [queue state inspection](#queue-state-inspection):
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddRabbitFlow(configure: o =>
+    {
+        o.Queues.Add("orders-queue");        // must exist → otherwise Unhealthy
+        o.MaxReadyMessages = 10_000;          // backlog above this → Degraded
+        o.RequireConsumers = true;            // queue without consumers → Degraded
+    });
+
+// later:
+app.MapHealthChecks("/health");
+```
+
+With no queues configured it acts as a pure broker-connectivity probe. Per-queue counts are exposed in the health report's `Data` dictionary (`{queue}.exists`, `{queue}.messages`, `{queue}.consumers`).
 
 ---
 
@@ -1421,17 +1608,19 @@ EasyRabbitFlow distinguishes between **transient** failures (worth retrying) and
 
 | Exception type | When it fires |
 |---|---|
-| `OperationCanceledException` | Per-attempt timeout (configured via `ConsumerSettings.Timeout`) |
-| `TaskCanceledException` | Same as above, plus most cooperative cancellations — including `HttpClient.Timeout` |
-| `RabbitFlowTransientException` | Explicitly thrown by your consumer to signal a retryable error |
+| `RabbitFlowTransientException` **and any derived type** | Explicitly thrown by your consumer to signal a retryable error |
+| `OperationCanceledException` / `TaskCanceledException` | Per-attempt timeout (`ConsumerSettings.Timeout`), cooperative cancellations, `HttpClient.Timeout` |
+| `TimeoutException` | Classic timeout signal from drivers and clients |
+| `HttpRequestException` with **no response** | Connection refused, DNS failure, socket reset — the request never reached a server |
+| `HttpRequestException` with status **408, 429, 502, 503, 504** | Rate limiting and upstream/gateway unavailability — waiting helps |
 
-Anything else thrown by your handler is treated as **permanent** and routed to the dead-letter queue without further retry.
+Classification is **inheritance-aware** and also inspects the **inner-exception chain** (up to 10 levels): an `InvalidOperationException` wrapping an `HttpRequestException(429)` is still transient. Anything else is treated as **permanent** and routed to the dead-letter queue without further retry.
 
-> **HttpClient timeouts are covered for free.** When `HttpClient.SendAsync` times out it throws `TaskCanceledException`, which is already in the transient set — no wrapping needed.
+> **HTTP rate limits and gateway errors are covered for free.** A `429` or `503` thrown by `HttpClient` (e.g. via `EnsureSuccessStatusCode()`) is recognized automatically — no wrapping needed. A `404` or `400` stays permanent.
 
 ### Marking your own errors as transient
 
-If a failure is transient but doesn't fall into the auto-recognized set (a `429 Too Many Requests`, a `503`, a database deadlock…), catch the original exception and rethrow it wrapped in `RabbitFlowTransientException`:
+If a failure is transient but doesn't fall into the auto-recognized set (a database deadlock, a provider-specific error code…), catch the original exception and rethrow it wrapped in `RabbitFlowTransientException` — or throw your own subclass of it, which is equally recognized:
 
 ```csharp
 using EasyRabbitFlow.Exceptions;
@@ -1453,13 +1642,9 @@ public class PaymentConsumer : IRabbitFlowConsumer<PaymentEvent>
 }
 ```
 
-**Example — making `429 Too Many Requests` transient:**
-
-A rate-limited downstream API responds with `429`. The failure is temporary by definition (waiting helps), so we want it retried by both the in-handler policy and, if the message ends up dead-lettered, by the reprocessor:
+**Example — HTTP failures need no wrapping:**
 
 ```csharp
-using EasyRabbitFlow.Exceptions;
-
 public class NotificationConsumer : IRabbitFlowConsumer<NotificationEvent>
 {
     private readonly HttpClient _http;
@@ -1468,29 +1653,17 @@ public class NotificationConsumer : IRabbitFlowConsumer<NotificationEvent>
 
     public async Task HandleAsync(NotificationEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _http.PostAsJsonAsync("https://api.example.com/notify", message, cancellationToken);
-        }
-        catch (HttpRequestException ex)
-        {
-            // Connection refused, DNS failure, socket reset… all worth retrying.
-            throw new RabbitFlowTransientException("Notification API unreachable.", ex);
-        }
+        var response = await _http.PostAsJsonAsync("https://api.example.com/notify", message, cancellationToken);
 
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            // Mark 429 explicitly as transient so retry / reprocessor pick it up.
-            throw new RabbitFlowTransientException("Notification API rate-limited (429).");
-        }
-
-        response.EnsureSuccessStatusCode(); // 4xx (other than 429) bubbles up as permanent → DLQ
+        // 429 / 503 / 502 / 504 / 408 → HttpRequestException recognized as transient automatically.
+        // Connection refused / DNS failure (no response) → also transient automatically.
+        // 400 / 401 / 404 / 500 → permanent, goes to the dead-letter queue.
+        response.EnsureSuccessStatusCode();
     }
 }
 ```
 
-**Why this matters for the reprocessor:** the reprocessor only re-enqueues messages whose recorded `exceptionType` is one of the three transient types listed above. Wrapping the right errors at the handler level is what makes them eligible for the slow recovery path provided by [`ConfigureDeadLetterReprocess`](#dead-letter-reprocessor).
+**How the reprocessor decides:** when a message is dead-lettered, the failure is classified at capture time and recorded in the envelope as an `isTransient` flag — honoring inheritance and the HTTP rules above. The reprocessor re-enqueues only messages whose flag is `true`. Envelopes written by older library versions (without the flag) fall back to exact exception type-name matching (`RabbitFlowTransientException`, `OperationCanceledException`, `TaskCanceledException`).
 
 ### Exception types reference
 
@@ -1499,6 +1672,49 @@ public class NotificationConsumer : IRabbitFlowConsumer<NotificationEvent>
 | `RabbitFlowTransientException` | User-facing marker. Throw it from your handler to signal a retryable error to both the in-handler retry policy and the dead-letter reprocessor. |
 | `RabbitFlowException` | General library error |
 | `RabbitFlowOverRetriesException` | Thrown internally when all retry attempts are exhausted |
+
+---
+
+## Sample Project
+
+`sample/RabbitFlowSample` is a runnable ASP.NET Core API that demonstrates every library feature with self-contained modules under `Samples/` (each has its own README, `.http` file, and topology):
+
+| Module | What it demonstrates |
+|--------|----------------------|
+| `Notifications/` | Fanout exchange, retry policies, dead-letter envelope + reprocessor, DI lifetimes |
+| `Orders/` | Topic exchange with `*` / `#` wildcard bindings |
+| `Payments/` | Dead-letter replicas (audit + alerting feeds from the same DLX) |
+| `SupportTickets/` | Priority queues (`MaxPriority` + `PublishOptions.Priority`) |
+| `Thumbnails/` | Temporary queues: `TemporaryRunResult`, per-job `Timeout`, whole-run `RunTimeout`, fire-and-forget |
+
+It also exposes `GET /health` (the native health check, monitoring queues + consumer presence) and `GET /diagnostics/queues` (unified `QueueState` snapshot of all sample queues).
+
+### Option A — Aspire (recommended): full observability
+
+With Docker (or Podman) running:
+
+```bash
+dotnet run --project sample/RabbitFlowSample.AppHost
+```
+
+The Aspire AppHost starts a RabbitMQ container (management plugin included), launches the sample API wired to it, and prints the **dashboard URL** in the console. From the dashboard:
+
+- **Resources** — RabbitMQ (with its management UI link) and the sample API (with its Swagger link).
+- **Traces** — fire any endpoint from Swagger (e.g. `POST /orders`) and watch the HTTP request span flow into the `publish` span and then into each queue's `process` span, stitched by the W3C trace context traveling in AMQP headers.
+- **Metrics** — select the `rabbitflow-sample` resource and browse the `easyrabbitflow.*` instruments (publish/consume counters, processing-duration histogram).
+
+The AppHost injects the RabbitMQ connection string and the OTLP endpoint automatically — no configuration needed.
+
+### Option B — Standalone
+
+Start a broker manually and run the API:
+
+```bash
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+dotnet run --project sample/RabbitFlowSample
+```
+
+The sample falls back to `localhost:5672` with `guest`/`guest`, and skips the OTLP exporter when no collector endpoint is configured. Swagger is served at the root URL printed in the console; the RabbitMQ management UI lives at `http://localhost:15672`.
 
 ---
 
@@ -1523,7 +1739,21 @@ IServiceCollection AddRabbitFlow(this IServiceCollection services,
 
 // Start background consumer processing
 IServiceCollection UseRabbitFlowConsumers(this IServiceCollection services);
+
+// Register the native health check (see Observability > Health Check)
+IHealthChecksBuilder AddRabbitFlow(this IHealthChecksBuilder builder,
+    string name = "rabbitflow",
+    Action<RabbitFlowHealthCheckOptions>? configure = null,
+    HealthStatus? failureStatus = null,
+    IEnumerable<string>? tags = null);
 ```
+
+### Observability Constants
+
+| Constant | Value | Use |
+|----------|-------|-----|
+| `RabbitFlowDiagnostics.ActivitySourceName` | `"EasyRabbitFlow"` | `AddSource(...)` for traces |
+| `RabbitFlowDiagnostics.MeterName` | `"EasyRabbitFlow"` | `AddMeter(...)` for metrics |
 
 ### RabbitFlowConfigurator Methods
 
