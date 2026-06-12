@@ -16,8 +16,10 @@ namespace EasyRabbitFlow.Services
 {
     /// <summary>
     /// Hosted service that periodically drains the auto-generated dead-letter queue of every consumer
-    /// configured with <see cref="DeadLetterReprocessSettings{TConsumer}"/> and re-publishes messages
-    /// back to the main queue until the configured maximum attempt count is reached.
+    /// configured with <see cref="DeadLetterReprocessSettings{TConsumer}"/> and re-publishes transient
+    /// failures back to the main queue until the configured maximum attempt count is reached.
+    /// Messages that will never be re-enqueued (exhausted, permanent, malformed) are moved once to the
+    /// parking queue (<c>{queue}-deadletter-parking</c>) so they don't churn through the DLQ on every cycle.
     /// </summary>
     internal sealed class DeadLetterReprocessorHostedService : IHostedService
     {
@@ -119,6 +121,7 @@ namespace EasyRabbitFlow.Services
         private readonly string _deadLetterQueueName;
         private readonly string _deadLetterExchangeName;
         private readonly string _deadLetterRoutingKey;
+        private readonly string _parkingQueueName;
         private readonly int _maxAttempts;
         private readonly TimeSpan _interval;
         private readonly int _maxMessagesPerCycle;
@@ -143,6 +146,7 @@ namespace EasyRabbitFlow.Services
             _deadLetterQueueName = $"{queueName}-deadletter";
             _deadLetterExchangeName = $"{queueName}-deadletter-exchange";
             _deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
+            _parkingQueueName = $"{queueName}-deadletter-parking";
             _maxAttempts = maxAttempts;
             _interval = interval;
             _maxMessagesPerCycle = maxMessagesPerCycle;
@@ -190,11 +194,15 @@ namespace EasyRabbitFlow.Services
             }
         }
 
-        private async Task RunCycleAsync(CancellationToken ct)
+        internal async Task RunCycleAsync(CancellationToken ct)
         {
             using var connection = await _connectionFactory.CreateConnectionAsync($"reprocessor_{_queueName}", ct).ConfigureAwait(false);
-            
+
             using var channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+            // Parking queue for messages that will never be re-enqueued (exhausted, permanent, malformed),
+            // so they don't churn through the DLQ on every cycle.
+            await channel.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, cancellationToken: ct).ConfigureAwait(false);
 
             uint initialCount;
 
@@ -249,20 +257,27 @@ namespace EasyRabbitFlow.Services
                 if (envelope == null || !envelope.MessageData.HasValue)
                 {
                     malformed++;
-                    
-                    await RepublishUnchangedAsync(channel, result, ct).ConfigureAwait(false);
-                    
+
+                    RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "malformed"));
+
+                    await ParkUnchangedAsync(channel, result, ct).ConfigureAwait(false);
+
                     continue;
                 }
 
-                if (!IsTransientException(envelope.ExceptionType))
+                // Envelopes written by current versions carry the flag; older ones fall back to type-name matching
+                var isTransient = envelope.IsTransient ?? TransientExceptionClassifier.IsTransientTypeName(envelope.ExceptionType);
+
+                if (!isTransient)
                 {
                     permanent++;
-                    _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} skipping permanent failure ({ExceptionType}) in {Dlq}.",
+                    _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} parking permanent failure ({ExceptionType}) from {Dlq}.",
                         _consumerName, envelope.ExceptionType ?? "(unknown)", _deadLetterQueueName);
-                    
-                    await RepublishUnchangedAsync(channel, result, ct).ConfigureAwait(false);
-                    
+
+                    RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "permanent"));
+
+                    await ParkUnchangedAsync(channel, result, ct).ConfigureAwait(false);
+
                     continue;
                 }
 
@@ -272,23 +287,17 @@ namespace EasyRabbitFlow.Services
 
                     var payload = Encoding.UTF8.GetBytes(envelope.MessageData.Value.GetRawText());
 
-                    var props = new BasicProperties
-                    {
-                        MessageId = envelope.MessageId,
-                        CorrelationId = envelope.CorrelationId,
-                        Headers = new Dictionary<string, object?>
-                        {
-                            [RabbitFlowHeaders.ReprocessAttempts] = newAttempts
-                        }
-                    };
+                    var props = BuildRestoredProperties(envelope, newAttempts);
 
                     try
                     {
                         await channel.BasicPublishAsync(exchange: "", routingKey: _queueName, mandatory: false, basicProperties: props, body: payload, cancellationToken: ct).ConfigureAwait(false);
-                        
+
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
-                        
+
                         reenqueued++;
+
+                        RabbitFlowDiagnostics.ReprocessedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
                     }
                     catch (Exception ex)
                     {
@@ -303,44 +312,85 @@ namespace EasyRabbitFlow.Services
                     try
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
-                        
-                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct).ConfigureAwait(false);
+
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: bytes, cancellationToken: ct).ConfigureAwait(false);
 
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
 
                         exhausted++;
+
+                        RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "exhausted"));
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "[RABBIT-FLOW]: Failed to re-publish exhausted message to {Dlq}.", _deadLetterQueueName);
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Failed to park exhausted message to {Parking}.", _parkingQueueName);
                         break;
                     }
                 }
             }
 
-            _logger.LogInformation("[RABBIT-FLOW]: Reprocessor cycle for {Consumer} done. Reenqueued={Reenqueued}, Exhausted={Exhausted}, Permanent={Permanent}, Malformed={Malformed}.",
+            _logger.LogInformation("[RABBIT-FLOW]: Reprocessor cycle for {Consumer} done. Reenqueued={Reenqueued}, Parked: Exhausted={Exhausted}, Permanent={Permanent}, Malformed={Malformed}.",
                 _consumerName, reenqueued, exhausted, permanent, malformed);
         }
 
-        private static bool IsTransientException(string? exceptionType)
+        private static BasicProperties BuildRestoredProperties(DeadLetterEnvelope envelope, int newAttempts)
         {
-            if (string.IsNullOrEmpty(exceptionType)) return false;
+            var props = new BasicProperties
+            {
+                MessageId = envelope.MessageId,
+                CorrelationId = envelope.CorrelationId
+            };
 
-            return exceptionType == nameof(OperationCanceledException)
-                || exceptionType == nameof(TaskCanceledException)
-                || exceptionType == nameof(RabbitFlowTransientException);
+            var headers = new Dictionary<string, object?>();
+
+            var original = envelope.Properties;
+
+            if (original != null)
+            {
+                if (original.DeliveryMode.HasValue)
+                    props.DeliveryMode = (DeliveryModes)(byte)original.DeliveryMode.Value;
+
+                if (original.Type != null)
+                    props.Type = original.Type;
+
+                if (original.AppId != null)
+                    props.AppId = original.AppId;
+
+                if (original.Priority.HasValue)
+                    props.Priority = original.Priority.Value;
+
+                if (original.ContentType != null)
+                    props.ContentType = original.ContentType;
+
+                if (original.ReplyTo != null)
+                    props.ReplyTo = original.ReplyTo;
+
+                if (original.Headers != null)
+                {
+                    foreach (var kvp in original.Headers)
+                    {
+                        headers[kvp.Key] = kvp.Value;
+                    }
+                }
+            }
+
+            headers[RabbitFlowHeaders.ReprocessAttempts] = newAttempts;
+
+            props.Headers = headers;
+
+            return props;
         }
 
-        private async Task RepublishUnchangedAsync(IChannel channel, BasicGetResult result, CancellationToken ct)
+        private async Task ParkUnchangedAsync(IChannel channel, BasicGetResult result, CancellationToken ct)
         {
             try
             {
-                await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
+                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
                 await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[RABBIT-FLOW]: Failed to re-publish malformed message to {Dlq}.", _deadLetterQueueName);
+                _logger.LogError(ex, "[RABBIT-FLOW]: Failed to park message to {Parking}.", _parkingQueueName);
             }
         }
     }
