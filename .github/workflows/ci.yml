@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Build (netstandard2.1 + net8.0)
+        run: dotnet build --configuration Release
+
+      # Integration tests run against a real RabbitMQ broker via Testcontainers
+      # (Docker is preinstalled on ubuntu-latest runners).
+      - name: Test
+        run: dotnet test tests/EasyRabbitFlow.Tests --configuration Release --no-build --logger "console;verbosity=normal"
