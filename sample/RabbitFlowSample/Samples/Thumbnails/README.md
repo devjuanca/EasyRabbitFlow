@@ -4,7 +4,7 @@ Illustrates **on-demand worker pools backed by a temporary RabbitMQ queue**. A r
 
 ## What it demonstrates
 
-- **`IRabbitFlowTemporary.RunAsync<T, TResult>`** — collects a per-job result and returns the aggregate once the batch finishes (await-completion endpoint).
+- **`IRabbitFlowTemporary.RunAsync<T, TResult>`** — returns a rich run summary and collects per-job results once the batch finishes (await-completion endpoint).
 - **`IRabbitFlowTemporary.RunAsync<T>`** — fires the batch and returns immediately while the workers keep draining (fire-and-forget endpoint).
 - **Bounded concurrency** — `PrefetchCount` controls how many jobs run in parallel.
 - **Per-job timeout** — `Timeout` cancels a stuck worker without killing the whole batch.
@@ -26,7 +26,7 @@ HTTP request                                   Temporary queue
                                                                   per-job onMessageReceived
                                                                           │
                                                                           ▼
-                                                                  ThumbnailResult collected
+                                                                  TemporaryRunResult collected
                                                                           │
                                                                           ▼
 HTTP response  ◄─────  onCompletedAsync  ◄───────────────────────────────┘
