@@ -32,6 +32,7 @@ namespace EasyRabbitFlow.Settings
         ushort PrefetchCount { get; set; }
 
         TimeSpan Timeout { get; set; }
+
     }
 
     public class ConsumerSettings<TConsumer> : IConsumerSettingsBase where TConsumer : class
@@ -145,7 +146,6 @@ namespace EasyRabbitFlow.Settings
         /// Default is 30 seconds.
         /// </summary>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
-
 
         /// <summary>
         /// Configures the retry policy for the consumer.

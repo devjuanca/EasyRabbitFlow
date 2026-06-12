@@ -8,6 +8,7 @@ using RabbitMQ.Client.Events;
 using RabbitMQ.Client.Exceptions;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
@@ -81,7 +82,7 @@ namespace EasyRabbitFlow.Services
             {
                 try
                 {
-                    await instance.StopAsync();
+                    await instance.StopAsync(cancellationToken);
                 }
                 catch (ObjectDisposedException)
                 {
@@ -184,7 +185,7 @@ namespace EasyRabbitFlow.Services
             _extendDeadLetter = effectiveExtend;
 
             var retryPolicyObj = root.GetService(typeof(RetryPolicy<>).MakeGenericType(_consumerType))
-                                ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType));
+                                ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType))!;
 
             var rpType = retryPolicyObj.GetType();
 
@@ -249,7 +250,7 @@ namespace EasyRabbitFlow.Services
             await EnsureChannelAsync(cancellationToken);
         }
 
-        public async Task StopAsync()
+        public async Task StopAsync(CancellationToken cancellationToken = default)
         {
             if (Interlocked.Exchange(ref _stopped, 1) != 0)
             {
@@ -257,6 +258,28 @@ namespace EasyRabbitFlow.Services
             }
 
             _stopping = true;
+
+            // Bounded drain: wait for in-flight handlers (the prefetch semaphore back at full capacity)
+            // before closing the channel, so finished work is acked and failures are dead-lettered
+            // instead of being silently redelivered after restart. The host's shutdown token (or the
+            // 30s cap) bounds the wait when a handler ignores cancellation.
+            var drainDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+
+            try
+            {
+                while (_prefetchSemaphore.CurrentCount < _prefetch
+                    && DateTime.UtcNow < drainDeadline
+                    && !cancellationToken.IsCancellationRequested)
+                {
+                    await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
 
             try
             {
@@ -336,6 +359,11 @@ namespace EasyRabbitFlow.Services
                     await _prefetchSemaphore.WaitAsync(_lifetimeCt);
                 }
                 catch { return; }
+
+                if (_stopping || _lifetimeCt.IsCancellationRequested)
+                {
+                    return;
+                }
 
                 _ = ProcessMessageAsync(ea);
             };
@@ -500,6 +528,20 @@ namespace EasyRabbitFlow.Services
                         _queueName, _consumerType.Name);
                 }
 
+                using var activity = RabbitFlowDiagnostics.StartProcess(_queueName, args.BasicProperties?.Headers, msgId, corrId, args.Redelivered);
+
+                var startTimestamp = Stopwatch.GetTimestamp();
+
+                void RecordConsumeMetrics(string outcome)
+                {
+                    var elapsedSeconds = (Stopwatch.GetTimestamp() - startTimestamp) / (double)Stopwatch.Frequency;
+                    var queueTag = new KeyValuePair<string, object?>("queue", _queueName);
+                    var outcomeTag = new KeyValuePair<string, object?>("outcome", outcome);
+
+                    RabbitFlowDiagnostics.ConsumedMessages.Add(1, queueTag, outcomeTag);
+                    RabbitFlowDiagnostics.ConsumeDuration.Record(elapsedSeconds, queueTag, outcomeTag);
+                }
+
                 object? evt;
 
                 try
@@ -508,7 +550,9 @@ namespace EasyRabbitFlow.Services
                 }
                 catch (Exception ex)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, null, body, reprocessAttempts, msgId, corrId, ex, rootCt);
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    RecordConsumeMetrics("failure");
+                    await HandleErrorAsync(channel, args.DeliveryTag, null, body, reprocessAttempts, msgId, corrId, args.BasicProperties, ex, rootCt);
                     return;
                 }
 
@@ -552,16 +596,30 @@ namespace EasyRabbitFlow.Services
 
                         await SafeAckAsync(channel, args.DeliveryTag, rootCt);
 
+                        RecordConsumeMetrics("success");
+
                         return;
                     }
                     catch (OperationCanceledException ex) when (attemptCts.IsCancellationRequested && !rootCt.IsCancellationRequested)
                     {
                         lastException = ex;
+
+                        if (remainingAttempts > 1)
+                        {
+                            RabbitFlowDiagnostics.RetriedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                        }
+
                         await ApplyRetryDelay(remainingAttempts, rootCt);
                     }
-                    catch (RabbitFlowTransientException ex)
+                    catch (Exception ex) when (TransientExceptionClassifier.IsTransient(ex))
                     {
                         lastException = ex;
+
+                        if (remainingAttempts > 1)
+                        {
+                            RabbitFlowDiagnostics.RetriedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                        }
+
                         await ApplyRetryDelay(remainingAttempts, rootCt);
                     }
                     catch (Exception ex)
@@ -577,7 +635,9 @@ namespace EasyRabbitFlow.Services
 
                 if (remainingAttempts <= 0)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, lastException ?? new Exception("Unknown error"), rootCt);
+                    activity?.SetStatus(ActivityStatusCode.Error, lastException?.Message ?? "Unknown error");
+                    RecordConsumeMetrics("failure");
+                    await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, args.BasicProperties, lastException ?? new Exception("Unknown error"), rootCt);
                 }
             }
             catch (AlreadyClosedException) { }
@@ -633,7 +693,7 @@ namespace EasyRabbitFlow.Services
             }
         }
 
-        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
+        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, IReadOnlyBasicProperties? originalProperties, Exception exception, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
 
@@ -662,7 +722,9 @@ namespace EasyRabbitFlow.Services
                         ErrorMessage = exception?.Message,
                         StackTrace = exception?.StackTrace,
                         Source = exception?.Source,
-                        ReprocessAttempts = reprocessAttempts
+                        ReprocessAttempts = reprocessAttempts,
+                        IsTransient = TransientExceptionClassifier.IsTransient(exception),
+                        Properties = CaptureMessageProperties(originalProperties)
                     };
 
                     const int MaxDepth = 10;
@@ -691,23 +753,69 @@ namespace EasyRabbitFlow.Services
                     try
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
-                        
+
                         await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
-                        
+
                         await channel.BasicAckAsync(deliveryTag, false, ct);
+
+                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
                     }
                     catch { }
                 }
                 else
                 {
-                    try 
-                    { 
+                    try
+                    {
                         await channel.BasicNackAsync(deliveryTag, false, false, ct);
+
+                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
 
                     } catch { }
                 }
             }
             finally { _channelGate.Release(); }
+        }
+
+        private static DeadLetterMessageProperties? CaptureMessageProperties(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null)
+            {
+                return null;
+            }
+
+            Dictionary<string, string?>? headers = null;
+
+            if (properties.Headers != null)
+            {
+                foreach (var kvp in properties.Headers)
+                {
+                    if (kvp.Key == RabbitFlowHeaders.ReprocessAttempts)
+                    {
+                        continue; // tracked by the envelope's ReprocessAttempts counter
+                    }
+
+                    headers ??= new Dictionary<string, string?>();
+
+                    headers[kvp.Key] = kvp.Value switch
+                    {
+                        null => null,
+                        byte[] bytes => Encoding.UTF8.GetString(bytes),
+                        string text => text,
+                        _ => kvp.Value.ToString()
+                    };
+                }
+            }
+
+            return new DeadLetterMessageProperties
+            {
+                DeliveryMode = ReadDeliveryMode(properties),
+                Type = ReadType(properties),
+                AppId = ReadAppId(properties),
+                Priority = ReadPriority(properties),
+                ContentType = ReadContentType(properties),
+                ReplyTo = ReadReplyTo(properties),
+                Headers = headers
+            };
         }
 
         private static MessageDeliveryMode? ReadDeliveryMode(IReadOnlyBasicProperties? properties)
