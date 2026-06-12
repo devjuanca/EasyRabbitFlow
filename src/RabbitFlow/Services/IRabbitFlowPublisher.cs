@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -206,6 +207,8 @@ namespace EasyRabbitFlow.Services
 
             var resolvedMessageId = string.IsNullOrEmpty(messageId) ? Guid.NewGuid().ToString("N") : messageId!;
 
+            using var activity = RabbitFlowDiagnostics.StartPublish(destination, routingKey, resolvedMessageId, correlationId);
+
             var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
             var serializerOptions = options?.JsonOptions ?? jsonOptions;
@@ -219,10 +222,16 @@ namespace EasyRabbitFlow.Services
                 logger.LogDebug("[RABBIT-FLOW]: Message of type {MessageType} published to {Destination}. MessageId={MessageId}",
                     typeof(TEvent).FullName, destination, resolvedMessageId);
 
+                RabbitFlowDiagnostics.PublishedMessages.Add(1, new KeyValuePair<string, object?>("destination", destination));
+
                 return PublishResult.Successful(destination, routingKey, resolvedMessageId);
             }
             catch (Exception ex)
             {
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+
+                RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
+
                 logger.LogError(ex, "[RABBIT-FLOW]: Error publishing message to {Destination}", destination);
 
                 return PublishResult.Failed(destination, routingKey, resolvedMessageId, ex);
@@ -244,6 +253,8 @@ namespace EasyRabbitFlow.Services
             }
 
             var messageIds = new List<string>(messages.Count);
+
+            using var activity = RabbitFlowDiagnostics.StartPublish(destination, routingKey, messageId: null, correlationId, messages.Count);
 
             var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
@@ -297,10 +308,16 @@ namespace EasyRabbitFlow.Services
                 logger.LogDebug("[RABBIT-FLOW]: Batch of {Count} messages published to {Destination}. Mode={Mode}",
                     messages.Count, destination, channelMode);
 
+                RabbitFlowDiagnostics.PublishedMessages.Add(messages.Count, new KeyValuePair<string, object?>("destination", destination));
+
                 return BatchPublishResult.Successful(destination, routingKey, channelMode, messages.Count, messageIds);
             }
             catch (Exception ex)
             {
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+
+                RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
+
                 if (channelMode == ChannelMode.Transactional)
                 {
                     try
@@ -335,7 +352,9 @@ namespace EasyRabbitFlow.Services
 
             var rk = isQueue ? destination : routingKey;
 
-            if (messageId == null && correlationId == null && options == null)
+            var hasTraceContext = RabbitFlowDiagnostics.HasCurrentW3CContext;
+
+            if (messageId == null && correlationId == null && options == null && !hasTraceContext)
             {
                 return channel.BasicPublishAsync(exchange, rk, body, cancellationToken);
             }
@@ -375,9 +394,22 @@ namespace EasyRabbitFlow.Services
                 {
                     properties.Timestamp = new AmqpTimestamp(options.Timestamp.Value.ToUnixTimeSeconds());
                 }
+            }
 
-                if (options.Headers != null) 
-                    properties.Headers = options.Headers;
+            if (hasTraceContext)
+            {
+                // Copy caller headers before injecting so the user's dictionary is never mutated
+                var headers = options?.Headers != null
+                    ? new Dictionary<string, object?>(options.Headers)
+                    : new Dictionary<string, object?>();
+
+                RabbitFlowDiagnostics.InjectContext(headers);
+
+                properties.Headers = headers;
+            }
+            else if (options?.Headers != null)
+            {
+                properties.Headers = options.Headers;
             }
 
             return channel.BasicPublishAsync(exchange, rk, false, properties, body, cancellationToken);
