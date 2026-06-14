@@ -201,11 +201,6 @@ namespace EasyRabbitFlow.Services
         {
             using var connection = await _connectionFactory.CreateConnectionAsync($"reprocessor_{_queueName}", ct).ConfigureAwait(false);
 
-            // Parking queue for messages that will never be re-enqueued (exhausted, permanent, malformed),
-            // so they don't churn through the DLQ on every cycle. Ensured here (not on the working channel)
-            // so a passive-declare 404 can't take the cycle's channel down with it.
-            await EnsureParkingQueueAsync(connection, ct).ConfigureAwait(false);
-
             using var channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
 
             uint initialCount;
@@ -225,6 +220,13 @@ namespace EasyRabbitFlow.Services
                 _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer}: DLQ {Dlq} is empty.", _consumerName, _deadLetterQueueName);
                 return;
             }
+
+            // Parking queue for messages that will never be re-enqueued (exhausted, permanent, malformed), so they
+            // don't churn through the DLQ on every cycle. Ensured only now that the DLQ actually has messages to
+            // drain, so the queue never appears on the broker unless the reprocessor really has dead messages to
+            // handle. Ensured on a throwaway channel (not the working one) so a passive-declare 404 can't take the
+            // cycle's channel down with it.
+            await EnsureParkingQueueAsync(connection, ct).ConfigureAwait(false);
 
             var toProcess = (int)Math.Min(initialCount, (uint)_maxMessagesPerCycle);
 
