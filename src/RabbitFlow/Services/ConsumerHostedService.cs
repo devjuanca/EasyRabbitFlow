@@ -112,9 +112,6 @@ namespace EasyRabbitFlow.Services
         private readonly int _rpMax;
         private readonly int _totalAttempts;
         private readonly int _rpInterval;
-        private readonly bool _rpExp;
-        private readonly int _rpFactor;
-        private readonly int _rpMaxDelay;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
@@ -199,12 +196,6 @@ namespace EasyRabbitFlow.Services
             _totalAttempts = _rpMax + 1;
             
             _rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
-            
-            _rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
-            
-            _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
-            
-            _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
 
             _autoGenObj = _autoGenerate
                 ? (root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType))
@@ -213,28 +204,8 @@ namespace EasyRabbitFlow.Services
 
             _prefetchSemaphore = new SemaphoreSlim(_prefetch);
 
-            long sumRetryDelaysMs = 0;
-
-            for (int attemptIndex = 1; attemptIndex <= _rpMax; attemptIndex++)
-            {
-                long d = _rpInterval;
-
-                if (_rpExp && attemptIndex > 1)
-                {
-                    try
-                    {
-                        var computed = checked((long)(_rpInterval * Math.Pow(_rpFactor, attemptIndex - 1)));
-                        
-                        d = Math.Min(computed, _rpMaxDelay);
-                    }
-                    catch 
-                    { 
-                        d = _rpMaxDelay; 
-                    }
-                }
-
-                sumRetryDelaysMs += d;
-            }
+            // Fixed interval between every retry: _rpMax retries means _rpMax delays of _rpInterval each.
+            long sumRetryDelaysMs = (long)_rpInterval * _rpMax;
 
             const long serverTimeoutGraceMs = 30_000;
 
@@ -658,23 +629,10 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
-            int attemptIndex = _totalAttempts - remainingAttempts + 1;
-            long delay = _rpInterval;
-
-            if (_rpExp && attemptIndex > 1)
+            try
             {
-                try
-                {
-                    var computed = checked(_rpInterval * (long)Math.Pow(_rpFactor, attemptIndex - 1));
-                    delay = Math.Min(computed, _rpMaxDelay);
-                }
-                catch { delay = _rpMaxDelay; }
+                await Task.Delay(_rpInterval, ct);
             }
-
-            try 
-            { 
-                await Task.Delay((int)delay, ct); 
-            } 
             catch { }
         }
 
@@ -750,17 +708,64 @@ namespace EasyRabbitFlow.Services
                         depth++;
                     }
 
+                    var queueTag = new KeyValuePair<string, object?>("queue", _queueName);
+
+                    byte[]? bytes = null;
+
                     try
                     {
-                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
-
-                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
-
-                        await channel.BasicAckAsync(deliveryTag, false, ct);
-
-                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                        bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Failed to serialize dead-letter envelope for {Consumer}; falling back to nack-driven dead-lettering.", _consumerType.Name);
+                    }
+
+                    var published = false;
+
+                    if (bytes != null)
+                    {
+                        try
+                        {
+                            await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
+
+                            published = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "[RABBIT-FLOW]: Failed to publish dead-letter envelope to {Exchange} for {Consumer}; falling back to nack-driven dead-lettering.", _deadLetterExchangeName, _consumerType.Name);
+                        }
+                    }
+
+                    if (published)
+                    {
+                        // Envelope is safely in the DLQ. Ack the original; if the ack fails the message will
+                        // be redelivered (at-least-once) and may yield a duplicate envelope on a later pass.
+                        try
+                        {
+                            await channel.BasicAckAsync(deliveryTag, false, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "[RABBIT-FLOW]: Dead-letter envelope published for {Consumer} but the ack of the original delivery failed; it may be redelivered.", _consumerType.Name);
+                        }
+
+                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, queueTag);
+                    }
+                    else
+                    {
+                        // The envelope could not be produced or published. Don't leave the original delivery
+                        // unacked: a persistent failure would have it redelivered, reprocessed, and re-failed
+                        // forever. Fall back to broker-native dead-lettering (the queue's x-dead-letter-exchange)
+                        // so the raw message still leaves the main queue and the redelivery loop is broken.
+                        try
+                        {
+                            await channel.BasicNackAsync(deliveryTag, false, false, ct);
+
+                            RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, queueTag);
+                        }
+                        catch { }
+                    }
                 }
                 else
                 {

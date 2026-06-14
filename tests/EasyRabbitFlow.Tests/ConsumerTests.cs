@@ -143,7 +143,6 @@ public class ConsumerTests
                 {
                     r.MaxRetryCount = 3;
                     r.RetryInterval = 100;
-                    r.ExponentialBackoff = false;
                 });
                 cfg.ConfigureAutoGenerate(ag =>
                 {

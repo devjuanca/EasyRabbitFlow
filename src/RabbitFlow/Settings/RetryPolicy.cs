@@ -2,8 +2,9 @@
 {
     /// <summary>
     /// Represents the retry policy settings for handling message processing retries in the RabbitFlow consumer.
-    /// This class provides configuration options for controlling how the system should behave when message processing fails,
-    /// including the number of retry attempts, intervals between retries, and optional use of exponential backoff.
+    /// This class provides configuration options for controlling how the system should behave when message processing fails:
+    /// the number of retry attempts and the fixed interval between them. Retries apply only to transient failures and run
+    /// in-process while the delivery stays unacknowledged, so this policy is intended for short, ephemeral recovery only.
     /// </summary>
     /// <typeparam name="TConsumer">The type of the consumer that this retry policy applies to.</typeparam>
     public class RetryPolicy<TConsumer> where TConsumer : class
@@ -20,30 +21,13 @@
         public int MaxRetryCount { get; set; } = 0;
 
         /// <summary>
-        /// Gets or sets the time interval (in milliseconds) between retry attempts.
+        /// Gets or sets the fixed time interval (in milliseconds) waited between retry attempts.
+        /// The delay is constant across all retries by design: the in-handler retry policy is meant for
+        /// short, ephemeral transient failures (a brief network blip, a momentary 5xx, a transient deadlock).
+        /// Keep this small. For failures that take minutes to resolve, use the dead-letter reprocessor instead,
+        /// which retries on a slow recovery cadence without holding the delivery unacknowledged.
         /// The default value is 1000 milliseconds (1 second).
         /// </summary>
         public int RetryInterval { get; set; } = 1000;
-
-        /// <summary>
-        /// Gets or sets a value indicating whether to use exponential backoff for retry intervals.
-        /// If set to <c>true</c>, the retry interval will increase exponentially with each retry attempt.
-        /// The default value is <c>false</c>, meaning the retry interval remains constant.
-        /// </summary>
-        public bool ExponentialBackoff { get; set; } = false;
-
-        /// <summary>
-        /// Gets or sets the factor by which to multiply the retry interval for each exponential backoff attempt.
-        /// This value is used only if <see cref="ExponentialBackoff"/> is set to <c>true</c>.
-        /// The default value is 1, meaning the retry interval will double with each retry.
-        /// </summary>
-        public int ExponentialBackoffFactor { get; set; } = 1;
-
-        /// <summary>
-        /// Gets or sets the maximum delay (in milliseconds) allowed between retries when using exponential backoff.
-        /// This acts as an upper bound to prevent retry delays from growing indefinitely.
-        /// The default value is 60000 milliseconds (60 seconds).
-        /// </summary>
-        public int MaxRetryDelay { get; set; } = 60_000;
     }
 }

@@ -36,6 +36,12 @@ The in-process retry policy, the dead-letter envelope, and the reprocessor now s
 
 Exhausted, permanent, and malformed messages are moved once to `{queue}-deadletter-parking` (declared durable by the reprocessor) instead of rotating through the DLQ on every cycle. Tooling or operators that inspected those messages in the DLQ should look at the parking queue instead. See [Dead-Letter Reprocessor](#dead-letter-reprocessor).
 
+**Retry policy is now a fixed interval — exponential backoff removed**
+
+`RetryPolicy<TConsumer>` no longer exposes `ExponentialBackoff`, `ExponentialBackoffFactor`, or `MaxRetryDelay`. The in-handler retry is intentionally scoped to short, ephemeral transient failures, so it now always waits a constant `RetryInterval` between attempts. For failures that take minutes to resolve, use the [dead-letter reprocessor](#dead-letter-reprocessor), which retries on a slow recovery cadence without holding the delivery unacknowledged. See [Retry Policies](#retry-policies).
+
+**Migration:** delete `ExponentialBackoff`, `ExponentialBackoffFactor`, and `MaxRetryDelay` from your `ConfigureRetryPolicy(...)` calls (they no longer compile). Keep `MaxRetryCount` and `RetryInterval`. If you relied on long backoff windows, move that workload to the dead-letter reprocessor instead.
+
 **Other changes (non-breaking but notable)**
 
 - Multi-targeting: `netstandard2.1` + `net8.0`.
@@ -286,7 +292,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 | Fluent, strongly-typed configuration | ✅ |
 | Automatic queue / exchange / dead-letter generation | ✅ |
 | Reflection-free per-message processing | ✅ |
-| Configurable retry with exponential backoff | ✅ |
+| Configurable in-process retry for transient failures | ✅ |
 | Temporary batch processing with auto-cleanup | ✅ |
 | Queue state & purge utilities | ✅ |
 | Full DI integration (scoped/transient/singleton) | ✅ |
@@ -430,8 +436,7 @@ builder.Services
             c.ConfigureRetryPolicy(r =>
             {
                 r.MaxRetryCount = 3;
-                r.ExponentialBackoff = true;
-                r.ExponentialBackoffFactor = 2;
+                r.RetryInterval = 1000;
             });
         });
     })
@@ -710,12 +715,16 @@ Configure how failed messages are retried:
 c.ConfigureRetryPolicy(r =>
 {
     r.MaxRetryCount = 4;               // Number of retries after the initial attempt fails (5 attempts total)
-    r.RetryInterval = 1000;            // Base delay in ms
-    r.ExponentialBackoff = true;        // Enable exponential backoff
-    r.ExponentialBackoffFactor = 2;     // Multiply delay by this factor
-    r.MaxRetryDelay = 30_000;           // Cap delay at 30 seconds
+    r.RetryInterval = 1000;            // Fixed delay between retries, in ms
 });
 ```
+
+The in-handler retry policy runs **in-process** while the delivery stays unacknowledged, and it only
+retries **transient** failures (see [Transient Exceptions](#transient-exceptions-and-custom-retry-logic)). It uses a **fixed**
+interval by design — it is meant for short, ephemeral hiccups (a brief network blip, a momentary 5xx,
+a transient deadlock). Keep `RetryInterval` small. For failures that take minutes to resolve, rely on
+the [dead-letter reprocessor](#dead-letter-reprocessor) instead, which retries on a slow recovery
+cadence without holding the delivery open.
 
 `MaxRetryCount` counts **retries**, not total attempts:
 
@@ -723,23 +732,20 @@ c.ConfigureRetryPolicy(r =>
 - `1` — one retry after the first failure (up to 2 attempts).
 - `4` — four retries after the first failure (up to 5 attempts).
 
-**Example: retry timeline with `MaxRetryCount = 4` and exponential backoff (factor=2, base=1000ms):**
+**Example: retry timeline with `MaxRetryCount = 4` and `RetryInterval = 1000`:**
 
 ```text
 Attempt 1 → fail → wait 1000ms
-Attempt 2 → fail → wait 2000ms
-Attempt 3 → fail → wait 4000ms
-Attempt 4 → fail → wait 8000ms
+Attempt 2 → fail → wait 1000ms
+Attempt 3 → fail → wait 1000ms
+Attempt 4 → fail → wait 1000ms
 Attempt 5 → fail → sent to dead-letter queue
 ```
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `MaxRetryCount` | int | `0` | Number of retries after the initial attempt fails (`0` = no retries) |
-| `RetryInterval` | int | `1000` | Base delay between retries (ms) |
-| `ExponentialBackoff` | bool | `false` | Enable exponential backoff |
-| `ExponentialBackoffFactor` | int | `1` | Multiplier for exponential growth |
-| `MaxRetryDelay` | int | `60000` | Upper bound for delay (ms) |
+| `RetryInterval` | int | `1000` | Fixed delay between retries (ms) |
 
 ### Consumer Timeout
 
@@ -1787,10 +1793,7 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
     c.ConfigureRetryPolicy(r =>
     {
         r.MaxRetryCount = 3;
-        r.RetryInterval = 500;
-        r.ExponentialBackoff = true;
-        r.ExponentialBackoffFactor = 2;
-        r.MaxRetryDelay = 10_000;                  // Cap at 10 seconds
+        r.RetryInterval = 500;                     // Fixed, ephemeral delay between retries
     });
 });
 
