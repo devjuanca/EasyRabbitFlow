@@ -143,10 +143,10 @@ namespace EasyRabbitFlow.Services
             _serializerOptions = serializerOptions;
             _consumerName = consumerName;
             _queueName = queueName;
-            _deadLetterQueueName = $"{queueName}-deadletter";
-            _deadLetterExchangeName = $"{queueName}-deadletter-exchange";
-            _deadLetterRoutingKey = $"{queueName}-deadletter-routing-key";
-            _parkingQueueName = $"{queueName}-deadletter-parking";
+            _deadLetterQueueName = RabbitFlowTopologyNames.DeadLetterQueue(queueName);
+            _deadLetterExchangeName = RabbitFlowTopologyNames.DeadLetterExchange(queueName);
+            _deadLetterRoutingKey = RabbitFlowTopologyNames.DeadLetterRoutingKey(queueName);
+            _parkingQueueName = RabbitFlowTopologyNames.ParkingQueue(queueName);
             _maxAttempts = maxAttempts;
             _interval = interval;
             _maxMessagesPerCycle = maxMessagesPerCycle;

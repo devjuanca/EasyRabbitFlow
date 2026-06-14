@@ -759,23 +759,28 @@ Internally it drives a `CancellationTokenSource` passed to `HandleAsync`. On tim
 
 **Server-side timeout (`x-consumer-timeout`)**
 
-RabbitMQ also enforces its own per-queue delivery acknowledgement timeout (default 30 minutes). If a message is not acked within that window, the broker closes the channel with `PRECONDITION_FAILED` and requeues the message.
+RabbitMQ enforces a delivery acknowledgement timeout: if a message is not acked within the window, the broker closes the channel and redelivers the message. Because the in-process retry policy holds the delivery **unacknowledged** for the whole retry cycle, that cycle must fit inside this window.
 
-When `AutoGenerate = true`, EasyRabbitFlow automatically sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
+- The timeout was introduced in **RabbitMQ 3.8.15** as a **broker-wide** setting (`consumer_timeout`), default 15 minutes — raised to **30 minutes in 3.8.17**.
+- Overriding it **per queue** via the `x-consumer-timeout` queue argument requires **RabbitMQ 3.12+**. On older brokers the argument is ignored and only the broker-wide `consumer_timeout` applies — so a long `Timeout` there must be accommodated by raising `consumer_timeout` on the broker instead.
+
+When `AutoGenerate = true`, EasyRabbitFlow sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
 
 ```text
-x-consumer-timeout = Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace
+x-consumer-timeout = max(60s, Timeout × (MaxRetryCount + 1) + RetryInterval × MaxRetryCount + 30s grace)
 ```
 
-This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
+The value is floored at 60s because RabbitMQ rejects consumer timeouts below one minute. This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
 
 **Channel recovery**
 
 If the broker does close a channel (timeout exceeded, protocol violation, etc.), EasyRabbitFlow automatically recreates the channel, re-applies QoS, and re-subscribes the consumer — with exponential backoff between attempts (1s, 2s, 4s… capped at 30s). Connection-level closures are handled the same way.
 
-> **⚠️ Migration note (upgrading from < 5.1.0)**
+> **⚠️ Queue arguments are immutable in RabbitMQ**
 >
-> Queue arguments are immutable in RabbitMQ. If you had a queue created by a previous version (without `x-consumer-timeout`), the next startup with `AutoGenerate = true` will fail with `PRECONDITION_FAILED: inequivalent arg 'x-consumer-timeout'`.
+> Because `x-consumer-timeout` is **derived** from `Timeout`, `MaxRetryCount` and `RetryInterval`, changing any of those settings changes the value the consumer tries to declare. RabbitMQ does not allow redeclaring an existing queue with different arguments, so the next startup with `AutoGenerate = true` fails with `PRECONDITION_FAILED: inequivalent arg 'x-consumer-timeout'`. The same happens when upgrading from a version (< 5.1.0) that created the queue without the argument at all.
+>
+> EasyRabbitFlow detects this specific failure and logs an explicit, actionable error naming the queue (instead of surfacing it as a cryptic channel shutdown and silent recovery loop). When you see it:
 >
 > **Options:**
 >

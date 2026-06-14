@@ -209,7 +209,13 @@ namespace EasyRabbitFlow.Services
 
             const long serverTimeoutGraceMs = 30_000;
 
-            _serverConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _totalAttempts) + sumRetryDelaysMs + serverTimeoutGraceMs;
+            // RabbitMQ rejects consumer timeouts below one minute, so floor the computed value at 60s.
+            // (A short Timeout with no retries can otherwise land under the minimum.)
+            const long minConsumerTimeoutMs = 60_000;
+
+            var computedConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _totalAttempts) + sumRetryDelaysMs + serverTimeoutGraceMs;
+
+            _serverConsumerTimeoutMs = Math.Max(minConsumerTimeoutMs, computedConsumerTimeoutMs);
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -346,9 +352,9 @@ namespace EasyRabbitFlow.Services
         {
             var autoGenObj = _autoGenObj!;
 
-            var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? $"{_queueName}-exchange";
+            var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? RabbitFlowTopologyNames.Exchange(_queueName);
 
-            var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? $"{_queueName}-routing-key";
+            var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? RabbitFlowTopologyNames.RoutingKey(_queueName);
 
             var generateDeadletter = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateDeadletterQueue))?.GetValue(autoGenObj) ?? false;
 
@@ -382,11 +388,11 @@ namespace EasyRabbitFlow.Services
 
             if (generateDeadletter)
             {
-                _deadLetterQueueName = $"{_queueName}-deadletter";
+                _deadLetterQueueName = RabbitFlowTopologyNames.DeadLetterQueue(_queueName);
 
-                _deadLetterExchangeName = $"{_queueName}-deadletter-exchange";
+                _deadLetterExchangeName = RabbitFlowTopologyNames.DeadLetterExchange(_queueName);
 
-                _deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
+                _deadLetterRoutingKey = RabbitFlowTopologyNames.DeadLetterRoutingKey(_queueName);
 
                 await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
 
@@ -453,7 +459,25 @@ namespace EasyRabbitFlow.Services
                 args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
             }
 
-            await channel.QueueDeclareAsync(_queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
+            try
+            {
+                await channel.QueueDeclareAsync(_queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
+            }
+            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
+            {
+                // PRECONDITION_FAILED: the queue already exists with arguments that differ from what we're
+                // declaring. The most common cause is a changed Timeout/MaxRetryCount/RetryInterval altering the
+                // derived x-consumer-timeout. Surface a clear, actionable error instead of letting this surface
+                // as a cryptic channel shutdown and silent recovery loop. The channel is dead after a 406, so rethrow.
+                _logger.LogError(ex,
+                    "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the auto-generated topology " +
+                    "(commonly a changed Timeout/MaxRetryCount/RetryInterval, which alters the derived x-consumer-timeout). " +
+                    "RabbitMQ rejected the redeclaration with PRECONDITION_FAILED. Delete or migrate the queue, or revert the " +
+                    "changed settings, before the consumer for {Consumer} can start.",
+                    _queueName, _consumerType.Name);
+
+                throw;
+            }
 
             if (generateExchange)
             {
