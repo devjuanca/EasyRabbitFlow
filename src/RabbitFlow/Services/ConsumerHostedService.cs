@@ -462,6 +462,10 @@ namespace EasyRabbitFlow.Services
 
             args ??= new Dictionary<string, object?>();
 
+            // x-consumer-timeout only takes effect when the queue is first created. Unlike most x-arguments,
+            // RabbitMQ treats it as optional and silently ignores a changed value on redeclare (no
+            // PRECONDITION_FAILED), so changing Timeout/MaxRetryCount/RetryInterval on an existing queue does NOT
+            // update it — the queue must be deleted and recreated (or a consumer-timeout policy applied) to change it.
             if (!args.ContainsKey("x-consumer-timeout"))
             {
                 args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
@@ -479,10 +483,12 @@ namespace EasyRabbitFlow.Services
 
         // Declares the main queue on a throwaway channel so an argument mismatch (PRECONDITION_FAILED) can't take
         // the consumer's channel down with it. If the queue is missing it is created with these arguments; if it
-        // already exists with identical arguments the declare is a harmless no-op. Only a genuine mismatch reaches
-        // the catch — most commonly a stale x-consumer-timeout from a changed Timeout/MaxRetryCount/RetryInterval.
-        // In that case we adopt the existing queue and keep running rather than crashing the consumer: a running
-        // consumer with a stale server-side timeout beats one that won't start and silently leaves the system idle.
+        // already exists with identical arguments the declare is a harmless no-op. A genuine mismatch reaches the
+        // catch only for arguments RabbitMQ verifies for equivalence (x-dead-letter-exchange/-routing-key,
+        // x-max-priority, custom Args). Note x-consumer-timeout is NOT one of them: the broker silently ignores a
+        // changed value on redeclare, so a stale server-side timeout never surfaces here (see DeclareTopologyAsync).
+        // On mismatch we adopt the existing queue and keep running rather than crashing the consumer: a running
+        // consumer beats one that won't start and silently leaves the system idle.
         private async Task DeclareOrAdoptMainQueueAsync(bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?> args, CancellationToken ct)
         {
             try
@@ -495,10 +501,9 @@ namespace EasyRabbitFlow.Services
             {
                 _logger.LogWarning(
                     "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the current configuration " +
-                    "(commonly a changed Timeout/MaxRetryCount/RetryInterval, which alters the derived x-consumer-timeout). " +
+                    "(e.g. x-dead-letter-exchange/-routing-key, x-max-priority, or custom Args). " +
                     "The consumer for {Consumer} will keep running against the EXISTING queue and its current arguments. " +
-                    "If its x-consumer-timeout is too low for your retry cycle the broker may close the channel mid-retry; " +
-                    "to apply the new arguments, delete queue '{Queue}' and let the consumer recreate it.",
+                    "To apply the new arguments, delete queue '{Queue}' and let the consumer recreate it.",
                     _queueName, _consumerType.Name, _queueName);
             }
         }

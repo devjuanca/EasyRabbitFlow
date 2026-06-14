@@ -779,26 +779,25 @@ x-consumer-timeout = max(60s, Timeout × (MaxRetryCount + 1) + RetryInterval × 
 
 The value is floored at 60s because RabbitMQ rejects consumer timeouts below one minute. This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
 
+> **⚠️ `x-consumer-timeout` only applies when the queue is first created**
+>
+> Unlike most queue arguments, RabbitMQ treats `x-consumer-timeout` as *optional* and **silently ignores a changed value when an existing queue is redeclared** — no `PRECONDITION_FAILED`, no error, no warning. So if you change `Timeout`, `MaxRetryCount`, or `RetryInterval` on a queue that already exists, the new `x-consumer-timeout` is **not** applied: the queue keeps its original value. **To make the change take effect, delete and recreate the queue** (or apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) on the broker, which *can* be changed in place). This is specific to `x-consumer-timeout`; other arguments (`x-dead-letter-exchange`, `x-max-priority`, custom `Args`) **are** verified on redeclare — see the **Queue arguments are immutable in RabbitMQ** note below.
+
 **Channel recovery**
 
 If the broker does close a channel (timeout exceeded, protocol violation, etc.), EasyRabbitFlow automatically recreates the channel, re-applies QoS, and re-subscribes the consumer — with exponential backoff between attempts (1s, 2s, 4s… capped at 30s). Connection-level closures are handled the same way.
 
 > **⚠️ Queue arguments are immutable in RabbitMQ**
 >
-> Because `x-consumer-timeout` is **derived** from `Timeout`, `MaxRetryCount` and `RetryInterval`, changing any of those settings changes the value the consumer would declare. RabbitMQ does not allow redeclaring an existing queue with different arguments. The same situation arises when upgrading from a version (< 5.1.0) that created the queue without the argument at all.
+> Arguments that RabbitMQ verifies for equivalence — `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-message-ttl`, `x-max-length`, `x-max-priority`, `durable`, and any custom `Args` — cannot be changed by redeclaring an existing queue: the broker rejects the declare with `PRECONDITION_FAILED`. (The derived `x-consumer-timeout` is the exception — it is silently *ignored* rather than rejected; see the note above.)
 >
-> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue. A running consumer with a slightly stale server-side timeout is safer than one that won't start and silently leaves the system idle. The trade-off: a stale `x-consumer-timeout` that is too low for your retry cycle could let the broker close the channel mid-retry. To apply the new arguments:
+> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue — a running consumer is safer than one that won't start and silently leaves the system idle. To actually apply the new arguments:
 >
 > **Options:**
 >
->
 > 1. Delete the queue and let EasyRabbitFlow recreate it.
->
->
-
-> 2. Apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) to the existing queue on the broker and add `x-consumer-timeout` with the same value to `AutoGenerateSettings.Args` so the declare matches.
-
-> 3. Set `AutoGenerate = false` and manage the queue yourself (via policy on the broker).
+> 2. Apply the change via a broker policy where the argument supports it (e.g. a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout)), and add the matching value to `AutoGenerateSettings.Args` so the declare matches.
+> 3. Set `AutoGenerate = false` and manage the queue yourself.
 
 ### Dead-Letter Replicas
 
