@@ -149,10 +149,10 @@ namespace EasyRabbitFlow.Settings
         /// When <see cref="AutoGenerate"/> is <c>true</c>, this value (together with the retry policy) drives the
         /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't kill the consumer while it retries in
         /// process. Because queue arguments are immutable, changing <see cref="Timeout"/>, <c>MaxRetryCount</c>, or
-        /// <c>RetryInterval</c> on a queue that already exists requires recreating or migrating the queue
-        /// (the consumer logs an explicit <c>PRECONDITION_FAILED</c> error if they no longer match). The per-queue
-        /// <c>x-consumer-timeout</c> override requires RabbitMQ 3.12+; on older brokers raise <c>consumer_timeout</c>
-        /// at the broker level instead.
+        /// <c>RetryInterval</c> on a queue that already exists won't update that argument: the consumer adopts the
+        /// existing queue as-is and logs a warning (it does not crash). Delete and recreate the queue to apply the
+        /// new value. The per-queue <c>x-consumer-timeout</c> override requires RabbitMQ 3.12+; on older brokers
+        /// raise <c>consumer_timeout</c> at the broker level instead.
         /// </remarks>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 

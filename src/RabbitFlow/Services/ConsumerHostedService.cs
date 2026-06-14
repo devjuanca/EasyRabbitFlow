@@ -459,31 +459,39 @@ namespace EasyRabbitFlow.Services
                 args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
             }
 
-            try
-            {
-                await channel.QueueDeclareAsync(_queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
-            }
-            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
-            {
-                // PRECONDITION_FAILED: the queue already exists with arguments that differ from what we're
-                // declaring. The most common cause is a changed Timeout/MaxRetryCount/RetryInterval altering the
-                // derived x-consumer-timeout. Surface a clear, actionable error instead of letting this surface
-                // as a cryptic channel shutdown and silent recovery loop. The channel is dead after a 406, so rethrow.
-                _logger.LogError(ex,
-                    "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the auto-generated topology " +
-                    "(commonly a changed Timeout/MaxRetryCount/RetryInterval, which alters the derived x-consumer-timeout). " +
-                    "RabbitMQ rejected the redeclaration with PRECONDITION_FAILED. Delete or migrate the queue, or revert the " +
-                    "changed settings, before the consumer for {Consumer} can start.",
-                    _queueName, _consumerType.Name);
-
-                throw;
-            }
+            await DeclareOrAdoptMainQueueAsync(durableQueue, exclusiveQueue, autoDeleteQueue, args, ct);
 
             if (generateExchange)
             {
                 await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
                 
                 await channel.QueueBindAsync(_queueName, exchangeName, routingKey);
+            }
+        }
+
+        // Declares the main queue on a throwaway channel so an argument mismatch (PRECONDITION_FAILED) can't take
+        // the consumer's channel down with it. If the queue is missing it is created with these arguments; if it
+        // already exists with identical arguments the declare is a harmless no-op. Only a genuine mismatch reaches
+        // the catch — most commonly a stale x-consumer-timeout from a changed Timeout/MaxRetryCount/RetryInterval.
+        // In that case we adopt the existing queue and keep running rather than crashing the consumer: a running
+        // consumer with a stale server-side timeout beats one that won't start and silently leaves the system idle.
+        private async Task DeclareOrAdoptMainQueueAsync(bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?> args, CancellationToken ct)
+        {
+            try
+            {
+                using var declareChannel = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+                await declareChannel.QueueDeclareAsync(_queueName, durable, exclusive, autoDelete, args, cancellationToken: ct).ConfigureAwait(false);
+            }
+            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
+            {
+                _logger.LogWarning(
+                    "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the current configuration " +
+                    "(commonly a changed Timeout/MaxRetryCount/RetryInterval, which alters the derived x-consumer-timeout). " +
+                    "The consumer for {Consumer} will keep running against the EXISTING queue and its current arguments. " +
+                    "If its x-consumer-timeout is too low for your retry cycle the broker may close the channel mid-retry; " +
+                    "to apply the new arguments, delete queue '{Queue}' and let the consumer recreate it.",
+                    _queueName, _consumerType.Name, _queueName);
             }
         }
 

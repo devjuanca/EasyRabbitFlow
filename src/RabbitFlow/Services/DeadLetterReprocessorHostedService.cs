@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -128,6 +129,8 @@ namespace EasyRabbitFlow.Services
 
         private Task? _runTask;
 
+        private bool _parkingQueueExistsLogged;
+
         public DeadLetterReprocessWorker(
             ILogger logger,
             ConnectionFactory connectionFactory,
@@ -198,11 +201,12 @@ namespace EasyRabbitFlow.Services
         {
             using var connection = await _connectionFactory.CreateConnectionAsync($"reprocessor_{_queueName}", ct).ConfigureAwait(false);
 
-            using var channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
-
             // Parking queue for messages that will never be re-enqueued (exhausted, permanent, malformed),
-            // so they don't churn through the DLQ on every cycle.
-            await channel.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, cancellationToken: ct).ConfigureAwait(false);
+            // so they don't churn through the DLQ on every cycle. Ensured here (not on the working channel)
+            // so a passive-declare 404 can't take the cycle's channel down with it.
+            await EnsureParkingQueueAsync(connection, ct).ConfigureAwait(false);
+
+            using var channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
 
             uint initialCount;
 
@@ -331,6 +335,43 @@ namespace EasyRabbitFlow.Services
 
             _logger.LogInformation("[RABBIT-FLOW]: Reprocessor cycle for {Consumer} done. Reenqueued={Reenqueued}, Parked: Exhausted={Exhausted}, Permanent={Permanent}, Malformed={Malformed}.",
                 _consumerName, reenqueued, exhausted, permanent, malformed);
+        }
+
+        // Make sure the parking queue exists without fighting over its arguments. We probe with a passive
+        // declare (which never compares arguments): if the queue already exists we use it as-is, so an
+        // operator's deliberate settings (TTL, queue type, max-length, ...) are respected and we never hit
+        // PRECONDITION_FAILED. Only when it's missing (404) do we create it with defaults. The probe runs on a
+        // throwaway channel because a 404 closes the channel it runs on.
+        private async Task EnsureParkingQueueAsync(IConnection connection, CancellationToken ct)
+        {
+            try
+            {
+                using var probe = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+                await probe.QueueDeclarePassiveAsync(_parkingQueueName, ct).ConfigureAwait(false);
+
+                if (!_parkingQueueExistsLogged)
+                {
+                    _parkingQueueExistsLogged = true;
+
+                    _logger.LogInformation(
+                        "[RABBIT-FLOW]: Parking queue '{Parking}' already exists; using it as-is. To apply different " +
+                        "arguments (TTL, queue type, max-length, ...), delete the queue and the reprocessor will recreate it with defaults.",
+                        _parkingQueueName);
+                }
+
+                return;
+            }
+            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 404)
+            {
+                // Not found: fall through and create it on a fresh channel (the probe channel is now closed).
+            }
+
+            using var create = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+            await create.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, cancellationToken: ct).ConfigureAwait(false);
+
+            _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}'.", _parkingQueueName);
         }
 
         private static BasicProperties BuildRestoredProperties(DeadLetterEnvelope envelope, int newAttempts)

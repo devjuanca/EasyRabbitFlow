@@ -778,9 +778,9 @@ If the broker does close a channel (timeout exceeded, protocol violation, etc.),
 
 > **⚠️ Queue arguments are immutable in RabbitMQ**
 >
-> Because `x-consumer-timeout` is **derived** from `Timeout`, `MaxRetryCount` and `RetryInterval`, changing any of those settings changes the value the consumer tries to declare. RabbitMQ does not allow redeclaring an existing queue with different arguments, so the next startup with `AutoGenerate = true` fails with `PRECONDITION_FAILED: inequivalent arg 'x-consumer-timeout'`. The same happens when upgrading from a version (< 5.1.0) that created the queue without the argument at all.
+> Because `x-consumer-timeout` is **derived** from `Timeout`, `MaxRetryCount` and `RetryInterval`, changing any of those settings changes the value the consumer would declare. RabbitMQ does not allow redeclaring an existing queue with different arguments. The same situation arises when upgrading from a version (< 5.1.0) that created the queue without the argument at all.
 >
-> EasyRabbitFlow detects this specific failure and logs an explicit, actionable error naming the queue (instead of surfacing it as a cryptic channel shutdown and silent recovery loop). When you see it:
+> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue. A running consumer with a slightly stale server-side timeout is safer than one that won't start and silently leaves the system idle. The trade-off: a stale `x-consumer-timeout` that is too low for your retry cycle could let the broker close the channel mid-retry. To apply the new arguments:
 >
 > **Options:**
 >
@@ -911,6 +911,8 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 ```
 
 If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle.
+
+The parking queue is created on demand the first time the reprocessor needs it (the consumer never declares it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, no extra args).
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
