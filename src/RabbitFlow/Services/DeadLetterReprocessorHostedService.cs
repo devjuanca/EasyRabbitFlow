@@ -131,6 +131,13 @@ namespace EasyRabbitFlow.Services
 
         private bool _parkingQueueExistsLogged;
 
+        // Publisher confirms for the working channel: every re-enqueue/park is a publish-then-ack pair, and we must
+        // know the publish reached the broker before acking it off the DLQ. With tracking enabled BasicPublishAsync
+        // awaits the broker ack and throws on failure, so an unconfirmed publish aborts before the ack and the
+        // message stays safely in the DLQ instead of being lost.
+        private static readonly CreateChannelOptions ConfirmChannelOptions =
+            new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
+
         public DeadLetterReprocessWorker(
             ILogger logger,
             ConnectionFactory connectionFactory,
@@ -201,7 +208,7 @@ namespace EasyRabbitFlow.Services
         {
             using var connection = await _connectionFactory.CreateConnectionAsync($"reprocessor_{_queueName}", ct).ConfigureAwait(false);
 
-            using var channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+            using var channel = await connection.CreateChannelAsync(ConfirmChannelOptions, cancellationToken: ct).ConfigureAwait(false);
 
             uint initialCount;
 

@@ -257,6 +257,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 - [Consumers](#consumers)
   - [Implementing a Consumer](#implementing-a-consumer)
   - [Registering Consumers](#registering-consumers)
+  - [Dead-Letter Delivery Guarantee](#dead-letter-delivery-guarantee)
   - [Reserved Name Substrings](#reserved-name-substrings)
   - [Auto-Generate Topology](#auto-generate-topology)
   - [Retry Policies](#retry-policies)
@@ -596,6 +597,12 @@ cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 | `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details |
 | `UnwrapDeadLetterEnvelopes` | bool | `false` | Defensive safety net: detect a `DeadLetterEnvelope` arriving on the main queue (e.g. from a manual DLQ replay) and process the inner payload. See [Manual DLQ Replay Safety Net](#manual-dlq-replay-safety-net). |
 | `DisableNameValidation` | bool | `false` | Skip validation of reserved substrings (`deadletter`, `-exchange`, `-routing-key`) against the queue name and any auto-generate names. See [Reserved Name Substrings](#reserved-name-substrings). Only honored when `AutoGenerate = false`. |
+
+### Dead-Letter Delivery Guarantee
+
+When a message exhausts its retries it is guaranteed to leave the main queue and reach the DLQ — it is never silently dropped. The `DeadLetterEnvelope` is published on a **publisher-confirms** channel, so the `await` only completes once the broker has confirmed receipt; if the publish is not confirmed (or serialization fails), the consumer falls back to broker-native `nack` dead-lettering. The dead-letter reprocessor uses confirms too: a re-enqueue or park only acks the message off the DLQ after the broker confirms the new copy, so an unconfirmed publish leaves the message safely on the DLQ.
+
+This closes the message-**loss** window. It does **not** provide exactly-once delivery: a confirmed publish whose subsequent ack fails is redelivered, so a message can reach the DLQ — or be reprocessed — more than once. As with any at-least-once broker, make consumers idempotent; see [Idempotency](#idempotency).
 
 ### Reserved Name Substrings
 

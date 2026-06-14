@@ -118,6 +118,14 @@ namespace EasyRabbitFlow.Services
         private readonly SemaphoreSlim _recoveryGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _prefetchSemaphore;
 
+        // Publisher confirms for the consumer channel: the only thing this channel publishes is the dead-letter
+        // envelope, and we must know it actually reached the broker before acking the original delivery. With
+        // tracking enabled, BasicPublishAsync awaits the broker ack and throws if the message is not confirmed,
+        // so a lost publish surfaces as an exception and falls back to nack-driven dead-lettering instead of
+        // silently dropping the message. Consuming on a confirm-enabled channel is unaffected.
+        private static readonly CreateChannelOptions ConfirmChannelOptions =
+            new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
+
         private IConnection? _connection;
         private IChannel? _channel;
         private string _deadLetterQueueName = string.Empty;
@@ -310,7 +318,7 @@ namespace EasyRabbitFlow.Services
 
             DisposeChannel();
 
-            _channel = await _connection!.CreateChannelAsync(cancellationToken: ct);
+            _channel = await _connection!.CreateChannelAsync(ConfirmChannelOptions, cancellationToken: ct);
 
             _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
             
