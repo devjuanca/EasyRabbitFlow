@@ -1,6 +1,7 @@
 using EasyRabbitFlow;
 using EasyRabbitFlow.Services;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Hosting;
 using RabbitMQ.Client;
 using Testcontainers.RabbitMq;
@@ -59,7 +60,10 @@ public class RabbitMqFixture : IAsyncLifetime
     public IServiceProvider BuildServiceProviderWithConsumers(Action<RabbitFlowConfigurator> configure)
     {
         var services = new ServiceCollection();
-        services.AddLogging();
+
+        // Capture library logs into a static buffer so timing-sensitive tests (e.g. recovery) can surface what
+        // the library actually did on failure. See MemoryLogSink.
+        services.AddLogging(b => b.AddProvider(new EasyRabbitFlow.Tests.Helpers.MemoryLoggerProvider()).SetMinimumLevel(LogLevel.Debug));
 
         services.AddRabbitFlow(settings =>
         {
@@ -77,6 +81,17 @@ public class RabbitMqFixture : IAsyncLifetime
         services.UseRabbitFlowConsumers();
 
         return services.BuildServiceProvider();
+    }
+
+    /// <summary>
+    /// Forces the broker to drop every open connection (consumers, publisher, verification),
+    /// simulating an abrupt network/broker outage so recovery paths can be exercised.
+    /// Returns the <c>rabbitmqctl</c> exit code (0 on success).
+    /// </summary>
+    public async Task<long> CloseAllConnectionsAsync(string reason = "regression-test")
+    {
+        var result = await _container.ExecAsync(new[] { "rabbitmqctl", "close_all_connections", reason });
+        return result.ExitCode ?? -1;
     }
 
     /// <summary>
