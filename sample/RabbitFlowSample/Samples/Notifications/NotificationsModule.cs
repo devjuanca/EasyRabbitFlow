@@ -34,9 +34,7 @@ public static class NotificationsModule
             c.ConfigureRetryPolicy(r =>
             {
                 r.MaxRetryCount = 1;             // one retry after the initial attempt
-                r.RetryInterval = 1000;
-                r.ExponentialBackoff = true;
-                r.ExponentialBackoffFactor = 2;
+                r.RetryInterval = 1000;         // fixed, ephemeral delay between retries
             });
 
             c.ExtendDeadletterMessage = true;    // wrap failed messages in DeadLetterEnvelope

@@ -66,6 +66,60 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         [JsonPropertyName("reprocessAttempts")]
         public int ReprocessAttempts { get; set; }
+
+        /// <summary>
+        /// Whether the recorded failure was classified as transient (retryable) when it was captured,
+        /// honoring exception inheritance and transient HTTP status codes.
+        /// <c>null</c> on envelopes written by library versions prior to this field; the reprocessor then
+        /// falls back to exact exception type-name matching.
+        /// </summary>
+        [JsonPropertyName("isTransient")]
+        public bool? IsTransient { get; set; }
+
+        /// <summary>
+        /// AMQP properties of the original message, captured at failure time so the dead-letter
+        /// reprocessor can restore them faithfully when re-enqueueing to the main queue.
+        /// <c>null</c> on envelopes written by library versions prior to this field.
+        /// </summary>
+        [JsonPropertyName("properties")]
+        public DeadLetterMessageProperties? Properties { get; set; }
+    }
+
+    /// <summary>
+    /// AMQP properties captured in a <see cref="DeadLetterEnvelope"/> for faithful re-enqueueing.
+    /// </summary>
+    public sealed class DeadLetterMessageProperties
+    {
+        /// <summary>Original AMQP delivery mode. Restored so persistent messages stay persistent after a replay.</summary>
+        [JsonPropertyName("deliveryMode")]
+        public MessageDeliveryMode? DeliveryMode { get; set; }
+
+        /// <summary>Original AMQP <c>type</c> property.</summary>
+        [JsonPropertyName("type")]
+        public string? Type { get; set; }
+
+        /// <summary>Original AMQP <c>app-id</c> property.</summary>
+        [JsonPropertyName("appId")]
+        public string? AppId { get; set; }
+
+        /// <summary>Original AMQP priority.</summary>
+        [JsonPropertyName("priority")]
+        public byte? Priority { get; set; }
+
+        /// <summary>Original AMQP content type.</summary>
+        [JsonPropertyName("contentType")]
+        public string? ContentType { get; set; }
+
+        /// <summary>Original AMQP reply-to.</summary>
+        [JsonPropertyName("replyTo")]
+        public string? ReplyTo { get; set; }
+
+        /// <summary>
+        /// Original message headers, captured as strings (binary AMQP values are decoded as UTF-8).
+        /// The internal reprocess counter header is excluded — the envelope tracks it separately.
+        /// </summary>
+        [JsonPropertyName("headers")]
+        public Dictionary<string, string?>? Headers { get; set; }
     }
 
     /// <summary>

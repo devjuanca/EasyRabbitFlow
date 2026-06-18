@@ -143,7 +143,6 @@ public class ConsumerTests
                 {
                     r.MaxRetryCount = 3;
                     r.RetryInterval = 100;
-                    r.ExponentialBackoff = false;
                 });
                 cfg.ConfigureAutoGenerate(ag =>
                 {
@@ -537,5 +536,86 @@ public class ConsumerTests
         var stopB = hostedService.StopAsync(CancellationToken.None);
 
         await Task.WhenAll(stopA, stopB);
+    }
+
+    [Theory]
+    [InlineData(typeof(AlwaysDerivedTransientFailConsumer), true)]   // subclass of RabbitFlowTransientException
+    [InlineData(typeof(AlwaysFailConsumer), false)]                  // InvalidOperationException
+    public async Task DeadLetterEnvelope_Carries_IsTransient_Flag(Type consumerType, bool expectedTransient)
+    {
+        // Arrange
+        AlwaysFailConsumer.Reset();
+
+        var queueName = $"test-istransient-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+
+        void Configure(RabbitFlowConfigurator settings)
+        {
+            void Common<TConsumer>() where TConsumer : class, IRabbitFlowConsumer<TestEvent> =>
+                settings.AddConsumer<TConsumer>(queueName, cfg =>
+                {
+                    cfg.AutoGenerate = true;
+                    cfg.PrefetchCount = 1;
+                    cfg.Timeout = TimeSpan.FromSeconds(5);
+                    cfg.ExtendDeadletterMessage = true;
+                    cfg.ConfigureAutoGenerate(ag =>
+                    {
+                        ag.GenerateExchange = false;
+                        ag.GenerateDeadletterQueue = true;
+                        ag.DurableQueue = false;
+                        ag.DurableExchange = false;
+                        ag.AutoDeleteQueue = true;
+                    });
+                });
+
+            if (consumerType == typeof(AlwaysDerivedTransientFailConsumer))
+            {
+                Common<AlwaysDerivedTransientFailConsumer>();
+            }
+            else
+            {
+                Common<AlwaysFailConsumer>();
+            }
+        }
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(Configure);
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        // Act
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        var evt = new TestEvent { Id = "transient-flag-1", Message = "fails" };
+        await ch.BasicPublishAsync("", queueName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(evt, jsonOpts)));
+
+        BasicGetResult? dlqResult = null;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            dlqResult = await ch.BasicGetAsync(dlqName, autoAck: true);
+            if (dlqResult != null) break;
+            await Task.Delay(200);
+        }
+
+        // Assert
+        Assert.NotNull(dlqResult);
+
+        var envelope = JsonSerializer.Deserialize<DeadLetterEnvelope>(dlqResult!.Body.Span, jsonOpts);
+        Assert.NotNull(envelope);
+        Assert.Equal(expectedTransient, envelope!.IsTransient);
+
+        if (expectedTransient)
+        {
+            // Inheritance-aware: the runtime type name is the derived one, which the legacy
+            // name-matching would have misclassified as permanent.
+            Assert.Equal(nameof(DerivedTransientException), envelope.ExceptionType);
+        }
+
+        await hostedService.StopAsync(CancellationToken.None);
     }
 }

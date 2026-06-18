@@ -32,6 +32,7 @@ namespace EasyRabbitFlow.Settings
         ushort PrefetchCount { get; set; }
 
         TimeSpan Timeout { get; set; }
+
     }
 
     public class ConsumerSettings<TConsumer> : IConsumerSettingsBase where TConsumer : class
@@ -141,11 +142,20 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Gets or sets the timeout duration for processing a single message. 
+        /// Gets or sets the timeout duration for processing a single message.
         /// Default is 30 seconds.
         /// </summary>
+        /// <remarks>
+        /// When <see cref="AutoGenerate"/> is <c>true</c>, this value (together with the retry policy) drives the
+        /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't kill the consumer while it retries in
+        /// process. That argument only takes effect when the queue is first created: RabbitMQ silently ignores a
+        /// changed <c>x-consumer-timeout</c> when an existing queue is redeclared (no error, no warning), so changing
+        /// <see cref="Timeout"/>, <c>MaxRetryCount</c>, or <c>RetryInterval</c> on a queue that already exists does
+        /// not update it — delete and recreate the queue (or apply a <c>consumer-timeout</c> policy) to change it.
+        /// The per-queue <c>x-consumer-timeout</c> override requires RabbitMQ 3.12+; on older brokers raise
+        /// <c>consumer_timeout</c> at the broker level instead.
+        /// </remarks>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
-
 
         /// <summary>
         /// Configures the retry policy for the consumer.

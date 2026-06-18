@@ -42,12 +42,12 @@ public static class ThumbnailsModule
                 return Results.BadRequest(new { error = "Provide at least one thumbnail job." });
             }
 
-            // The TResult overload returns the processed count and pipes each per-job result
-            // into a ConcurrentQueue that onCompletedAsync receives. Capture the queue here
-            // so the endpoint can include the items in the HTTP response.
+            // The TResult overload returns an aggregate run result and still pipes each per-job
+            // result into a ConcurrentQueue that onCompletedAsync receives. Capture the queue
+            // here to demonstrate the callback-oriented style used by fire-and-forget callers.
             ConcurrentQueue<ThumbnailResult>? collected = null;
 
-            var processed = await temporary.RunAsync<ThumbnailJob, ThumbnailResult>(
+            var run = await temporary.RunAsync<ThumbnailJob, ThumbnailResult>(
                 messages: jobs,
                 onMessageReceived: async (job, workerCt) =>
                 {
@@ -87,7 +87,8 @@ public static class ThumbnailsModule
                 options: new RunTemporaryOptions
                 {
                     PrefetchCount = 4,
-                    Timeout = TimeSpan.FromSeconds(10),
+                    Timeout = TimeSpan.FromSeconds(10),    // per-job timeout
+                    RunTimeout = TimeSpan.FromMinutes(2),  // whole-run safety net: the HTTP request can never hang
                     QueuePrefixName = "thumbnails",
                 },
                 cancellationToken: ct);
@@ -95,8 +96,15 @@ public static class ThumbnailsModule
             return Results.Ok(new
             {
                 requested = jobs.Length,
-                processed,
-                items = collected?.ToArray() ?? Array.Empty<ThumbnailResult>()
+                run.Success,
+                run.TotalMessages,
+                run.PublishedMessages,
+                run.ProcessedMessages,
+                run.SucceededMessages,
+                run.FailedMessages,
+                run.Duration,
+                items = collected?.ToArray() ?? run.Results.ToArray(),
+                errors = run.Errors
             });
         })
         .WithName("RunThumbnailBatch")

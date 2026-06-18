@@ -23,8 +23,9 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         /// Maximum number of times a single message will be moved from the dead-letter queue back to the main queue.
-        /// When this count is reached, the message stays in the dead-letter queue with the final attempt count recorded
-        /// in its envelope so it can be inspected from a RabbitMQ client. Default is <c>3</c>.
+        /// When this count is reached, the message is moved to the parking queue (<c>{queue}-deadletter-parking</c>)
+        /// with the final attempt count recorded in its envelope so it can be inspected from a RabbitMQ client.
+        /// Default is <c>3</c>.
         /// </summary>
         public int MaxReprocessAttempts
         {

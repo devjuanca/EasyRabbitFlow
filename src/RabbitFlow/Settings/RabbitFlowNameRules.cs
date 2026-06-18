@@ -5,11 +5,14 @@ namespace EasyRabbitFlow.Settings
 {
     internal static class RabbitFlowNameRules
     {
+        // Derived from RabbitFlowTopologyNames so the reserved list can never drift from the suffixes the
+        // framework actually appends. "deadletter" is matched without its leading dash on purpose: that is
+        // stricter and rejects any user name containing the substring, not only the exact "-deadletter" suffix.
         private static readonly string[] ReservedSubstrings = new[]
         {
-            "deadletter",
-            "-exchange",
-            "-routing-key"
+            RabbitFlowTopologyNames.DeadLetterSuffix.TrimStart('-'),
+            RabbitFlowTopologyNames.ExchangeSuffix,
+            RabbitFlowTopologyNames.RoutingKeySuffix
         };
 
         public static void Validate(string? name, string paramName)

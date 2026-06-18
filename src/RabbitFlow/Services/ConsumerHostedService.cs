@@ -8,6 +8,7 @@ using RabbitMQ.Client.Events;
 using RabbitMQ.Client.Exceptions;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
@@ -81,7 +82,7 @@ namespace EasyRabbitFlow.Services
             {
                 try
                 {
-                    await instance.StopAsync();
+                    await instance.StopAsync(cancellationToken);
                 }
                 catch (ObjectDisposedException)
                 {
@@ -111,14 +112,19 @@ namespace EasyRabbitFlow.Services
         private readonly int _rpMax;
         private readonly int _totalAttempts;
         private readonly int _rpInterval;
-        private readonly bool _rpExp;
-        private readonly int _rpFactor;
-        private readonly int _rpMaxDelay;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _recoveryGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _prefetchSemaphore;
+
+        // Publisher confirms for the consumer channel: the only thing this channel publishes is the dead-letter
+        // envelope, and we must know it actually reached the broker before acking the original delivery. With
+        // tracking enabled, BasicPublishAsync awaits the broker ack and throws if the message is not confirmed,
+        // so a lost publish surfaces as an exception and falls back to nack-driven dead-lettering instead of
+        // silently dropping the message. Consuming on a confirm-enabled channel is unaffected.
+        private static readonly CreateChannelOptions ConfirmChannelOptions =
+            new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
 
         private IConnection? _connection;
         private IChannel? _channel;
@@ -184,7 +190,7 @@ namespace EasyRabbitFlow.Services
             _extendDeadLetter = effectiveExtend;
 
             var retryPolicyObj = root.GetService(typeof(RetryPolicy<>).MakeGenericType(_consumerType))
-                                ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType));
+                                ?? Activator.CreateInstance(typeof(RetryPolicy<>).MakeGenericType(_consumerType))!;
 
             var rpType = retryPolicyObj.GetType();
 
@@ -198,12 +204,6 @@ namespace EasyRabbitFlow.Services
             _totalAttempts = _rpMax + 1;
             
             _rpInterval = (int)rpType.GetProperty(nameof(RetryPolicy<object>.RetryInterval))!.GetValue(retryPolicyObj)!;
-            
-            _rpExp = (bool)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoff))!.GetValue(retryPolicyObj)!;
-            
-            _rpFactor = (int)rpType.GetProperty(nameof(RetryPolicy<object>.ExponentialBackoffFactor))!.GetValue(retryPolicyObj)!;
-            
-            _rpMaxDelay = (int)rpType.GetProperty(nameof(RetryPolicy<object>.MaxRetryDelay))!.GetValue(retryPolicyObj)!;
 
             _autoGenObj = _autoGenerate
                 ? (root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(_consumerType))
@@ -212,32 +212,18 @@ namespace EasyRabbitFlow.Services
 
             _prefetchSemaphore = new SemaphoreSlim(_prefetch);
 
-            long sumRetryDelaysMs = 0;
-
-            for (int attemptIndex = 1; attemptIndex <= _rpMax; attemptIndex++)
-            {
-                long d = _rpInterval;
-
-                if (_rpExp && attemptIndex > 1)
-                {
-                    try
-                    {
-                        var computed = checked((long)(_rpInterval * Math.Pow(_rpFactor, attemptIndex - 1)));
-                        
-                        d = Math.Min(computed, _rpMaxDelay);
-                    }
-                    catch 
-                    { 
-                        d = _rpMaxDelay; 
-                    }
-                }
-
-                sumRetryDelaysMs += d;
-            }
+            // Fixed interval between every retry: _rpMax retries means _rpMax delays of _rpInterval each.
+            long sumRetryDelaysMs = (long)_rpInterval * _rpMax;
 
             const long serverTimeoutGraceMs = 30_000;
 
-            _serverConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _totalAttempts) + sumRetryDelaysMs + serverTimeoutGraceMs;
+            // RabbitMQ rejects consumer timeouts below one minute, so floor the computed value at 60s.
+            // (A short Timeout with no retries can otherwise land under the minimum.)
+            const long minConsumerTimeoutMs = 60_000;
+
+            var computedConsumerTimeoutMs = (long)(_timeout.TotalMilliseconds * _totalAttempts) + sumRetryDelaysMs + serverTimeoutGraceMs;
+
+            _serverConsumerTimeoutMs = Math.Max(minConsumerTimeoutMs, computedConsumerTimeoutMs);
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -249,7 +235,7 @@ namespace EasyRabbitFlow.Services
             await EnsureChannelAsync(cancellationToken);
         }
 
-        public async Task StopAsync()
+        public async Task StopAsync(CancellationToken cancellationToken = default)
         {
             if (Interlocked.Exchange(ref _stopped, 1) != 0)
             {
@@ -257,6 +243,28 @@ namespace EasyRabbitFlow.Services
             }
 
             _stopping = true;
+
+            // Bounded drain: wait for in-flight handlers (the prefetch semaphore back at full capacity)
+            // before closing the channel, so finished work is acked and failures are dead-lettered
+            // instead of being silently redelivered after restart. The host's shutdown token (or the
+            // 30s cap) bounds the wait when a handler ignores cancellation.
+            var drainDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+
+            try
+            {
+                while (_prefetchSemaphore.CurrentCount < _prefetch
+                    && DateTime.UtcNow < drainDeadline
+                    && !cancellationToken.IsCancellationRequested)
+                {
+                    await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
 
             try
             {
@@ -310,7 +318,7 @@ namespace EasyRabbitFlow.Services
 
             DisposeChannel();
 
-            _channel = await _connection!.CreateChannelAsync(cancellationToken: ct);
+            _channel = await _connection!.CreateChannelAsync(ConfirmChannelOptions, cancellationToken: ct);
 
             _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
             
@@ -337,6 +345,11 @@ namespace EasyRabbitFlow.Services
                 }
                 catch { return; }
 
+                if (_stopping || _lifetimeCt.IsCancellationRequested)
+                {
+                    return;
+                }
+
                 _ = ProcessMessageAsync(ea);
             };
 
@@ -347,9 +360,9 @@ namespace EasyRabbitFlow.Services
         {
             var autoGenObj = _autoGenObj!;
 
-            var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? $"{_queueName}-exchange";
+            var exchangeName = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.ExchangeName))?.GetValue(autoGenObj) ?? RabbitFlowTopologyNames.Exchange(_queueName);
 
-            var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? $"{_queueName}-routing-key";
+            var routingKey = (string?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.RoutingKey))?.GetValue(autoGenObj) ?? RabbitFlowTopologyNames.RoutingKey(_queueName);
 
             var generateDeadletter = (bool?)autoGenObj.GetType().GetProperty(nameof(AutoGenerateSettings<object>.GenerateDeadletterQueue))?.GetValue(autoGenObj) ?? false;
 
@@ -383,11 +396,11 @@ namespace EasyRabbitFlow.Services
 
             if (generateDeadletter)
             {
-                _deadLetterQueueName = $"{_queueName}-deadletter";
+                _deadLetterQueueName = RabbitFlowTopologyNames.DeadLetterQueue(_queueName);
 
-                _deadLetterExchangeName = $"{_queueName}-deadletter-exchange";
+                _deadLetterExchangeName = RabbitFlowTopologyNames.DeadLetterExchange(_queueName);
 
-                _deadLetterRoutingKey = $"{_queueName}-deadletter-routing-key";
+                _deadLetterRoutingKey = RabbitFlowTopologyNames.DeadLetterRoutingKey(_queueName);
 
                 await channel.QueueDeclareAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, null, cancellationToken: ct);
 
@@ -449,18 +462,49 @@ namespace EasyRabbitFlow.Services
 
             args ??= new Dictionary<string, object?>();
 
+            // x-consumer-timeout only takes effect when the queue is first created. Unlike most x-arguments,
+            // RabbitMQ treats it as optional and silently ignores a changed value on redeclare (no
+            // PRECONDITION_FAILED), so changing Timeout/MaxRetryCount/RetryInterval on an existing queue does NOT
+            // update it — the queue must be deleted and recreated (or a consumer-timeout policy applied) to change it.
             if (!args.ContainsKey("x-consumer-timeout"))
             {
                 args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
             }
 
-            await channel.QueueDeclareAsync(_queueName, durableQueue, exclusiveQueue, autoDeleteQueue, args);
+            await DeclareOrAdoptMainQueueAsync(durableQueue, exclusiveQueue, autoDeleteQueue, args, ct);
 
             if (generateExchange)
             {
                 await channel.ExchangeDeclareAsync(exchangeName, exchangeType, durableExchange);
                 
                 await channel.QueueBindAsync(_queueName, exchangeName, routingKey);
+            }
+        }
+
+        // Declares the main queue on a throwaway channel so an argument mismatch (PRECONDITION_FAILED) can't take
+        // the consumer's channel down with it. If the queue is missing it is created with these arguments; if it
+        // already exists with identical arguments the declare is a harmless no-op. A genuine mismatch reaches the
+        // catch only for arguments RabbitMQ verifies for equivalence (x-dead-letter-exchange/-routing-key,
+        // x-max-priority, custom Args). Note x-consumer-timeout is NOT one of them: the broker silently ignores a
+        // changed value on redeclare, so a stale server-side timeout never surfaces here (see DeclareTopologyAsync).
+        // On mismatch we adopt the existing queue and keep running rather than crashing the consumer: a running
+        // consumer beats one that won't start and silently leaves the system idle.
+        private async Task DeclareOrAdoptMainQueueAsync(bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?> args, CancellationToken ct)
+        {
+            try
+            {
+                using var declareChannel = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+                await declareChannel.QueueDeclareAsync(_queueName, durable, exclusive, autoDelete, args, cancellationToken: ct).ConfigureAwait(false);
+            }
+            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
+            {
+                _logger.LogWarning(
+                    "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the current configuration " +
+                    "(e.g. x-dead-letter-exchange/-routing-key, x-max-priority, or custom Args). " +
+                    "The consumer for {Consumer} will keep running against the EXISTING queue and its current arguments. " +
+                    "To apply the new arguments, delete queue '{Queue}' and let the consumer recreate it.",
+                    _queueName, _consumerType.Name, _queueName);
             }
         }
 
@@ -500,6 +544,20 @@ namespace EasyRabbitFlow.Services
                         _queueName, _consumerType.Name);
                 }
 
+                using var activity = RabbitFlowDiagnostics.StartProcess(_queueName, args.BasicProperties?.Headers, msgId, corrId, args.Redelivered);
+
+                var startTimestamp = Stopwatch.GetTimestamp();
+
+                void RecordConsumeMetrics(string outcome)
+                {
+                    var elapsedSeconds = (Stopwatch.GetTimestamp() - startTimestamp) / (double)Stopwatch.Frequency;
+                    var queueTag = new KeyValuePair<string, object?>("queue", _queueName);
+                    var outcomeTag = new KeyValuePair<string, object?>("outcome", outcome);
+
+                    RabbitFlowDiagnostics.ConsumedMessages.Add(1, queueTag, outcomeTag);
+                    RabbitFlowDiagnostics.ConsumeDuration.Record(elapsedSeconds, queueTag, outcomeTag);
+                }
+
                 object? evt;
 
                 try
@@ -508,7 +566,9 @@ namespace EasyRabbitFlow.Services
                 }
                 catch (Exception ex)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, null, body, reprocessAttempts, msgId, corrId, ex, rootCt);
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    RecordConsumeMetrics("failure");
+                    await HandleErrorAsync(channel, args.DeliveryTag, null, body, reprocessAttempts, msgId, corrId, args.BasicProperties, ex, rootCt);
                     return;
                 }
 
@@ -552,16 +612,30 @@ namespace EasyRabbitFlow.Services
 
                         await SafeAckAsync(channel, args.DeliveryTag, rootCt);
 
+                        RecordConsumeMetrics("success");
+
                         return;
                     }
                     catch (OperationCanceledException ex) when (attemptCts.IsCancellationRequested && !rootCt.IsCancellationRequested)
                     {
                         lastException = ex;
+
+                        if (remainingAttempts > 1)
+                        {
+                            RabbitFlowDiagnostics.RetriedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                        }
+
                         await ApplyRetryDelay(remainingAttempts, rootCt);
                     }
-                    catch (RabbitFlowTransientException ex)
+                    catch (Exception ex) when (TransientExceptionClassifier.IsTransient(ex))
                     {
                         lastException = ex;
+
+                        if (remainingAttempts > 1)
+                        {
+                            RabbitFlowDiagnostics.RetriedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                        }
+
                         await ApplyRetryDelay(remainingAttempts, rootCt);
                     }
                     catch (Exception ex)
@@ -577,7 +651,9 @@ namespace EasyRabbitFlow.Services
 
                 if (remainingAttempts <= 0)
                 {
-                    await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, lastException ?? new Exception("Unknown error"), rootCt);
+                    activity?.SetStatus(ActivityStatusCode.Error, lastException?.Message ?? "Unknown error");
+                    RecordConsumeMetrics("failure");
+                    await HandleErrorAsync(channel, args.DeliveryTag, evt, body, reprocessAttempts, msgId, corrId, args.BasicProperties, lastException ?? new Exception("Unknown error"), rootCt);
                 }
             }
             catch (AlreadyClosedException) { }
@@ -598,23 +674,10 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
-            int attemptIndex = _totalAttempts - remainingAttempts + 1;
-            long delay = _rpInterval;
-
-            if (_rpExp && attemptIndex > 1)
+            try
             {
-                try
-                {
-                    var computed = checked(_rpInterval * (long)Math.Pow(_rpFactor, attemptIndex - 1));
-                    delay = Math.Min(computed, _rpMaxDelay);
-                }
-                catch { delay = _rpMaxDelay; }
+                await Task.Delay(_rpInterval, ct);
             }
-
-            try 
-            { 
-                await Task.Delay((int)delay, ct); 
-            } 
             catch { }
         }
 
@@ -633,7 +696,7 @@ namespace EasyRabbitFlow.Services
             }
         }
 
-        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, Exception exception, CancellationToken ct)
+        private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, IReadOnlyBasicProperties? originalProperties, Exception exception, CancellationToken ct)
         {
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
 
@@ -662,7 +725,9 @@ namespace EasyRabbitFlow.Services
                         ErrorMessage = exception?.Message,
                         StackTrace = exception?.StackTrace,
                         Source = exception?.Source,
-                        ReprocessAttempts = reprocessAttempts
+                        ReprocessAttempts = reprocessAttempts,
+                        IsTransient = TransientExceptionClassifier.IsTransient(exception),
+                        Properties = CaptureMessageProperties(originalProperties)
                     };
 
                     const int MaxDepth = 10;
@@ -688,26 +753,119 @@ namespace EasyRabbitFlow.Services
                         depth++;
                     }
 
+                    var queueTag = new KeyValuePair<string, object?>("queue", _queueName);
+
+                    byte[]? bytes = null;
+
                     try
                     {
-                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
-                        
-                        await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
-                        
-                        await channel.BasicAckAsync(deliveryTag, false, ct);
+                        bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Failed to serialize dead-letter envelope for {Consumer}; falling back to nack-driven dead-lettering.", _consumerType.Name);
+                    }
+
+                    var published = false;
+
+                    if (bytes != null)
+                    {
+                        try
+                        {
+                            await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
+
+                            published = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "[RABBIT-FLOW]: Failed to publish dead-letter envelope to {Exchange} for {Consumer}; falling back to nack-driven dead-lettering.", _deadLetterExchangeName, _consumerType.Name);
+                        }
+                    }
+
+                    if (published)
+                    {
+                        // Envelope is safely in the DLQ. Ack the original; if the ack fails the message will
+                        // be redelivered (at-least-once) and may yield a duplicate envelope on a later pass.
+                        try
+                        {
+                            await channel.BasicAckAsync(deliveryTag, false, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "[RABBIT-FLOW]: Dead-letter envelope published for {Consumer} but the ack of the original delivery failed; it may be redelivered.", _consumerType.Name);
+                        }
+
+                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, queueTag);
+                    }
+                    else
+                    {
+                        // The envelope could not be produced or published. Don't leave the original delivery
+                        // unacked: a persistent failure would have it redelivered, reprocessed, and re-failed
+                        // forever. Fall back to broker-native dead-lettering (the queue's x-dead-letter-exchange)
+                        // so the raw message still leaves the main queue and the redelivery loop is broken.
+                        try
+                        {
+                            await channel.BasicNackAsync(deliveryTag, false, false, ct);
+
+                            RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, queueTag);
+                        }
+                        catch { }
+                    }
                 }
                 else
                 {
-                    try 
-                    { 
+                    try
+                    {
                         await channel.BasicNackAsync(deliveryTag, false, false, ct);
+
+                        RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
 
                     } catch { }
                 }
             }
             finally { _channelGate.Release(); }
+        }
+
+        private static DeadLetterMessageProperties? CaptureMessageProperties(IReadOnlyBasicProperties? properties)
+        {
+            if (properties == null)
+            {
+                return null;
+            }
+
+            Dictionary<string, string?>? headers = null;
+
+            if (properties.Headers != null)
+            {
+                foreach (var kvp in properties.Headers)
+                {
+                    if (kvp.Key == RabbitFlowHeaders.ReprocessAttempts)
+                    {
+                        continue; // tracked by the envelope's ReprocessAttempts counter
+                    }
+
+                    headers ??= new Dictionary<string, string?>();
+
+                    headers[kvp.Key] = kvp.Value switch
+                    {
+                        null => null,
+                        byte[] bytes => Encoding.UTF8.GetString(bytes),
+                        string text => text,
+                        _ => kvp.Value.ToString()
+                    };
+                }
+            }
+
+            return new DeadLetterMessageProperties
+            {
+                DeliveryMode = ReadDeliveryMode(properties),
+                Type = ReadType(properties),
+                AppId = ReadAppId(properties),
+                Priority = ReadPriority(properties),
+                ContentType = ReadContentType(properties),
+                ReplyTo = ReadReplyTo(properties),
+                Headers = headers
+            };
         }
 
         private static MessageDeliveryMode? ReadDeliveryMode(IReadOnlyBasicProperties? properties)
