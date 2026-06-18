@@ -29,7 +29,7 @@ public class PublisherTests
         // Pre-declare queue
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         var evt = new TestEvent { Id = "1", Message = "hello" };
 
@@ -57,7 +57,7 @@ public class PublisherTests
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
         await ch.ExchangeDeclareAsync(exchangeName, "direct", durable: false, autoDelete: true);
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
         await ch.QueueBindAsync(queueName, exchangeName, routingKey);
 
         var evt = new TestEvent { Id = "2", Message = "routed" };
@@ -93,7 +93,7 @@ public class PublisherTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         var evt = new TestEvent { Id = "42", Message = "content-check" };
 

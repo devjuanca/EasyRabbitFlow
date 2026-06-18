@@ -51,7 +51,7 @@ public class TracingTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -110,7 +110,7 @@ public class TracingTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
