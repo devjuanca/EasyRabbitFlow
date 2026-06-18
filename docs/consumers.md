@@ -241,15 +241,26 @@ The value is floored at 60s because RabbitMQ rejects consumer timeouts below one
 >
 > Unlike most queue arguments, RabbitMQ treats `x-consumer-timeout` as *optional* and **silently ignores a changed value when an existing queue is redeclared** — no `PRECONDITION_FAILED`, no error, no warning. So if you change `Timeout`, `MaxRetryCount`, or `RetryInterval` on a queue that already exists, the new `x-consumer-timeout` is **not** applied: the queue keeps its original value. **To make the change take effect, delete and recreate the queue** (or apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) on the broker, which *can* be changed in place). This is specific to `x-consumer-timeout`; other arguments (`x-dead-letter-exchange`, `x-max-priority`, custom `Args`) **are** verified on redeclare — see the **Queue arguments are immutable in RabbitMQ** note below.
 
-**Channel recovery**
+**Channel & connection recovery**
 
-If the broker does close a channel (timeout exceeded, protocol violation, etc.), EasyRabbitFlow automatically recreates the channel, re-applies QoS, and re-subscribes the consumer — with exponential backoff between attempts (1s, 2s, 4s… capped at 30s). Connection-level closures are handled the same way.
+EasyRabbitFlow manages consumer recovery itself rather than relying on the RabbitMQ client's built-in automatic/topology recovery (which is deliberately disabled on the connections it owns — running both at once makes the client re-bind/re-consume a recorded topology that doesn't include the main queue, surfacing as a `404 NOT_FOUND` on reconnect). When the broker closes a channel or connection (timeout exceeded, protocol violation, network blip, etc.), the consumer re-establishes the connection and channel, re-applies QoS, **re-declares its full topology**, and re-subscribes — with exponential backoff between attempts, seeded by `NetworkRecoveryInterval` (e.g. 10s, 20s, 40s… capped at 30s, or the configured value when larger).
+
+This is controlled by two `HostSettings` knobs:
+
+- `AutomaticRecoveryEnabled` (default `true`) — when `false`, a dropped consumer stays down until the application restarts.
+- `NetworkRecoveryInterval` (default `10s`) — the base delay for the recovery backoff.
+
+See [Configuration](configuration.md#host-settings).
 
 > **⚠️ Queue arguments are immutable in RabbitMQ**
 >
 > Arguments that RabbitMQ verifies for equivalence — `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-message-ttl`, `x-max-length`, `x-max-priority`, `durable`, and any custom `Args` — cannot be changed by redeclaring an existing queue: the broker rejects the declare with `PRECONDITION_FAILED`. (The derived `x-consumer-timeout` is the exception — it is silently *ignored* rather than rejected; see the note above.)
 >
-> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue — a running consumer is safer than one that won't start and silently leaves the system idle. To actually apply the new arguments:
+> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue — a running consumer is safer than one that won't start and silently leaves the system idle.
+>
+> A related edge case is handled too: if the existing queue is a **stale `auto-delete` (or `x-expires`) queue** left over from a previous run — for example a broker that survived an app restart, as is common with Aspire — the broker may delete it the moment its previous consumer disconnects, *right as the new consumer is starting*. That produces an "adopt" (the queue still exists at declare time) immediately followed by a `404 NOT_FOUND` when binding/consuming (it's already gone). The consumer detects the 404 during setup, **recreates the queue with the current arguments** (it no longer exists, so there is no mismatch) and resumes — rather than crashing host startup.
+>
+> To actually apply the new arguments to a queue that *does* persist:
 >
 > **Options:**
 >

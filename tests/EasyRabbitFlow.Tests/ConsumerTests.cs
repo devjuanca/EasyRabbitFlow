@@ -538,6 +538,160 @@ public class ConsumerTests
         await Task.WhenAll(stopA, stopB);
     }
 
+    [Fact]
+    public async Task Consumer_RecoversAfterConnectionDrop_AndKeepsConsuming()
+    {
+        // Regression (v8 / 8.0.0-rc.2): a consumer must recover after its connection is dropped and keep
+        // consuming, WITHOUT a topology error.
+        //
+        // In 8.0.0-rc.1 the main queue was declared on a throwaway channel and the RabbitMQ client's built-in
+        // topology recovery was left enabled. On reconnect the client re-bound/re-consumed a recorded topology
+        // that did NOT include the main queue (it was never recorded, the throwaway declare adopted a 406), so
+        // recovery failed with "404 NOT_FOUND - no queue '...'" on queue.bind and the consumer stayed dead.
+        // EasyRabbitFlow now owns recovery (client recovery is off) and re-declares the FULL topology on every
+        // recovery, so the consumer comes back. This test exercises the exact path that broke: AutoGenerate with
+        // an exchange + binding + dead-letter queue.
+        TestConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-recovery-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = true;
+                    ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = false;
+                    ag.DurableExchange = false;
+                    // Must survive the connection drop so recovery re-binds to the SAME existing queue
+                    // (the scenario that produced the 404). An auto-delete queue would be removed when the
+                    // consumer disconnects, changing the test into a create-from-scratch path.
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+
+        // Sanity: a message flows before the drop.
+        await publisher.PublishAsync(new TestEvent { Id = "before", Message = "before-drop" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+        Assert.Single(TestConsumer.ReceivedMessages);
+
+        // Act - force the broker to drop every connection, including the consumer's.
+        var exitCode = await _fixture.CloseAllConnectionsAsync();
+        Assert.Equal(0, exitCode);
+
+        // Give the library's recovery loop time to re-establish the connection, channel and topology.
+        await Task.Delay(3000);
+
+        // Assert - a message published AFTER the drop is consumed, proving the consumer recovered and
+        // re-bound/re-consumed without a 404. (PublishAsync also exercises the publisher's connection
+        // re-creation, since its long-lived connection was dropped too.)
+        var afterResult = await publisher.PublishAsync(new TestEvent { Id = "after", Message = "after-drop" }, queueName);
+
+        deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (TestConsumer.ReceivedMessages.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        uint depth; uint consumers;
+        using (var probeConn = await _fixture.CreateDirectConnectionAsync())
+        using (var probeCh = await probeConn.CreateChannelAsync())
+        {
+            var ok = await probeCh.QueueDeclarePassiveAsync(queueName);
+            depth = ok.MessageCount;
+            consumers = ok.ConsumerCount;
+        }
+
+        Assert.True(
+            TestConsumer.ReceivedMessages.Count == 2 && TestConsumer.ReceivedMessages.Any(m => m.Id == "after"),
+            $"Consumer did not recover. Received={TestConsumer.ReceivedMessages.Count}, afterPublishSuccess={afterResult.Success}, queueDepth={depth}, consumers={consumers}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        // Cleanup
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_AdoptsPreexistingQueueWithConflictingArgs_WithoutCrashing()
+    {
+        // Regression (v8): when the auto-generated queue already exists with arguments that differ from the
+        // current configuration (e.g. a previous run created it transient + auto-delete + without a dead-letter
+        // exchange), the consumer must adopt the existing queue and keep running instead of letting the declare
+        // mismatch (PRECONDITION_FAILED / 406) propagate and crash host startup. This is the visible half of the
+        // QA failure: the "[RABBIT-FLOW]: Queue '...' already exists with arguments that differ" warning followed
+        // by a hard 404 that took the host down.
+        TestConsumer.Reset();
+
+        var queueName = $"test-adopt-{Guid.NewGuid():N}";
+
+        // Seed the queue with arguments that differ from what the consumer requests below (consumer wants a
+        // durable queue with a dead-letter exchange; this one is transient, auto-delete and has no DLX), so the
+        // consumer's declare hits a 406 and must take the adopt path.
+        using (var seedConn = await _fixture.CreateDirectConnectionAsync())
+        using (var seedCh = await seedConn.CreateChannelAsync())
+        {
+            await seedCh.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true, arguments: null);
+        }
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = true;
+                    ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
+                    ag.GenerateDeadletterQueue = true;   // adds x-dead-letter-* args -> mismatch vs the seeded queue
+                    ag.DurableQueue = true;              // mismatch: seeded queue is transient
+                    ag.DurableExchange = false;
+                    ag.AutoDeleteQueue = false;          // mismatch: seeded queue is auto-delete
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+
+        // Must NOT throw: the 406 is adopted, not propagated to the host.
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        // The adopted queue is usable end-to-end.
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "adopt-1", Message = "adopted" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count == 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.Single(TestConsumer.ReceivedMessages);
+        Assert.Equal("adopt-1", TestConsumer.ReceivedMessages[0].Id);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
     [Theory]
     [InlineData(typeof(AlwaysDerivedTransientFailConsumer), true)]   // subclass of RabbitFlowTransientException
     [InlineData(typeof(AlwaysFailConsumer), false)]                  // InvalidOperationException

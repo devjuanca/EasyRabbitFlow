@@ -417,19 +417,33 @@ namespace EasyRabbitFlow.Services
 
         private async Task<IConnection> ResolveConnection(string connectionId, CancellationToken cancellationToken = default)
         {
-            if (globalConnection == null)
+            // The RabbitMQ client's automatic recovery is disabled (EasyRabbitFlow manages recovery itself), so this
+            // long-lived publisher connection is not healed by the client when it drops — it must be re-created here.
+            // Fast path: reuse it while open.
+            if (globalConnection != null && globalConnection.IsOpen)
             {
-                await semaphore.WaitAsync(cancellationToken);
-
-                try
-                {
-                    globalConnection ??= await connectionFactory.CreateConnectionAsync($"Publisher_{connectionId}", cancellationToken);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
+                return globalConnection;
             }
+
+            await semaphore.WaitAsync(cancellationToken);
+
+            try
+            {
+                // Replace a connection that closed since the last publish.
+                if (globalConnection != null && !globalConnection.IsOpen)
+                {
+                    try { await globalConnection.DisposeAsync(); } catch { }
+
+                    globalConnection = null;
+                }
+
+                globalConnection ??= await connectionFactory.CreateConnectionAsync($"Publisher_{connectionId}", cancellationToken);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+
             return globalConnection;
         }
 

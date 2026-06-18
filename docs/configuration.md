@@ -35,9 +35,8 @@ cfg.ConfigureHost(host =>
 | `Username` | string | `"guest"` | Authentication username |
 | `Password` | string | `"guest"` | Authentication password |
 | `VirtualHost` | string | `"/"` | RabbitMQ virtual host |
-| `AutomaticRecoveryEnabled` | bool | `true` | Auto-reconnect after failures |
-| `TopologyRecoveryEnabled` | bool | `true` | Auto-recover queues/exchanges after reconnect |
-| `NetworkRecoveryInterval` | TimeSpan | `10s` | Wait time between recovery attempts |
+| `AutomaticRecoveryEnabled` | bool | `true` | Enables EasyRabbitFlow's own consumer recovery (re-connects, re-creates the channel and re-declares the full topology on an unexpected shutdown). The RabbitMQ client's built-in recovery is always disabled to avoid running two recovery systems at once. |
+| `NetworkRecoveryInterval` | TimeSpan | `10s` | Base delay for the library's recovery backoff (exponential from this value, capped at 30s) |
 | `RequestedHeartbeat` | TimeSpan | `30s` | Heartbeat interval for connection health |
 
 ### JSON Serialization

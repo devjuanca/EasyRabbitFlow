@@ -53,13 +53,23 @@ namespace EasyRabbitFlow.Services
                 UserName = hostSettings.Username,
                 Password = hostSettings.Password,
                 VirtualHost = hostSettings.VirtualHost,
-                AutomaticRecoveryEnabled = hostSettings.AutomaticRecoveryEnabled,
-                TopologyRecoveryEnabled = hostSettings.TopologyRecoveryEnabled,
-                NetworkRecoveryInterval = hostSettings.NetworkRecoveryInterval,
+
+                // EasyRabbitFlow owns recovery itself: the consumer re-establishes its connection and channel and
+                // re-declares its full topology on an unexpected shutdown (see ConsumerInstance.TriggerRecoveryAsync).
+                // The client's built-in recovery is intentionally left OFF so the two never run at the same time —
+                // client topology recovery re-binds/re-consumes a recorded topology that does NOT include the main
+                // queue (declared on a throwaway channel), which fails with 404 NOT_FOUND on reconnect. The library's
+                // recovery is configured through HostSettings.AutomaticRecoveryEnabled / NetworkRecoveryInterval.
+                AutomaticRecoveryEnabled = false,
+                TopologyRecoveryEnabled = false,
+
                 RequestedHeartbeat = hostSettings.RequestedHeartbeat
             };
 
             _services.AddSingleton(factory);
+
+            // Registered so the consumer host can read the library-managed recovery settings.
+            _services.AddSingleton(hostSettings);
         }
 
         /// <summary>

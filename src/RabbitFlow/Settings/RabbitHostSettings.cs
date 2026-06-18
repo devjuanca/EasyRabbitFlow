@@ -46,34 +46,30 @@ namespace EasyRabbitFlow.Settings
         public string VirtualHost { get; set; } = "/";
 
         /// <summary>
-        /// Gets or sets a value indicating whether automatic connection recovery is enabled.
+        /// Gets or sets a value indicating whether EasyRabbitFlow's own recovery is enabled for consumers.
         /// </summary>
         /// <remarks>
-        /// When enabled, the client will automatically attempt to reconnect to the RabbitMQ broker after a network
-        /// failure or unexpected connection loss. This helps maintain connection stability in production environments
-        /// with transient network issues. 
-        /// The default value is <see langword="true"/>.
+        /// EasyRabbitFlow manages recovery itself: when a consumer's connection or channel shuts down unexpectedly,
+        /// it re-establishes the connection and channel and <b>re-declares its full topology</b> (queue, exchange,
+        /// bindings, dead-letter resources) before resuming consumption. Because of this, the RabbitMQ client's
+        /// built-in automatic/topology recovery is intentionally left disabled — running both at once causes the
+        /// client to re-bind/re-consume a recorded topology that does not include the consumer's main queue,
+        /// surfacing as <c>404 NOT_FOUND</c> on reconnect.
+        /// <para>
+        /// When <see langword="true"/> (the default), a dropped consumer keeps retrying in the background with an
+        /// exponential backoff seeded by <see cref="NetworkRecoveryInterval"/>. When <see langword="false"/>, a
+        /// dropped consumer stays down until the application is restarted.
+        /// </para>
         /// </remarks>
         public bool AutomaticRecoveryEnabled { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets a value indicating whether automatic topology recovery is enabled after a network failure.
+        /// Gets or sets the base interval used by EasyRabbitFlow's own consumer recovery loop.
         /// </summary>
         /// <remarks>
-        /// When enabled, the system will attempt to restore connections and recover topology
-        /// information automatically if a network interruption occurs. Disabling this property may require manual
-        /// intervention to re-establish connections and recover state.
-        /// The default value is <see langword="true"/>.
-        /// </remarks>
-        public bool TopologyRecoveryEnabled { get; set; } = true;
-
-        /// <summary>
-        /// Gets or sets the interval to wait between attempts to recover a lost network connection.
-        /// </summary>
-        /// <remarks>
-        /// Specify a duration that determines how long the system waits before retrying network
-        /// recovery after a failure. Adjust this value based on expected network conditions and recovery
-        /// requirements.
+        /// This is the delay before the first recovery attempt; subsequent attempts back off exponentially from this
+        /// value (capped at 30 seconds, or this value when larger). Only meaningful when
+        /// <see cref="AutomaticRecoveryEnabled"/> is <see langword="true"/>.
         /// The default value is <see langword="10"/> seconds.
         /// </remarks>
         public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(10);

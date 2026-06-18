@@ -47,6 +47,8 @@ namespace EasyRabbitFlow.Services
 
             var serializerOptions = _root.GetKeyedService<JsonSerializerOptions>("RabbitFlowJsonSerializer") ?? JsonSerializerOptions.Web;
 
+            var hostSettings = _root.GetService<HostSettings>() ?? new HostSettings();
+
             foreach (var marker in markers)
             {
                 var settingsObj = marker.SettingsInstance;
@@ -63,7 +65,7 @@ namespace EasyRabbitFlow.Services
                     continue;
                 }
 
-                var instance = new ConsumerInstance(_root, _logger, connectionFactory, serializerOptions, marker);
+                var instance = new ConsumerInstance(_root, _logger, connectionFactory, serializerOptions, hostSettings, marker);
 
                 _instances.Add(instance);
 
@@ -112,6 +114,8 @@ namespace EasyRabbitFlow.Services
         private readonly int _rpMax;
         private readonly int _totalAttempts;
         private readonly int _rpInterval;
+        private readonly bool _recoveryEnabled;
+        private readonly int _recoveryBaseDelayMs;
         private readonly object? _autoGenObj;
         private readonly long _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
@@ -132,6 +136,7 @@ namespace EasyRabbitFlow.Services
         private string _deadLetterExchangeName = string.Empty;
         private string _deadLetterRoutingKey = string.Empty;
         private volatile bool _stopping;
+        private volatile bool _rebuilding;
         private int _stopped;
         private CancellationToken _lifetimeCt;
 
@@ -140,6 +145,7 @@ namespace EasyRabbitFlow.Services
             ILogger logger,
             ConnectionFactory connectionFactory,
             JsonSerializerOptions serializerOptions,
+            HostSettings hostSettings,
             IConsumerSettingsMarker marker)
         {
             _root = root;
@@ -147,6 +153,12 @@ namespace EasyRabbitFlow.Services
             _connectionFactory = connectionFactory;
             _serializerOptions = serializerOptions;
             _marker = marker;
+
+            _recoveryEnabled = hostSettings.AutomaticRecoveryEnabled;
+
+            // Base delay for the library's own recovery backoff; floored at 1s so a misconfigured tiny interval
+            // never spins the recovery loop. See HostSettings.NetworkRecoveryInterval.
+            _recoveryBaseDelayMs = (int)Math.Max(1000, hostSettings.NetworkRecoveryInterval.TotalMilliseconds);
 
             var settings = marker.SettingsInstance;
 
@@ -230,9 +242,30 @@ namespace EasyRabbitFlow.Services
         {
             _lifetimeCt = cancellationToken;
 
-            await EnsureConnectionAsync(cancellationToken);
+            try
+            {
+                await EnsureConnectionAsync(cancellationToken);
 
-            await EnsureChannelAsync(cancellationToken);
+                await EnsureChannelAsync(cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                // A consumer that fails to set up (topology declare, bind, consume) must not bring the whole host
+                // down at startup: one broken consumer should not leave the entire application unable to start.
+                // Log it and, when recovery is enabled, keep retrying in the background; otherwise the consumer
+                // stays down but the host comes up.
+                _logger.LogError(ex,
+                    "[RABBIT-FLOW]: Initial setup failed for {Consumer}. The host will continue to start. {Recovery}",
+                    _consumerType.Name,
+                    _recoveryEnabled
+                        ? "Recovery is enabled; the consumer will keep retrying in the background."
+                        : "Recovery is disabled (AutomaticRecoveryEnabled = false); the consumer stays down until restart.");
+
+                if (_recoveryEnabled)
+                {
+                    _ = TriggerRecoveryAsync();
+                }
+            }
         }
 
         public async Task StopAsync(CancellationToken cancellationToken = default)
@@ -296,6 +329,12 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
+            // The connection is gone, so any channel on it is dead too — even though a stale IChannel can keep
+            // reporting IsOpen == true for a while after its connection drops. Drop it here so EnsureChannelAsync
+            // rebuilds the channel AND re-attaches the consumer on the new connection instead of short-circuiting
+            // on the stale flag and leaving the queue with no consumer.
+            DisposeChannel();
+
             DisposeConnection();
 
             _connection = await _connectionFactory.CreateConnectionAsync($"consumer_{_consumerId}", ct);
@@ -318,42 +357,78 @@ namespace EasyRabbitFlow.Services
 
             DisposeChannel();
 
-            _channel = await _connection!.CreateChannelAsync(ConfirmChannelOptions, cancellationToken: ct);
+            // Bounded retry around topology declaration + consume. The auto-generated main queue can be present
+            // when we declare/adopt it (on the throwaway channel) but already gone by the time we bind/consume it
+            // on this channel — e.g. an auto-delete queue whose previous consumer just disconnected, or an
+            // x-expires queue — which surfaces as a 404 that closes the channel. On that race we recreate the
+            // channel and retry: the next pass finds the queue missing and re-creates it with the current arguments
+            // (so there is no longer a mismatch), then binds and consumes. Recovery is suppressed while we rebuild
+            // so a channel-close during setup can't kick off a second, racing recovery on top of this loop.
+            const int maxAttempts = 3;
 
-            _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
-            
-            _channel.ChannelShutdownAsync += OnChannelShutdownAsync;
+            _rebuilding = true;
 
-            await _channel.BasicQosAsync(0, _prefetch, false, ct);
-
-            if (_autoGenerate && _autoGenObj != null)
+            try
             {
-                await DeclareTopologyAsync(_channel, ct);
+                for (int attempt = 1; ; attempt++)
+                {
+                    _channel = await _connection!.CreateChannelAsync(ConfirmChannelOptions, cancellationToken: ct);
+
+                    _channel.CallbackExceptionAsync += OnChannelCallbackExceptionAsync;
+
+                    _channel.ChannelShutdownAsync += OnChannelShutdownAsync;
+
+                    await _channel.BasicQosAsync(0, _prefetch, false, ct);
+
+                    try
+                    {
+                        if (_autoGenerate && _autoGenObj != null)
+                        {
+                            await DeclareTopologyAsync(_channel, ct);
+                        }
+
+                        var consumer = new AsyncEventingBasicConsumer(_channel);
+
+                        consumer.ReceivedAsync += async (_, ea) =>
+                        {
+                            if (_stopping || _lifetimeCt.IsCancellationRequested)
+                            {
+                                return;
+                            }
+                            try
+                            {
+                                await _prefetchSemaphore.WaitAsync(_lifetimeCt);
+                            }
+                            catch { return; }
+
+                            if (_stopping || _lifetimeCt.IsCancellationRequested)
+                            {
+                                return;
+                            }
+
+                            _ = ProcessMessageAsync(ea);
+                        };
+
+                        await _channel.BasicConsumeAsync(queue: _queueName, autoAck: false, consumer: consumer, cancellationToken: ct);
+
+                        return;
+                    }
+                    catch (OperationInterruptedException ex) when (attempt < maxAttempts && ex.ShutdownReason?.ReplyCode == 404)
+                    {
+                        _logger.LogWarning(
+                            "[RABBIT-FLOW]: Queue '{Queue}' for {Consumer} was deleted by the broker during setup (404 NOT_FOUND) — " +
+                            "typically a stale auto-delete or x-expires queue whose previous consumer had just disconnected. " +
+                            "Recreating it with the current arguments and retrying (attempt {Attempt}/{Max}).",
+                            _queueName, _consumerType.Name, attempt, maxAttempts);
+
+                        DisposeChannel();
+                    }
+                }
             }
-
-            var consumer = new AsyncEventingBasicConsumer(_channel);
-
-            consumer.ReceivedAsync += async (_, ea) =>
+            finally
             {
-                if (_stopping || _lifetimeCt.IsCancellationRequested)
-                {
-                    return;
-                }
-                try
-                {
-                    await _prefetchSemaphore.WaitAsync(_lifetimeCt);
-                }
-                catch { return; }
-
-                if (_stopping || _lifetimeCt.IsCancellationRequested)
-                {
-                    return;
-                }
-
-                _ = ProcessMessageAsync(ea);
-            };
-
-            await _channel.BasicConsumeAsync(queue: _queueName, autoAck: false, consumer: consumer, cancellationToken: ct);
+                _rebuilding = false;
+            }
         }
 
         private async Task DeclareTopologyAsync(IChannel channel, CancellationToken ct)
@@ -929,7 +1004,7 @@ namespace EasyRabbitFlow.Services
         {
             _logger.LogWarning("[RABBIT-FLOW]: Channel shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", _consumerType.Name, args.ReplyCode, args.ReplyText);
 
-            if (_stopping || args.Initiator == ShutdownInitiator.Application)
+            if (_stopping || _rebuilding || !_recoveryEnabled || args.Initiator == ShutdownInitiator.Application)
             {
                 return Task.CompletedTask;
             }
@@ -943,7 +1018,7 @@ namespace EasyRabbitFlow.Services
         {
             _logger.LogWarning("[RABBIT-FLOW]: Connection shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", _consumerType.Name, args.ReplyCode, args.ReplyText);
 
-            if (_stopping || args.Initiator == ShutdownInitiator.Application)
+            if (_stopping || _rebuilding || !_recoveryEnabled || args.Initiator == ShutdownInitiator.Application)
             {
                 return Task.CompletedTask;
             }
@@ -973,7 +1048,7 @@ namespace EasyRabbitFlow.Services
 
         private async Task TriggerRecoveryAsync()
         {
-            if (_stopping)
+            if (_stopping || !_recoveryEnabled)
             {
                 return;
             }
@@ -1006,7 +1081,8 @@ namespace EasyRabbitFlow.Services
                     }
                     catch (Exception ex)
                     {
-                        var delay = Math.Min(1000 * (int)Math.Pow(2, Math.Min(attempt, 6)), 30_000);
+                        var cap = Math.Max(30_000, _recoveryBaseDelayMs);
+                        var delay = Math.Min(_recoveryBaseDelayMs * (int)Math.Pow(2, Math.Min(attempt - 1, 6)), cap);
                         _logger.LogError(ex, "[RABBIT-FLOW]: Recovery attempt {Attempt} failed for {Consumer}. Retrying in {Delay}ms.", attempt, _consumerType.Name, delay);
 
                         try { await Task.Delay(delay, _lifetimeCt); } catch { return; }
@@ -1064,11 +1140,16 @@ namespace EasyRabbitFlow.Services
             }
             catch { }
 
-            try 
-            { 
-                conn.Dispose(); 
-            } 
-            catch { }
+            // Disposing a connection that the broker force-closed (or that died mid-flight) blocks the caller for
+            // up to the client's ContinuationTimeout (20s by default) while it waits for a close-ok that never
+            // arrives. Offload it so recovery and shutdown aren't stalled; a healthy connection still disposes
+            // promptly, just off the calling path.
+            var connToDispose = conn;
+
+            _ = Task.Run(() =>
+            {
+                try { connToDispose.Dispose(); } catch { }
+            });
         }
 
         private static JsonElement? TryParseJsonElement(byte[]? body)

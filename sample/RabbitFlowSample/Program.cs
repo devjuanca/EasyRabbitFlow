@@ -75,7 +75,6 @@ builder.Services.AddRabbitFlow(settings =>
         }
 
         host.AutomaticRecoveryEnabled = true;
-        host.TopologyRecoveryEnabled = true;
     });
 
     settings.ConfigurePublisher(pub =>
