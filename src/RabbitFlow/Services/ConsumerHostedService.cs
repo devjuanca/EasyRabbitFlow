@@ -137,6 +137,9 @@ namespace EasyRabbitFlow.Services
         private string _deadLetterRoutingKey = string.Empty;
         private volatile bool _stopping;
         private volatile bool _rebuilding;
+        // Set once the broker rejects the 'x-consumer-timeout' queue argument (RabbitMQ 4.x), so later (re)declares
+        // and recovery passes don't keep re-adding it and paying the extra rejected round trip.
+        private volatile bool _consumerTimeoutArgRejected;
         private int _stopped;
         private CancellationToken _lifetimeCt;
 
@@ -541,7 +544,9 @@ namespace EasyRabbitFlow.Services
             // RabbitMQ treats it as optional and silently ignores a changed value on redeclare (no
             // PRECONDITION_FAILED), so changing Timeout/MaxRetryCount/RetryInterval on an existing queue does NOT
             // update it — the queue must be deleted and recreated (or a consumer-timeout policy applied) to change it.
-            if (!args.ContainsKey("x-consumer-timeout"))
+            // Skipped once the broker has rejected it (RabbitMQ 4.x doesn't accept it on queue.declare); see
+            // DeclareOrAdoptMainQueueAsync.
+            if (!args.ContainsKey("x-consumer-timeout") && !_consumerTimeoutArgRejected)
             {
                 args["x-consumer-timeout"] = _serverConsumerTimeoutMs;
             }
@@ -566,20 +571,98 @@ namespace EasyRabbitFlow.Services
         // consumer beats one that won't start and silently leaves the system idle.
         private async Task DeclareOrAdoptMainQueueAsync(bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?> args, CancellationToken ct)
         {
-            try
+            // Each fragile declare runs on its own throwaway channel so a 406 can't take the consumer's channel down.
+            while (true)
             {
-                using var declareChannel = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+                try
+                {
+                    using var declareChannel = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
 
-                await declareChannel.QueueDeclareAsync(_queueName, durable, exclusive, autoDelete, args, cancellationToken: ct).ConfigureAwait(false);
-            }
-            catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
-            {
-                _logger.LogWarning(
-                    "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the current configuration " +
-                    "(e.g. x-dead-letter-exchange/-routing-key, x-max-priority, or custom Args). " +
-                    "The consumer for {Consumer} will keep running against the EXISTING queue and its current arguments. " +
-                    "To apply the new arguments, delete queue '{Queue}' and let the consumer recreate it.",
-                    _queueName, _consumerType.Name, _queueName);
+                    await declareChannel.QueueDeclareAsync(_queueName, durable, exclusive, autoDelete, args, cancellationToken: ct).ConfigureAwait(false);
+
+                    return;
+                }
+                catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == 406)
+                {
+                    var brokerReason = ex.ShutdownReason?.ReplyText;
+
+                    // RabbitMQ 4.x rejects the per-queue 'x-consumer-timeout' argument that 3.13 accepted
+                    // ("PRECONDITION_FAILED - invalid arg 'x-consumer-timeout' ... of queue type rabbit_classic_queue").
+                    // It's a derived convenience, not user data, so drop it and re-declare: the broker-wide
+                    // consumer_timeout (default 30 min) applies instead, and a longer per-queue timeout can still be
+                    // set with a `consumer_timeout` policy. This keeps AutoGenerate working across 3.x and 4.x.
+                    if (args.ContainsKey("x-consumer-timeout")
+                        && (brokerReason?.IndexOf("x-consumer-timeout", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0)
+                    {
+                        _logger.LogWarning(
+                            "[RABBIT-FLOW]: Broker rejected the 'x-consumer-timeout' queue argument for '{Queue}' ({Consumer}); " +
+                            "this RabbitMQ version does not accept it on queue.declare. Re-declaring '{Queue}' without it — the " +
+                            "broker-wide consumer_timeout applies. Set a 'consumer_timeout' policy if you need a longer per-queue timeout. " +
+                            "Broker reason: {Reason}",
+                            _queueName, _consumerType.Name, _queueName, brokerReason);
+
+                        args.Remove("x-consumer-timeout");
+
+                        _consumerTimeoutArgRejected = true;
+
+                        continue;
+                    }
+
+                    // Otherwise a 406 means one of two different things:
+                    //   (a) the queue ALREADY EXISTS with arguments that differ from ours, or
+                    //   (b) the broker REJECTED the declare (an argument it won't accept, or a policy that conflicts
+                    //       with the requested arguments/queue-type) and the queue was NOT created.
+                    // We must not treat (b) as (a): adopting then binding/consuming a queue that doesn't exist yields a
+                    // misleading "already exists" warning followed by a 404 loop. A passive declare (which never
+                    // compares arguments) tells them apart.
+                    bool exists;
+
+                    try
+                    {
+                        using var probe = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+                        await probe.QueueDeclarePassiveAsync(_queueName, ct).ConfigureAwait(false);
+
+                        exists = true;
+                    }
+                    catch (OperationInterruptedException probeEx) when (probeEx.ShutdownReason?.ReplyCode == 404)
+                    {
+                        exists = false;
+                    }
+
+                    if (exists)
+                    {
+                        // (a) Adopt the existing queue as-is and keep running against its current arguments.
+                        _logger.LogWarning(
+                            "[RABBIT-FLOW]: Queue '{Queue}' already exists with arguments that differ from the current configuration " +
+                            "(e.g. x-dead-letter-exchange/-routing-key, x-max-priority, or custom Args). " +
+                            "The consumer for {Consumer} will keep running against the EXISTING queue and its current arguments. " +
+                            "To apply the new arguments, delete queue '{Queue}' and let the consumer recreate it. Broker reason: {Reason}",
+                            _queueName, _consumerType.Name, _queueName, brokerReason);
+
+                        return;
+                    }
+
+                    // (b) The declare was rejected and the queue does not exist. Surface the broker's actual reason
+                    // instead of pretending to adopt; binding/consuming would only fail with 404. The caller's setup
+                    // fails cleanly (the host still starts; recovery keeps retrying), and the operator gets the real cause.
+                    throw new RabbitFlowException(
+                        $"[RABBIT-FLOW]: Failed to declare queue '{_queueName}' for {_consumerType.Name}: the broker rejected the " +
+                        $"declare with PRECONDITION_FAILED and the queue does not exist. This is NOT an \"already exists\" mismatch — " +
+                        $"it usually means an argument value is not accepted by the broker, or a broker policy conflicts with the " +
+                        $"requested arguments or queue-type. Broker reason: {brokerReason}", ex);
+                }
+                catch (OperationInterruptedException ex)
+                {
+                    // Any other broker-side rejection of the declare (e.g. 405 RESOURCE_LOCKED, 530 NOT_ALLOWED,
+                    // 541 deprecated-feature like transient_nonexcl_queues, ...). Never swallow the broker's reason:
+                    // log the code and ReplyText with context, then rethrow so setup fails cleanly and recovery retries.
+                    _logger.LogError(ex,
+                        "[RABBIT-FLOW]: Unexpected broker error declaring queue '{Queue}' for {Consumer}. ReplyCode: {Code}, Broker reason: {Reason}",
+                        _queueName, _consumerType.Name, ex.ShutdownReason?.ReplyCode, ex.ShutdownReason?.ReplyText);
+
+                    throw;
+                }
             }
         }
 

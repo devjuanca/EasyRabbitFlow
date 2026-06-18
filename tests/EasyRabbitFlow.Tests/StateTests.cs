@@ -27,7 +27,7 @@ public class StateTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         var state = sp.GetRequiredService<IRabbitFlowState>();
 
@@ -47,7 +47,7 @@ public class StateTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new TestEvent { Id = "1" }));
         await ch.BasicPublishAsync("", queueName, body);
@@ -71,7 +71,7 @@ public class StateTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         // Publish 3 messages
         for (int i = 0; i < 3; i++)
@@ -99,7 +99,7 @@ public class StateTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         for (int i = 0; i < 2; i++)
         {
@@ -150,7 +150,7 @@ public class StateTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(existingQueue, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(existingQueue, durable: true, exclusive: false, autoDelete: true);
 
         var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new TestEvent { Id = "1" }));
         await ch.BasicPublishAsync("", existingQueue, body);

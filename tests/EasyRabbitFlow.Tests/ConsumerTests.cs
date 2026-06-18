@@ -39,7 +39,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -95,8 +95,8 @@ public class ConsumerTests
                     ag.GenerateExchange = true;
                     ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
                     ag.GenerateDeadletterQueue = true;
-                    ag.DurableQueue = false;
-                    ag.DurableExchange = false;
+                    ag.DurableQueue = true;
+                    ag.DurableExchange = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -148,7 +148,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -201,7 +201,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -259,7 +259,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -326,7 +326,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -397,7 +397,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = true;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.DurableExchange = false;
                     ag.AutoDeleteQueue = true;
                 });
@@ -490,7 +490,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -522,7 +522,7 @@ public class ConsumerTests
                 {
                     ag.GenerateExchange = false;
                     ag.GenerateDeadletterQueue = false;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.AutoDeleteQueue = true;
                 });
             });
@@ -568,7 +568,7 @@ public class ConsumerTests
                     ag.GenerateExchange = true;
                     ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
                     ag.GenerateDeadletterQueue = true;
-                    ag.DurableQueue = false;
+                    ag.DurableQueue = true;
                     ag.DurableExchange = false;
                     // Must survive the connection drop so recovery re-binds to the SAME existing queue
                     // (the scenario that produced the 404). An auto-delete queue would be removed when the
@@ -648,7 +648,7 @@ public class ConsumerTests
         using (var seedConn = await _fixture.CreateDirectConnectionAsync())
         using (var seedCh = await seedConn.CreateChannelAsync())
         {
-            await seedCh.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true, arguments: null);
+            await seedCh.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true, arguments: null);
         }
 
         var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
@@ -716,7 +716,7 @@ public class ConsumerTests
                     {
                         ag.GenerateExchange = false;
                         ag.GenerateDeadletterQueue = true;
-                        ag.DurableQueue = false;
+                        ag.DurableQueue = true;
                         ag.DurableExchange = false;
                         ag.AutoDeleteQueue = true;
                     });

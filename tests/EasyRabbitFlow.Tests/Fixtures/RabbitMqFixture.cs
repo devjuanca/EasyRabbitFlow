@@ -10,7 +10,9 @@ namespace EasyRabbitFlow.Tests.Fixtures;
 
 public class RabbitMqFixture : IAsyncLifetime
 {
-    private readonly RabbitMqContainer _container = new RabbitMqBuilder("rabbitmq:3.13-management")
+    // RabbitMQ 4.x (matches what Aspire provisions). 4.x is stricter than 3.13: notably it rejects the
+    // 'x-consumer-timeout' queue argument on queue.declare, which the consumer must tolerate.
+    private readonly RabbitMqContainer _container = new RabbitMqBuilder("rabbitmq:4.3-management")
         .WithUsername("guest")
         .WithPassword("guest")
         .Build();

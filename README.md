@@ -30,6 +30,19 @@ See the [Breaking Changes](#️-breaking-changes-v800) section below before upgr
 
 ---
 
+## RabbitMQ 4.x compatibility
+
+EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced a few server-side changes that affect queue declaration; here's how the library handles them:
+
+- **`x-consumer-timeout` on classic queues (4.x rejects it).** In 4.x, *classic queues no longer evaluate consumer timeouts* — the `x-consumer-timeout` argument is only valid for quorum queues/streams, and declaring a classic queue with it fails (`PRECONDITION_FAILED - invalid arg 'x-consumer-timeout' ... of queue type rabbit_classic_queue`). Older releases of this library always set that argument on the auto-generated queue, so on RabbitMQ 4.x the main queue could not be created. **Fixed in v8.0.0-rc.2:** when the broker rejects the argument, the consumer logs a warning, **re-declares the queue without `x-consumer-timeout`, and continues** — so `AutoGenerate` works on both 3.x and 4.x with no code change.
+  - Your per-message handler timeout (`ConsumerSettings.Timeout`) is **unaffected**: it is enforced by the library itself (a `CancellationToken`), not by the broker. On 4.x classic queues the broker no longer kills a consumer for a slow ack at all; if you need a broker-side per-queue timeout, use a quorum queue with a `consumer_timeout` policy.
+
+- **Transient non-exclusive queues are denied by default (`transient_nonexcl_queues`).** RabbitMQ 4.x rejects queues that are **both non-durable and non-exclusive** (`INTERNAL_ERROR - Feature 'transient_nonexcl_queues' is deprecated`). The library's default is `DurableQueue = true`, so the default configuration is safe. **Only if you explicitly set `DurableQueue = false`** on a consumer will 4.x reject it — keep the queue durable (recommended) or enable `deprecated_features.permit.transient_nonexcl_queues = true` on the broker. Temporary queues created via `IRabbitFlowTemporary` are **exclusive**, so they are unaffected.
+
+- **Not affected:** the library uses per-consumer QoS (`global: false`), so the deprecation of global QoS does not apply, and it never sets the removed CQv1 arguments (`x-queue-mode`, `x-queue-version = 1`).
+
+---
+
 ## Documentation
 
 | Guide | Contents |

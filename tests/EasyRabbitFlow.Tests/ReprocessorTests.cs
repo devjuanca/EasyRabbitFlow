@@ -31,8 +31,8 @@ public class ReprocessorTests
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
 
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: false);
-        await ch.QueueDeclareAsync(dlqName, durable: false, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
 
         try
         {

@@ -165,7 +165,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 | `ExchangeName` | string? | `null` | Custom name (defaults to `{queue}-exchange`) |
 | `RoutingKey` | string? | `null` | Custom routing key (defaults to `{queue}-routing-key`) |
 | `DurableExchange` | bool | `true` | Exchange survives broker restart |
-| `DurableQueue` | bool | `true` | Queue survives broker restart |
+| `DurableQueue` | bool | `true` | Queue survives broker restart. **Keep `true` on RabbitMQ 4.x:** the broker denies non-durable, non-exclusive queues by default (`transient_nonexcl_queues` deprecated), so `DurableQueue = false` on a non-exclusive consumer queue is rejected. See [RabbitMQ 4.x compatibility](../README.md#rabbitmq-4x-compatibility). |
 | `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
 | `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
 | `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
@@ -236,6 +236,12 @@ x-consumer-timeout = max(60s, Timeout × (MaxRetryCount + 1) + RetryInterval × 
 ```
 
 The value is floored at 60s because RabbitMQ rejects consumer timeouts below one minute. This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
+
+> **ℹ️ RabbitMQ 4.x: classic queues no longer evaluate consumer timeouts**
+>
+> Starting with RabbitMQ 4.x, *classic queues and streams no longer evaluate consumer timeouts* — the per-queue `x-consumer-timeout` argument is only valid for **quorum queues**, and declaring a **classic** queue with it is rejected (`PRECONDITION_FAILED - invalid arg 'x-consumer-timeout' ... of queue type rabbit_classic_queue`). EasyRabbitFlow declares classic queues, so on 4.x it **detects this rejection, re-declares the queue without `x-consumer-timeout`, and continues** (logging a warning once). This is automatic and needs no configuration — `AutoGenerate` works on both 3.13 and 4.x.
+>
+> The practical effect on 4.x: there is **no broker-side delivery-ack timeout on classic queues**, so a slow handler is never killed by the broker. Your per-message `Timeout` above is still enforced **by the library** (a `CancellationToken`), independent of the broker. If you specifically need a broker-enforced per-queue timeout on 4.x, use a quorum queue with a `consumer_timeout` policy.
 
 > **⚠️ `x-consumer-timeout` only applies when the queue is first created**
 >

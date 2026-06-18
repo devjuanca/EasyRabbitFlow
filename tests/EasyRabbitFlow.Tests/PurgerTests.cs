@@ -27,7 +27,7 @@ public class PurgerTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queueName, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
 
         // Publish 5 messages
         for (int i = 0; i < 5; i++)
@@ -61,8 +61,8 @@ public class PurgerTests
 
         using var conn = await _fixture.CreateDirectConnectionAsync();
         using var ch = await conn.CreateChannelAsync();
-        await ch.QueueDeclareAsync(queue1, durable: false, exclusive: false, autoDelete: true);
-        await ch.QueueDeclareAsync(queue2, durable: false, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queue1, durable: true, exclusive: false, autoDelete: true);
+        await ch.QueueDeclareAsync(queue2, durable: true, exclusive: false, autoDelete: true);
 
         var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new TestEvent { Id = "1" }));
         await ch.BasicPublishAsync("", queue1, body);
