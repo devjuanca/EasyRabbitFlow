@@ -22,6 +22,20 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RabbitFlowSample.AppHost", "sample\RabbitFlowSample.AppHost\RabbitFlowSample.AppHost.csproj", "{85B1206D-896E-400E-B861-BDDCDC220C6A}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "docs", "docs", "{F5F74167-FB59-484F-93D4-AF77166A86FB}"
+	ProjectSection(SolutionItems) = preProject
+		docs\api-reference.md = docs\api-reference.md
+		docs\configuration.md = docs\configuration.md
+		docs\consumers.md = docs\consumers.md
+		docs\dead-letter.md = docs\dead-letter.md
+		docs\observability.md = docs\observability.md
+		docs\publishing.md = docs\publishing.md
+		docs\queue-operations.md = docs\queue-operations.md
+		docs\sample-project.md = docs\sample-project.md
+		docs\temporary-processing.md = docs\temporary-processing.md
+		docs\transient-exceptions.md = docs\transient-exceptions.md
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
