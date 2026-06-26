@@ -94,6 +94,13 @@ namespace EasyRabbitFlow.Settings
     /// auto-generated dead-letter exchange of a consumer. Use it to replicate dead-lettered messages
     /// into audit, alerting, or side-channel processing consumers without affecting the primary
     /// dead-letter queue or the reprocessor.
+    /// <para>
+    /// The queue does <b>not</b> need to pre-exist: it is declared and bound automatically at consumer
+    /// startup. The declare is idempotent — if a queue with the same name already exists with identical
+    /// settings it is reused, but if it exists with different arguments the broker raises
+    /// <c>PRECONDITION_FAILED</c>. To use specific arguments (TTL, max-length, queue type, ...), set
+    /// <see cref="Arguments"/> from the start rather than declaring the queue separately.
+    /// </para>
     /// </summary>
     public class DeadLetterReplica
     {

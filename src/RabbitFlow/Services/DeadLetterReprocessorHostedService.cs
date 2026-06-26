@@ -326,7 +326,14 @@ namespace EasyRabbitFlow.Services
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
 
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: bytes, cancellationToken: ct).ConfigureAwait(false);
+                        var parkProps = new BasicProperties
+                        {
+                            DeliveryMode = DeliveryModes.Persistent,
+                            MessageId = envelope.MessageId,
+                            CorrelationId = envelope.CorrelationId
+                        };
+
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: bytes, cancellationToken: ct).ConfigureAwait(false);
 
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
 
@@ -435,7 +442,13 @@ namespace EasyRabbitFlow.Services
         {
             try
             {
-                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
+                // Preserve the original message's properties (MessageId, CorrelationId, headers, ...) and force
+                // persistence so parked messages survive a broker restart on the durable parking queue.
+                var parkProps = result.BasicProperties != null
+                    ? new BasicProperties(result.BasicProperties) { DeliveryMode = DeliveryModes.Persistent }
+                    : new BasicProperties { DeliveryMode = DeliveryModes.Persistent };
+
+                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
                 await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
             }
             catch (Exception ex)

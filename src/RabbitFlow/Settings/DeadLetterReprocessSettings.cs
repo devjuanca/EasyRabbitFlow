@@ -27,6 +27,13 @@ namespace EasyRabbitFlow.Settings
         /// with the final attempt count recorded in its envelope so it can be inspected from a RabbitMQ client.
         /// Default is <c>3</c>.
         /// </summary>
+        /// <remarks>
+        /// This counts <b>re-enqueues</b>, not total handler executions. The original delivery is not a reprocess,
+        /// so a value of <c>N</c> means the handler runs up to <c>N + 1</c> times before the message is parked
+        /// (1 original delivery + <c>N</c> reprocesses). For example, <c>MaxReprocessAttempts = 1</c> ⇒ the message
+        /// is delivered, fails, re-enqueued once, fails again, and is then parked: 2 executions in total.
+        /// The minimum is <c>1</c> (an enabled reprocessor always grants at least one retry).
+        /// </remarks>
         public int MaxReprocessAttempts
         {
             get => _maxReprocessAttempts;
