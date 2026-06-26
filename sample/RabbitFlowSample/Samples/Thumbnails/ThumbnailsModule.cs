@@ -2,7 +2,6 @@ using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
 using Microsoft.AspNetCore.Mvc;
 using RabbitFlowSample.Common;
-using System.Collections.Concurrent;
 
 namespace RabbitFlowSample.Samples.Thumbnails;
 
@@ -42,11 +41,9 @@ public static class ThumbnailsModule
                 return Results.BadRequest(new { error = "Provide at least one thumbnail job." });
             }
 
-            // The TResult overload returns an aggregate run result and still pipes each per-job
-            // result into a ConcurrentQueue that onCompletedAsync receives. Capture the queue
-            // here to demonstrate the callback-oriented style used by fire-and-forget callers.
-            ConcurrentQueue<ThumbnailResult>? collected = null;
-
+            // The TResult overload returns an aggregate run result; the same TemporaryRunResult
+            // (with its collected Results) is also handed to onCompletedAsync, so background
+            // callers can do their wrap-up without threading the queue out by hand.
             var run = await temporary.RunAsync<ThumbnailJob, ThumbnailResult>(
                 messages: jobs,
                 onMessageReceived: async (job, workerCt) =>
@@ -73,10 +70,11 @@ public static class ThumbnailsModule
                         OutputPath = outputPath
                     };
                 },
-                onCompletedAsync: (total, queue) =>
+                onCompletedAsync: (runResult, _) =>
                 {
-                    collected = queue;
-                    logger.LogInformation("[Thumbnail] Batch finished. Total={Total}", total);
+                    logger.LogInformation(
+                        "[Thumbnail] Batch finished. Processed={Processed}, Failed={Failed}, Collected={Collected}",
+                        runResult.ProcessedMessages, runResult.FailedMessages, runResult.Results.Count);
                     return Task.CompletedTask;
                 },
                 onError: (job, errorCt) =>
@@ -103,7 +101,7 @@ public static class ThumbnailsModule
                 run.SucceededMessages,
                 run.FailedMessages,
                 run.Duration,
-                items = collected?.ToArray() ?? run.Results.ToArray(),
+                items = run.Results,
                 errors = run.Errors
             });
         })
@@ -137,11 +135,11 @@ public static class ThumbnailsModule
                         "[Thumbnail-FaF] Resized {Url} ({W}x{H}) after {Ms}ms",
                         job.ImageUrl, job.Width, job.Height, latency);
                 },
-                onCompleted: (totalProcessed, errors) =>
+                onCompleted: runResult =>
                 {
                     logger.LogInformation(
                         "[Thumbnail-FaF] Background batch finished. Total={Total}, Errors={Errors}",
-                        totalProcessed, errors);
+                        runResult.ProcessedMessages, runResult.FailedMessages);
                 },
                 onError: (job, errorCt) =>
                 {

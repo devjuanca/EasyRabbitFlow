@@ -78,16 +78,23 @@ public class TemporaryTests
 
         int completedCount = 0;
         int errorCount = -1;
+        TemporaryRunResult? callbackResult = null;
 
         // Act
         await temporary.RunAsync<TestEvent>(
             messages,
             async (msg, ct) => await Task.CompletedTask,
-            onCompleted: (p, e) => { completedCount = p; errorCount = e; });
+            onCompleted: r => { completedCount = r.ProcessedMessages; errorCount = r.FailedMessages; callbackResult = r; });
 
         // Assert
         Assert.Equal(2, completedCount);
         Assert.Equal(0, errorCount);
+        // The callback now receives the full run result, not just counters.
+        Assert.NotNull(callbackResult);
+        Assert.True(callbackResult!.Success);
+        Assert.Equal(2, callbackResult.TotalMessages);
+        Assert.Equal(2, callbackResult.SucceededMessages);
+        Assert.Empty(callbackResult.Errors);
     }
 
     [Fact]
@@ -111,9 +118,9 @@ public class TemporaryTests
                 await Task.CompletedTask;
                 return $"processed-{msg.Id}";
             },
-            async (count, results) =>
+            async (runResult, ct) =>
             {
-                collectedResults.AddRange(results);
+                collectedResults.AddRange(runResult.Results);
                 await Task.CompletedTask;
             });
 
@@ -186,7 +193,7 @@ public class TemporaryTests
 
                 await Task.CompletedTask;
             },
-            onCompleted: (p, e) => { },
+            onCompleted: _ => { },
             onError: async (msg, ct) =>
             {
                 lock (failedMessages) { failedMessages.Add(msg); }
@@ -272,7 +279,7 @@ public class TemporaryTests
 
                 await Task.CompletedTask;
             },
-            onCompleted: (p, e) => { completedTotal = p; completedErrors = e; },
+            onCompleted: r => { completedTotal = r.ProcessedMessages; completedErrors = r.FailedMessages; },
             onError: async (msg, ct) =>
             {
                 lock (failedMessages) 
@@ -318,9 +325,9 @@ public class TemporaryTests
                 await Task.CompletedTask;
                 return $"processed-{msg.Id}";
             },
-            async (count, results) =>
+            async (runResult, ct) =>
             {
-                collectedResults.AddRange(results);
+                collectedResults.AddRange(runResult.Results);
                 await Task.CompletedTask;
             },
             onError: async (msg, ct) =>
