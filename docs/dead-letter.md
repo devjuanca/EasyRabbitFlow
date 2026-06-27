@@ -100,9 +100,11 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
     c.ConfigureDeadLetterReprocess(r =>
     {
         r.Enabled = true;
-        r.MaxReprocessAttempts = 5;              // re-enqueues DLQ → main (⇒ up to 6 handler executions total)
-        r.Interval = TimeSpan.FromHours(3);      // run every 3 hours
-        // r.MaxMessagesPerCycle = 500;          // optional safety cap; defaults to int.MaxValue (drain entire snapshot)
+        r.MaxReprocessAttempts = 5;                      // re-enqueues DLQ → main (⇒ up to 6 handler executions total)
+        r.Interval = TimeSpan.FromHours(3);              // run every 3 hours
+        // r.MaxMessagesPerCycle = 500;                  // optional safety cap; defaults to int.MaxValue (drain entire snapshot)
+        // r.FinalAction = DeadLetterFinalAction.Discard; // drop exhausted/permanent instead of parking (default: Park)
+        // r.ParkingMessageTtl = TimeSpan.FromDays(7);    // age out parked messages after 7 days (default: no TTL)
     });
 });
 ```
@@ -128,7 +130,23 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 
 If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle. Parked messages are published **persistent** (`DeliveryMode = 2`) onto the durable parking queue, so they survive a broker restart; for permanent/malformed messages the original AMQP properties (`MessageId`, `CorrelationId`, headers, …) are preserved as well.
 
-The parking queue is created on demand the first time the reprocessor finds messages in the DLQ to drain (the consumer never declares it, and a cycle that finds the DLQ empty skips it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, no extra args).
+The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, plus `x-message-ttl` if `ParkingMessageTtl` is set).
+
+### Discarding instead of parking
+
+By default every terminal message is parked. Set `FinalAction = DeadLetterFinalAction.Discard` to instead **drop** exhausted and permanent messages — they are acknowledged off the DLQ without being re-published anywhere. This suits high-volume failures that carry no recovery value and where parking would only accumulate noise. In `Discard` mode the parking queue is only ever created if a **malformed** message appears, because:
+
+- **Malformed messages are always parked, never discarded** — regardless of `FinalAction`. Their bytes could not be deserialized into an envelope, so dropping them would lose data with no recoverable trace. They are the one terminal category the discard switch does not govern.
+
+Discarded messages are not silently invisible to operators: each one increments the `easyrabbitflow.messages.discarded` counter (tagged `reason = exhausted | permanent`) and is logged at debug level.
+
+### Aging out parked messages
+
+Set `ParkingMessageTtl` to a `TimeSpan` to have the reprocessor declare the parking queue with `x-message-ttl`, so parked messages are dropped by the broker once they reach that age.
+
+> **The TTL is only applied when the reprocessor *creates* the parking queue.** If the parking queue already exists, it is adopted as-is and the TTL is **not** applied (the reprocessor never redeclares it to avoid `PRECONDITION_FAILED`). To apply a new or changed `ParkingMessageTtl` to a parking queue that already exists, **delete the queue** and let the reprocessor recreate it on the next cycle that needs to park a message.
+
+Note that a parking queue with a TTL and no dead-letter target drops expired messages, so combining `Park` with `ParkingMessageTtl` is effectively a delayed discard.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -136,6 +154,8 @@ The parking queue is created on demand the first time the reprocessor finds mess
 | `MaxReprocessAttempts` | int | `3` | Maximum **re-enqueues** from DLQ back to main queue. Counts reprocesses only — not the original delivery — so `N` allows up to `N + 1` total handler executions before parking (e.g. `1` ⇒ 2 executions). Minimum `1`. |
 | `Interval` | TimeSpan | `3h` | Time between reprocessor runs. **Minimum 10 minutes** (hard floor — use the in-handler `RetryPolicy` for tighter retry cadences) |
 | `MaxMessagesPerCycle` | int | `int.MaxValue` | Optional safety cap on messages drained per cycle. By default each cycle drains the whole DLQ snapshot taken at the start of the run; lower this only if you need an explicit ceiling. |
+| `FinalAction` | `DeadLetterFinalAction` | `Park` | What to do with terminal **exhausted**/**permanent** messages: `Park` (move to the parking queue) or `Discard` (ack off the DLQ and drop). Does **not** apply to malformed messages, which are always parked. |
+| `ParkingMessageTtl` | TimeSpan? | `null` | When set, the parking queue is created with `x-message-ttl` so parked messages age out after this duration. Applies only on a queue the reprocessor creates; an existing queue is adopted as-is. Must be greater than zero. |
 
 **Constraints:**
 
