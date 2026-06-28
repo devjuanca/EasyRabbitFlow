@@ -105,7 +105,9 @@ public class ReprocessorTests
                 queueName: queueName,
                 maxAttempts: 3,
                 interval: TimeSpan.FromHours(1),
-                maxMessagesPerCycle: 100);
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Park,
+                parkingMessageTtl: null);
 
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
@@ -159,6 +161,333 @@ public class ReprocessorTests
             try { await ch.QueueDeleteAsync(queueName); } catch { }
             try { await ch.QueueDeleteAsync(dlqName); } catch { }
             try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunCycle_Parks_Messages_As_Persistent_Preserving_OriginalProperties()
+    {
+        // Arrange
+        var queueName = $"test-reproc-persist-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            var messageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"p1"}""");
+
+            // Exhausted transient → parked as the re-serialized envelope (no original properties on the wire)
+            var exhausted = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageId = "exh-1",
+                CorrelationId = "exh-corr",
+                MessageData = messageData,
+                ExceptionType = "RabbitFlowTransientException",
+                IsTransient = true,
+                ReprocessAttempts = 3
+            };
+            await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(exhausted, jsonOpts)));
+
+            // Permanent → parked unchanged; its original AMQP properties must be preserved even though it
+            // arrived on the DLQ as non-persistent.
+            var permanent = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = messageData,
+                ExceptionType = "InvalidOperationException",
+                IsTransient = false,
+                ReprocessAttempts = 0
+            };
+            var permProps = new BasicProperties
+            {
+                MessageId = "perm-1",
+                CorrelationId = "perm-corr",
+                DeliveryMode = DeliveryModes.Transient,
+                Headers = new Dictionary<string, object?> { ["tenant"] = "acme" }
+            };
+            await ch.BasicPublishAsync("", dlqName, mandatory: false, basicProperties: permProps,
+                body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(permanent, jsonOpts)));
+
+            var factory = new ConnectionFactory
+            {
+                HostName = _fixture.Host,
+                Port = _fixture.Port,
+                UserName = _fixture.Username,
+                Password = _fixture.Password
+            };
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                factory,
+                jsonOpts,
+                consumerName: "ReprocessorPersistConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Park,
+                parkingMessageTtl: null);
+
+            // Act
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            // Assert — both failures parked, none re-enqueued
+            Assert.Equal(0u, await ch.MessageCountAsync(dlqName));
+            Assert.Equal(0u, await ch.MessageCountAsync(queueName));
+            Assert.Equal(2u, await ch.MessageCountAsync(parkingName));
+
+            // Bucket the two parked messages by their MessageId rather than relying on drain order
+            var parkedById = new Dictionary<string, BasicGetResult>();
+            for (var i = 0; i < 2; i++)
+            {
+                var parked = await ch.BasicGetAsync(parkingName, autoAck: true);
+                Assert.NotNull(parked);
+
+                // Every parked message must be persistent so it survives a broker restart
+                Assert.Equal(DeliveryModes.Persistent, parked!.BasicProperties.DeliveryMode);
+
+                parkedById[parked.BasicProperties.MessageId!] = parked;
+            }
+
+            Assert.True(parkedById.ContainsKey("exh-1"));
+            Assert.True(parkedById.ContainsKey("perm-1"));
+
+            // Permanent message was parked unchanged: original identity + headers preserved
+            var perm = parkedById["perm-1"];
+            Assert.Equal("perm-corr", perm.BasicProperties.CorrelationId);
+            Assert.Equal("acme", ReadHeaderString(perm.BasicProperties.Headers!, "tenant"));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunCycle_Discard_DropsExhaustedAndPermanent_ReenqueuesTransient_AndNeverCreatesParking()
+    {
+        // Arrange
+        var queueName = $"test-reproc-discard-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            var messageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"d1"}""");
+
+            var eligible = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = messageData,
+                ExceptionType = "RabbitFlowTransientException",
+                IsTransient = true,
+                ReprocessAttempts = 0
+            };
+
+            var exhausted = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = messageData,
+                ExceptionType = "RabbitFlowTransientException",
+                IsTransient = true,
+                ReprocessAttempts = 3
+            };
+
+            var permanent = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = messageData,
+                ExceptionType = "InvalidOperationException",
+                IsTransient = false,
+                ReprocessAttempts = 0
+            };
+
+            foreach (var envelope in new[] { eligible, exhausted, permanent })
+            {
+                await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, jsonOpts)));
+            }
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                Factory(),
+                jsonOpts,
+                consumerName: "ReprocessorDiscardConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Discard,
+                parkingMessageTtl: null);
+
+            // Act
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            // Assert — DLQ drained, transient re-enqueued, exhausted + permanent dropped,
+            // and the parking queue was never created since nothing needed parking.
+            Assert.Equal(0u, await ch.MessageCountAsync(dlqName));
+            Assert.Equal(1u, await ch.MessageCountAsync(queueName));
+            Assert.False(await QueueExistsAsync(conn, parkingName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunCycle_Discard_StillParksMalformed_CreatingParkingOnDemand()
+    {
+        // Arrange
+        var queueName = $"test-reproc-malformed-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            // Bytes that cannot be deserialized into a DeadLetterEnvelope → classified malformed.
+            await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes("this-is-not-json"));
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                Factory(),
+                jsonOpts,
+                consumerName: "ReprocessorMalformedConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Discard,
+                parkingMessageTtl: null);
+
+            // Act
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            // Assert — malformed bytes are never discarded; the parking queue is created on demand for them.
+            Assert.Equal(0u, await ch.MessageCountAsync(dlqName));
+            Assert.True(await QueueExistsAsync(conn, parkingName));
+            Assert.Equal(1u, await ch.MessageCountAsync(parkingName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunCycle_AppliesParkingMessageTtl_OnQueueCreation()
+    {
+        // Arrange
+        var queueName = $"test-reproc-ttl-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            var exhausted = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"t1"}"""),
+                ExceptionType = "RabbitFlowTransientException",
+                IsTransient = true,
+                ReprocessAttempts = 3
+            };
+            await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(exhausted, jsonOpts)));
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                Factory(),
+                jsonOpts,
+                consumerName: "ReprocessorTtlConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Park,
+                parkingMessageTtl: TimeSpan.FromSeconds(2));
+
+            // Act — message is parked into a queue declared with x-message-ttl = 2s
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            Assert.Equal(1u, await ch.MessageCountAsync(parkingName));
+
+            // The TTL applies: once it elapses, the broker drops the parked message.
+            await Task.Delay(TimeSpan.FromSeconds(4));
+
+            Assert.Equal(0u, await ch.MessageCountAsync(parkingName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    private ConnectionFactory Factory() => new ConnectionFactory
+    {
+        HostName = _fixture.Host,
+        Port = _fixture.Port,
+        UserName = _fixture.Username,
+        Password = _fixture.Password
+    };
+
+    private static async Task<bool> QueueExistsAsync(IConnection conn, string queueName)
+    {
+        using var probe = await conn.CreateChannelAsync();
+
+        try
+        {
+            await probe.QueueDeclarePassiveAsync(queueName);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 

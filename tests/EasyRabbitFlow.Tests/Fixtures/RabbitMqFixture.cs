@@ -12,10 +12,18 @@ public class RabbitMqFixture : IAsyncLifetime
 {
     // RabbitMQ 4.x (matches what Aspire provisions). 4.x is stricter than 3.13: notably it rejects the
     // 'x-consumer-timeout' queue argument on queue.declare, which the consumer must tolerate.
-    private readonly RabbitMqContainer _container = new RabbitMqBuilder("rabbitmq:4.3-management")
+    // The image tag can be overridden via the RABBITMQ_IMAGE env var so CI can run the suite against
+    // several broker versions (see the matrix in .github/workflows/ci.yml); defaults to 4.3-management.
+    private readonly RabbitMqContainer _container = new RabbitMqBuilder(ResolveImage())
         .WithUsername("guest")
         .WithPassword("guest")
         .Build();
+
+    private static string ResolveImage()
+    {
+        var image = Environment.GetEnvironmentVariable("RABBITMQ_IMAGE");
+        return string.IsNullOrWhiteSpace(image) ? "rabbitmq:4.3-management" : image;
+    }
 
     public string Host => _container.Hostname;
     public int Port => _container.GetMappedPublicPort(5672);

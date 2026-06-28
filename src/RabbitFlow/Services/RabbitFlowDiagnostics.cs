@@ -56,6 +56,9 @@ namespace EasyRabbitFlow.Services
         internal static readonly Counter<long> ParkedMessages = Meter.CreateCounter<long>(
             "easyrabbitflow.messages.parked", "{message}", "Messages moved to the parking queue (tag 'reason' = exhausted | permanent | malformed).");
 
+        internal static readonly Counter<long> DiscardedMessages = Meter.CreateCounter<long>(
+            "easyrabbitflow.messages.discarded", "{message}", "Messages permanently dropped by the reprocessor instead of being parked (tag 'reason' = exhausted | permanent).");
+
         internal static readonly Histogram<double> ConsumeDuration = Meter.CreateHistogram<double>(
             "easyrabbitflow.consumer.message.duration", "s", "End-to-end processing time per delivered message, including in-process retries.");
 

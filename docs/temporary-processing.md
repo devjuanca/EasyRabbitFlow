@@ -29,9 +29,9 @@ public class InvoiceService
                 Console.WriteLine($"Processing invoice {invoice.Id}...");
                 await Task.Delay(500, ct); // Simulate work
             },
-            onCompleted: (total, errors) =>
+            onCompleted: run =>
             {
-                Console.WriteLine($"Done! Processed: {total}, Errors: {errors}");
+                Console.WriteLine($"Done! Processed: {run.ProcessedMessages}, Errors: {run.FailedMessages}");
             },
             options: new RunTemporaryOptions
             {
@@ -56,9 +56,9 @@ TemporaryRunResult run = await _temporary.RunAsync(
     {
         await ProcessInvoiceAsync(invoice, ct);
     },
-    onCompleted: (total, errors) =>
+    onCompleted: run =>
     {
-        Console.WriteLine($"Done! Processed: {total}, Errors: {errors}");
+        Console.WriteLine($"Done! Processed: {run.ProcessedMessages}, Errors: {run.FailedMessages}");
     },
     onError: async (failedInvoice, ct) =>
     {
@@ -84,7 +84,7 @@ if (!run.Success)
 
 ### Async Completion Callback
 
-When the completion logic needs to `await` (e.g. flushing state to a database, publishing a follow-up message, calling another service), use the overload that takes `onCompletedAsync` instead of `onCompleted`. The callback receives the processed count, error count, and the operation's `CancellationToken`:
+When the completion logic needs to `await` (e.g. flushing state to a database, publishing a follow-up message, calling another service), use the overload that takes `onCompletedAsync` instead of `onCompleted`. The callback receives the run's `TemporaryRunResult` and the operation's `CancellationToken`:
 
 ```csharp
 TemporaryRunResult run = await _temporary.RunAsync(
@@ -93,10 +93,10 @@ TemporaryRunResult run = await _temporary.RunAsync(
     {
         await ProcessInvoiceAsync(invoice, ct);
     },
-    onCompletedAsync: async (total, errors, ct) =>
+    onCompletedAsync: async (result, ct) =>
     {
-        await _metrics.RecordBatchAsync(total, errors, ct);
-        await _publisher.PublishAsync(new BatchCompleted { Total = total, Errors = errors });
+        await _metrics.RecordBatchAsync(result.ProcessedMessages, result.FailedMessages, ct);
+        await _publisher.PublishAsync(new BatchCompleted { Total = result.ProcessedMessages, Errors = result.FailedMessages });
     });
 ```
 
@@ -104,10 +104,10 @@ Picking which overload to use:
 
 | Use this | When |
 |----------|------|
-| `onCompleted: (total, errors) => …` | Synchronous wrap-up (logging, in-memory counters) |
-| `onCompletedAsync: async (total, errors, ct) => …` | Wrap-up that needs to `await` I/O |
+| `onCompleted: result => …` | Synchronous wrap-up (logging, in-memory counters) |
+| `onCompletedAsync: async (result, ct) => …` | Wrap-up that needs to `await` I/O |
 
-Both overloads coexist — existing callers using `onCompleted` keep working unchanged.
+Both overloads coexist. The completion callback receives the **same** `TemporaryRunResult` that `RunAsync` returns, so it has access to the full counters, `CorrelationId`, `QueueName`, `Duration`, `Success`, and `Errors` — not just the processed/failed counts.
 
 ### With Result Collection
 
@@ -119,11 +119,11 @@ TemporaryRunResult<InvoiceResult> run = await _temporary.RunAsync<Invoice, Invoi
         var result = await ProcessInvoiceAsync(invoice, ct);
         return new InvoiceResult { InvoiceId = invoice.Id, Status = "Completed" };
     },
-    onCompletedAsync: async (count, results) =>
+    onCompletedAsync: async (run, ct) =>
     {
-        // results is a ConcurrentQueue<InvoiceResult> with all collected results
-        Console.WriteLine($"Processed {count} invoices, collected {results.Count} results");
-        await SaveResultsAsync(results);
+        // run.Results is an IReadOnlyList<InvoiceResult> with all collected results
+        Console.WriteLine($"Processed {run.ProcessedMessages} invoices, collected {run.Results.Count} results");
+        await SaveResultsAsync(run.Results);
     },
     onError: async (failedInvoice, ct) =>
     {

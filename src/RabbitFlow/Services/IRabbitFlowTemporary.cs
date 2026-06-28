@@ -30,11 +30,8 @@ namespace EasyRabbitFlow.Services
         /// </param>
         /// <param name="onCompleted">
         /// An optional callback executed after all messages have been processed.
-        /// <br/>
-        /// <ul>
-        /// <li><b>First parameter:</b> The number of processed messages.</li>
-        /// <li><b>Second parameter:</b> The number of messages that encountered errors.</li>
-        /// </ul>
+        /// Receives the <see cref="TemporaryRunResult"/> describing the whole run
+        /// (counters, correlation id, queue name, duration, success flag, and errors).
         /// </param>
         /// <param name="onError">
         /// An optional asynchronous callback executed when a message fails to publish or fails during processing (due to timeout, cancellation, or exception).
@@ -67,7 +64,7 @@ namespace EasyRabbitFlow.Services
         Task<TemporaryRunResult> RunAsync<T>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task> onMessageReceived,
-            Action<int, int>? onCompleted = null,
+            Action<TemporaryRunResult>? onCompleted = null,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class;
@@ -87,9 +84,8 @@ namespace EasyRabbitFlow.Services
         /// An asynchronous callback executed after all messages have been processed.
         /// <br/>
         /// <ul>
-        /// <li><b>First parameter:</b> The number of processed messages.</li>
-        /// <li><b>Second parameter:</b> The number of messages that encountered errors.</li>
-        /// <li><b>Third parameter:</b> A <see cref="CancellationToken"/> propagated from the caller.</li>
+        /// <li><b>First parameter:</b> The <see cref="TemporaryRunResult"/> describing the whole run (counters, correlation id, queue name, duration, success flag, and errors).</li>
+        /// <li><b>Second parameter:</b> A <see cref="CancellationToken"/> propagated from the caller.</li>
         /// </ul>
         /// </param>
         /// <param name="onError">
@@ -105,7 +101,7 @@ namespace EasyRabbitFlow.Services
         Task<TemporaryRunResult> RunAsync<T>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task> onMessageReceived,
-            Func<int, int, CancellationToken, Task> onCompletedAsync,
+            Func<TemporaryRunResult, CancellationToken, Task> onCompletedAsync,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class;
@@ -125,8 +121,8 @@ namespace EasyRabbitFlow.Services
         /// Asynchronous callback executed once all messages have been processed.
         /// <br/>
         /// <ul>
-        /// <li><b>First parameter:</b> The total number of messages processed.</li>
-        /// <li><b>Second parameter:</b> A thread-safe queue containing the results of each message.</li>
+        /// <li><b>First parameter:</b> The <see cref="TemporaryRunResult{TResult}"/> describing the whole run, including the <c>Results</c> collected from successful handlers.</li>
+        /// <li><b>Second parameter:</b> A <see cref="CancellationToken"/> propagated from the caller.</li>
         /// </ul>
         /// </param>
         /// <param name="onError">
@@ -142,7 +138,7 @@ namespace EasyRabbitFlow.Services
         Task<TemporaryRunResult<TResult>> RunAsync<T, TResult>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task<TResult>> onMessageReceived,
-            Func<int, ConcurrentQueue<TResult>, Task> onCompletedAsync,
+            Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class;
@@ -168,14 +164,14 @@ namespace EasyRabbitFlow.Services
         public Task<TemporaryRunResult> RunAsync<T>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task> onMessageReceived,
-            Action<int, int>? onCompleted = null,
+            Action<TemporaryRunResult>? onCompleted = null,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class
         {
-            Func<int, int, CancellationToken, Task> wrapped = (p, e, _) =>
+            Func<TemporaryRunResult, CancellationToken, Task> wrapped = (result, _) =>
             {
-                onCompleted?.Invoke(p, e);
+                onCompleted?.Invoke(result);
                 return Task.CompletedTask;
             };
 
@@ -185,7 +181,7 @@ namespace EasyRabbitFlow.Services
         public async Task<TemporaryRunResult> RunAsync<T>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task> onMessageReceived,
-            Func<int, int, CancellationToken, Task> onCompletedAsync,
+            Func<TemporaryRunResult, CancellationToken, Task> onCompletedAsync,
             Func<T, CancellationToken, Task>? onError = null,
             RunTemporaryOptions? options = null,
             CancellationToken cancellationToken = default) where T : class
@@ -198,7 +194,7 @@ namespace EasyRabbitFlow.Services
                     return null;
                 },
                 collectResults: false,
-                (processed, failed, _, ct) => onCompletedAsync(processed, failed, ct),
+                (result, ct) => onCompletedAsync(result, ct),
                 onError,
                 options,
                 cancellationToken).ConfigureAwait(false);
@@ -207,7 +203,7 @@ namespace EasyRabbitFlow.Services
         public Task<TemporaryRunResult<TResult>> RunAsync<T, TResult>(
                IReadOnlyList<T> messages,
                Func<T, CancellationToken, Task<TResult>> onMessageReceived,
-               Func<int, ConcurrentQueue<TResult>, Task> onCompletedAsync,
+               Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
                Func<T, CancellationToken, Task>? onError = null,
                RunTemporaryOptions? options = null,
                CancellationToken cancellationToken = default) where T : class
@@ -216,7 +212,7 @@ namespace EasyRabbitFlow.Services
                 messages,
                 onMessageReceived,
                 collectResults: true,
-                (processed, _, results, ct) => onCompletedAsync(processed, results),
+                onCompletedAsync,
                 onError,
                 options,
                 cancellationToken);
@@ -226,7 +222,7 @@ namespace EasyRabbitFlow.Services
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task<TResult>> onMessageReceived,
             bool collectResults,
-            Func<int, int, ConcurrentQueue<TResult>, CancellationToken, Task> onCompletedAsync,
+            Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
             Func<T, CancellationToken, Task>? onError,
             RunTemporaryOptions? options,
             CancellationToken cancellationToken) where T : class
@@ -561,6 +557,8 @@ namespace EasyRabbitFlow.Services
                 tcs.TrySetCanceled(effectiveCt);
             });
 
+            TemporaryRunResult<TResult> finalResult = null!;
+
             try
             {
                 await tcs.Task.ConfigureAwait(false);
@@ -623,35 +621,39 @@ namespace EasyRabbitFlow.Services
                     }
                 }
 
+                // Build the result snapshot the callback receives. Counters are stable here
+                // (all handlers drained); only Errors can still grow if the callback itself throws.
+                var completedUtc = DateTime.UtcNow;
+
+                finalResult = new TemporaryRunResult<TResult>(
+                    maxMessages, published, processed, succeeded, failed,
+                    correlationId, _queue, startedUtc, completedUtc,
+                    runErrors.ToArray(), resultsQueue.ToArray());
+
                 // Always run the completion callback
                 try
                 {
                     _logger.LogDebug("[RabbitFlowTemporary] Executing completion callback. Processed: {processed}, Failed: {failed}, Results: {results}, CorrelationId: {correlationId}",
                         processed, failed, resultsQueue.Count, correlationId);
 
-                    await onCompletedAsync(processed, failed, resultsQueue, cancellationToken).ConfigureAwait(false);
+                    await onCompletedAsync(finalResult, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Completion, ex, _queue));
                     _logger.LogError(ex, "[RabbitFlowTemporary] Error in completion callback. CorrelationId: {correlationId}", correlationId);
+
+                    // The callback couldn't see its own failure, but the returned result should: re-snapshot with the completion error.
+                    finalResult = new TemporaryRunResult<TResult>(
+                        maxMessages, published, processed, succeeded, failed,
+                        correlationId, _queue, startedUtc, completedUtc,
+                        runErrors.ToArray(), resultsQueue.ToArray());
                 }
 
                 channelGate.Dispose();
             }
 
-            return new TemporaryRunResult<TResult>(
-                maxMessages,
-                published,
-                processed,
-                succeeded,
-                failed,
-                correlationId,
-                _queue,
-                startedUtc,
-                DateTime.UtcNow,
-                runErrors.ToArray(),
-                resultsQueue.ToArray());
+            return finalResult;
         }
 
         private static async Task InvokeOnErrorAsync<T>(Func<T, CancellationToken, Task>? onError, T message, CancellationToken cancellationToken, ILogger logger, string? correlationId)

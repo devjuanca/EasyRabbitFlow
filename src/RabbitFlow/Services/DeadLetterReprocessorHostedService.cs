@@ -74,6 +74,8 @@ namespace EasyRabbitFlow.Services
                 var maxAttempts = (int)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.MaxReprocessAttempts))!.GetValue(reprocessObj)!;
                 var interval = (TimeSpan)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.Interval))!.GetValue(reprocessObj)!;
                 var maxMessagesPerCycle = (int)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.MaxMessagesPerCycle))!.GetValue(reprocessObj)!;
+                var finalAction = (DeadLetterFinalAction)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.FinalAction))!.GetValue(reprocessObj)!;
+                var parkingMessageTtl = (TimeSpan?)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.ParkingMessageTtl))!.GetValue(reprocessObj);
 
                 var worker = new DeadLetterReprocessWorker(
                     _logger,
@@ -83,14 +85,16 @@ namespace EasyRabbitFlow.Services
                     queueName: settings.QueueName,
                     maxAttempts: maxAttempts,
                     interval: interval,
-                    maxMessagesPerCycle: maxMessagesPerCycle);
+                    maxMessagesPerCycle: maxMessagesPerCycle,
+                    finalAction: finalAction,
+                    parkingMessageTtl: parkingMessageTtl);
 
                 _workers.Add(worker);
 
                 worker.Start(_stoppingCts.Token);
 
-                _logger.LogInformation("[RABBIT-FLOW]: Dead-letter reprocessor enabled for {Consumer}. Queue={Queue}, Interval={Interval}, MaxAttempts={MaxAttempts}, MaxMessagesPerCycle={MaxPerCycle}",
-                    marker.ConsumerType.Name, settings.QueueName, interval, maxAttempts, maxMessagesPerCycle);
+                _logger.LogInformation("[RABBIT-FLOW]: Dead-letter reprocessor enabled for {Consumer}. Queue={Queue}, Interval={Interval}, MaxAttempts={MaxAttempts}, MaxMessagesPerCycle={MaxPerCycle}, FinalAction={FinalAction}, ParkingTtl={ParkingTtl}",
+                    marker.ConsumerType.Name, settings.QueueName, interval, maxAttempts, maxMessagesPerCycle, finalAction, parkingMessageTtl);
             }
 
             return Task.CompletedTask;
@@ -126,6 +130,8 @@ namespace EasyRabbitFlow.Services
         private readonly int _maxAttempts;
         private readonly TimeSpan _interval;
         private readonly int _maxMessagesPerCycle;
+        private readonly DeadLetterFinalAction _finalAction;
+        private readonly TimeSpan? _parkingMessageTtl;
 
         private Task? _runTask;
 
@@ -146,7 +152,9 @@ namespace EasyRabbitFlow.Services
             string queueName,
             int maxAttempts,
             TimeSpan interval,
-            int maxMessagesPerCycle)
+            int maxMessagesPerCycle,
+            DeadLetterFinalAction finalAction,
+            TimeSpan? parkingMessageTtl)
         {
             _logger = logger;
             _connectionFactory = connectionFactory;
@@ -160,6 +168,8 @@ namespace EasyRabbitFlow.Services
             _maxAttempts = maxAttempts;
             _interval = interval;
             _maxMessagesPerCycle = maxMessagesPerCycle;
+            _finalAction = finalAction;
+            _parkingMessageTtl = parkingMessageTtl;
         }
 
         public void Start(CancellationToken cancellationToken)
@@ -228,16 +238,25 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
-            // Parking queue for messages that will never be re-enqueued (exhausted, permanent, malformed), so they
-            // don't churn through the DLQ on every cycle. Ensured only now that the DLQ actually has messages to
-            // drain, so the queue never appears on the broker unless the reprocessor really has dead messages to
-            // handle. Ensured on a throwaway channel (not the working one) so a passive-declare 404 can't take the
-            // cycle's channel down with it.
-            await EnsureParkingQueueAsync(connection, ct).ConfigureAwait(false);
+            // Parking queue for messages that will never be re-enqueued. Created lazily — only the first time
+            // this cycle actually needs to park something — so it never appears on the broker unless a message
+            // is genuinely parked. In particular, with FinalAction.Discard the only thing that still parks is a
+            // malformed message, so the queue stays absent unless one shows up. Ensured on a throwaway channel
+            // (not the working one) so a passive-declare 404 can't take the cycle's channel down with it.
+            var parkingEnsured = false;
+
+            async Task EnsureParkingOnceAsync()
+            {
+                if (parkingEnsured) return;
+
+                await EnsureParkingQueueAsync(connection, ct).ConfigureAwait(false);
+
+                parkingEnsured = true;
+            }
 
             var toProcess = (int)Math.Min(initialCount, (uint)_maxMessagesPerCycle);
 
-            int reenqueued = 0, exhausted = 0, malformed = 0, permanent = 0;
+            int reenqueued = 0, exhausted = 0, malformed = 0, permanent = 0, discarded = 0;
 
             for (int i = 0; i < toProcess && !ct.IsCancellationRequested; i++)
             {
@@ -269,9 +288,13 @@ namespace EasyRabbitFlow.Services
 
                 if (envelope == null || !envelope.MessageData.HasValue)
                 {
+                    // Malformed messages are always parked, never discarded: their bytes could not be parsed,
+                    // so dropping them would lose data with no recoverable trace, regardless of FinalAction.
                     malformed++;
 
                     RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "malformed"));
+
+                    await EnsureParkingOnceAsync().ConfigureAwait(false);
 
                     await ParkUnchangedAsync(channel, result, ct).ConfigureAwait(false);
 
@@ -284,10 +307,24 @@ namespace EasyRabbitFlow.Services
                 if (!isTransient)
                 {
                     permanent++;
+
+                    if (_finalAction == DeadLetterFinalAction.Discard)
+                    {
+                        _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} discarding permanent failure ({ExceptionType}) from {Dlq} (FinalAction=Discard).",
+                            _consumerName, envelope.ExceptionType ?? "(unknown)", _deadLetterQueueName);
+
+                        if (await DiscardAsync(channel, result, "permanent", ct).ConfigureAwait(false))
+                            discarded++;
+
+                        continue;
+                    }
+
                     _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} parking permanent failure ({ExceptionType}) from {Dlq}.",
                         _consumerName, envelope.ExceptionType ?? "(unknown)", _deadLetterQueueName);
 
                     RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "permanent"));
+
+                    await EnsureParkingOnceAsync().ConfigureAwait(false);
 
                     await ParkUnchangedAsync(channel, result, ct).ConfigureAwait(false);
 
@@ -318,6 +355,16 @@ namespace EasyRabbitFlow.Services
                         break;
                     }
                 }
+                else if (_finalAction == DeadLetterFinalAction.Discard)
+                {
+                    exhausted++;
+
+                    _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} discarding exhausted message from {Dlq} (FinalAction=Discard).",
+                        _consumerName, _deadLetterQueueName);
+
+                    if (await DiscardAsync(channel, result, "exhausted", ct).ConfigureAwait(false))
+                        discarded++;
+                }
                 else
                 {
                     envelope.ReprocessAttempts = _maxAttempts;
@@ -326,7 +373,16 @@ namespace EasyRabbitFlow.Services
                     {
                         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, _serializerOptions));
 
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: bytes, cancellationToken: ct).ConfigureAwait(false);
+                        var parkProps = new BasicProperties
+                        {
+                            DeliveryMode = DeliveryModes.Persistent,
+                            MessageId = envelope.MessageId,
+                            CorrelationId = envelope.CorrelationId
+                        };
+
+                        await EnsureParkingOnceAsync().ConfigureAwait(false);
+
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: bytes, cancellationToken: ct).ConfigureAwait(false);
 
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
 
@@ -342,8 +398,8 @@ namespace EasyRabbitFlow.Services
                 }
             }
 
-            _logger.LogInformation("[RABBIT-FLOW]: Reprocessor cycle for {Consumer} done. Reenqueued={Reenqueued}, Parked: Exhausted={Exhausted}, Permanent={Permanent}, Malformed={Malformed}.",
-                _consumerName, reenqueued, exhausted, permanent, malformed);
+            _logger.LogInformation("[RABBIT-FLOW]: Reprocessor cycle for {Consumer} done. Reenqueued={Reenqueued}, Exhausted={Exhausted}, Permanent={Permanent}, Malformed={Malformed}, Discarded={Discarded} (FinalAction={FinalAction}).",
+                _consumerName, reenqueued, exhausted, permanent, malformed, discarded, _finalAction);
         }
 
         // Make sure the parking queue exists without fighting over its arguments. We probe with a passive
@@ -378,9 +434,50 @@ namespace EasyRabbitFlow.Services
 
             using var create = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
 
-            await create.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, cancellationToken: ct).ConfigureAwait(false);
+            // Apply the configured TTL only on creation; a pre-existing queue is adopted as-is above so we never
+            // fight over its arguments (PRECONDITION_FAILED). A parking queue with x-message-ttl and no dead-letter
+            // target ages out parked messages by dropping them.
+            IDictionary<string, object?>? arguments = null;
 
-            _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}'.", _parkingQueueName);
+            if (_parkingMessageTtl.HasValue)
+            {
+                arguments = new Dictionary<string, object?>
+                {
+                    ["x-message-ttl"] = (long)_parkingMessageTtl.Value.TotalMilliseconds
+                };
+            }
+
+            await create.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, arguments: arguments, cancellationToken: ct).ConfigureAwait(false);
+
+            if (_parkingMessageTtl.HasValue)
+            {
+                _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}' with message TTL {Ttl}.", _parkingQueueName, _parkingMessageTtl.Value);
+            }
+            else
+            {
+                _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}'.", _parkingQueueName);
+            }
+        }
+
+        // Discard a message by acking it off the DLQ without re-publishing it anywhere. Returns true on success.
+        // A failed ack leaves the message on the DLQ (it will be redelivered next cycle) and is logged rather than
+        // aborting the cycle, matching ParkUnchangedAsync's resilience.
+        private async Task<bool> DiscardAsync(IChannel channel, BasicGetResult result, string reason, CancellationToken ct)
+        {
+            try
+            {
+                await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
+
+                RabbitFlowDiagnostics.DiscardedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", reason));
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[RABBIT-FLOW]: Failed to discard {Reason} message from {Dlq}.", reason, _deadLetterQueueName);
+
+                return false;
+            }
         }
 
         private static BasicProperties BuildRestoredProperties(DeadLetterEnvelope envelope, int newAttempts)
@@ -435,7 +532,13 @@ namespace EasyRabbitFlow.Services
         {
             try
             {
-                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
+                // Preserve the original message's properties (MessageId, CorrelationId, headers, ...) and force
+                // persistence so parked messages survive a broker restart on the durable parking queue.
+                var parkProps = result.BasicProperties != null
+                    ? new BasicProperties(result.BasicProperties) { DeliveryMode = DeliveryModes.Persistent }
+                    : new BasicProperties { DeliveryMode = DeliveryModes.Persistent };
+
+                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
                 await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
             }
             catch (Exception ex)

@@ -13,6 +13,15 @@ env:
 jobs:
   build_and_test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run the integration suite against a 3.x and a 4.x RabbitMQ image
+        # to cover both major versions still in use.
+        rabbitmq:
+          - rabbitmq:3.13.7-management
+          - rabbitmq:4.3.2-management
+    name: build_and_test (${{ matrix.rabbitmq }})
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +36,9 @@ jobs:
         run: dotnet build --configuration Release
 
       # Integration tests run against a real RabbitMQ broker via Testcontainers
-      # (Docker is preinstalled on ubuntu-latest runners).
+      # (Docker is preinstalled on ubuntu-latest runners). RABBITMQ_IMAGE selects
+      # the broker version the RabbitMqFixture spins up for this matrix leg.
       - name: Test
+        env:
+          RABBITMQ_IMAGE: ${{ matrix.rabbitmq }}
         run: dotnet test tests/EasyRabbitFlow.Tests --configuration Release --no-build --logger "console;verbosity=normal"

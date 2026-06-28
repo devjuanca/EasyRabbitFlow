@@ -198,7 +198,33 @@ That's it — **four steps** from zero to a working publish/consume pipeline.
 
 All three overloads return a rich result (`TotalMessages`, `PublishedMessages`, `ProcessedMessages`, `SucceededMessages`, `FailedMessages`, `Success`, `Duration`, `Errors`); the `<T, TResult>` overload returns `TemporaryRunResult<TResult>` with a `Results` collection. See [Temporary Batch Processing](docs/temporary-processing.md#temporary-batch-processing).
 
-**Migration:** replace `int processed = await temporary.RunAsync(...)` with `var run = await temporary.RunAsync(...)` and read `run.ProcessedMessages` (or the richer counters). The `onCompleted` / `onCompletedAsync` callbacks are unchanged.
+**Migration:** replace `int processed = await temporary.RunAsync(...)` with `var run = await temporary.RunAsync(...)` and read `run.ProcessedMessages` (or the richer counters).
+
+**`onCompleted` / `onCompletedAsync` now receive the `TemporaryRunResult` instead of loose counters**
+
+The completion callbacks no longer take separate `processed` / `errors` (or a `ConcurrentQueue<TResult>`) arguments — they receive the same `TemporaryRunResult` that `RunAsync` returns, so the callback sees the full picture (counters, correlation id, queue name, duration, `Success`, `Errors`, and — for the `<T, TResult>` overload — the collected `Results`). New signatures:
+
+| Callback | Before | After |
+|----------|--------|-------|
+| `onCompleted` | `Action<int, int>` | `Action<TemporaryRunResult>` |
+| `onCompletedAsync` | `Func<int, int, CancellationToken, Task>` | `Func<TemporaryRunResult, CancellationToken, Task>` |
+| `onCompletedAsync` (`<T, TResult>`) | `Func<int, ConcurrentQueue<TResult>, Task>` | `Func<TemporaryRunResult<TResult>, CancellationToken, Task>` |
+
+**Migration:**
+
+```csharp
+// Before
+onCompleted: (processed, errors) => Log(processed, errors)
+onCompletedAsync: async (processed, errors, ct) => await Flush(processed, errors, ct)
+onCompletedAsync: async (count, results) => await Save(results)            // <T, TResult>
+
+// After
+onCompleted: run => Log(run.ProcessedMessages, run.FailedMessages)
+onCompletedAsync: async (run, ct) => await Flush(run.ProcessedMessages, run.FailedMessages, ct)
+onCompletedAsync: async (run, ct) => await Save(run.Results)               // <T, TResult>
+```
+
+> The `<T, TResult>` completion callback also gains the `CancellationToken` it previously lacked.
 
 **`IRabbitFlowState` has two new interface members**
 

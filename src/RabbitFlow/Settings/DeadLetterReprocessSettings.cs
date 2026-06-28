@@ -27,6 +27,13 @@ namespace EasyRabbitFlow.Settings
         /// with the final attempt count recorded in its envelope so it can be inspected from a RabbitMQ client.
         /// Default is <c>3</c>.
         /// </summary>
+        /// <remarks>
+        /// This counts <b>re-enqueues</b>, not total handler executions. The original delivery is not a reprocess,
+        /// so a value of <c>N</c> means the handler runs up to <c>N + 1</c> times before the message is parked
+        /// (1 original delivery + <c>N</c> reprocesses). For example, <c>MaxReprocessAttempts = 1</c> ⇒ the message
+        /// is delivered, fails, re-enqueued once, fails again, and is then parked: 2 executions in total.
+        /// The minimum is <c>1</c> (an enabled reprocessor always grants at least one retry).
+        /// </remarks>
         public int MaxReprocessAttempts
         {
             get => _maxReprocessAttempts;
@@ -76,5 +83,42 @@ namespace EasyRabbitFlow.Settings
         }
 
         private int _maxMessagesPerCycle = int.MaxValue;
+
+        /// <summary>
+        /// What to do with a message that reaches a terminal, non-reprocessable state — <b>exhausted</b>
+        /// (ran out of reprocess attempts) or <b>permanent</b> (non-transient failure). Default is
+        /// <see cref="DeadLetterFinalAction.Park"/>, which preserves the historical behavior of moving the
+        /// message to the parking queue.
+        /// </summary>
+        /// <remarks>
+        /// This does <b>not</b> apply to <i>malformed</i> messages, which are always parked regardless of this
+        /// value. When set to <see cref="DeadLetterFinalAction.Discard"/>, the parking queue is only ever
+        /// created if a malformed message is encountered; exhausted and permanent messages are acknowledged
+        /// off the dead-letter queue and dropped.
+        /// </remarks>
+        public DeadLetterFinalAction FinalAction { get; set; } = DeadLetterFinalAction.Park;
+
+        /// <summary>
+        /// Optional time-to-live applied to the parking queue <b>when the reprocessor creates it</b>. When set,
+        /// the queue is declared with <c>x-message-ttl</c> so parked messages are aged out automatically after
+        /// this duration. Default is <c>null</c> (no TTL — parked messages stay until consumed or purged).
+        /// </summary>
+        /// <remarks>
+        /// The TTL only takes effect on a parking queue the reprocessor declares itself. If the queue already
+        /// exists, the reprocessor adopts it as-is (it never fights over arguments), so a pre-existing parking
+        /// queue keeps its own TTL — or lack of one. To apply this TTL to an existing queue, delete it and let
+        /// the reprocessor recreate it. Note that a TTL with no dead-letter target on the parking queue means
+        /// expired messages are dropped, so combining <see cref="DeadLetterFinalAction.Park"/> with a TTL is
+        /// effectively a delayed discard.
+        /// </remarks>
+        public TimeSpan? ParkingMessageTtl
+        {
+            get => _parkingMessageTtl;
+            set => _parkingMessageTtl = value.HasValue && value.Value <= TimeSpan.Zero
+                ? throw new ArgumentOutOfRangeException(nameof(ParkingMessageTtl), "ParkingMessageTtl must be greater than zero when set.")
+                : value;
+        }
+
+        private TimeSpan? _parkingMessageTtl;
     }
 }

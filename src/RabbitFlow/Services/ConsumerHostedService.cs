@@ -930,7 +930,16 @@ namespace EasyRabbitFlow.Services
                     {
                         try
                         {
-                            await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, body: bytes, cancellationToken: ct);
+                            // Publish the envelope persistent so it survives a broker restart while it waits in the
+                            // durable DLQ for the next reprocessor cycle (which can be up to Interval — hours — away).
+                            var dlqProps = new BasicProperties
+                            {
+                                DeliveryMode = DeliveryModes.Persistent,
+                                MessageId = messageId,
+                                CorrelationId = correlationId
+                            };
+
+                            await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, mandatory: false, basicProperties: dlqProps, body: bytes, cancellationToken: ct);
 
                             published = true;
                         }

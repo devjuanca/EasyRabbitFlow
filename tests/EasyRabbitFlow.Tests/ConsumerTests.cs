@@ -759,6 +759,10 @@ public class ConsumerTests
         // Assert
         Assert.NotNull(dlqResult);
 
+        // Envelope is published persistent so it survives a broker restart while it waits in the durable
+        // DLQ for the next reprocessor cycle.
+        Assert.Equal(DeliveryModes.Persistent, dlqResult!.BasicProperties.DeliveryMode);
+
         var envelope = JsonSerializer.Deserialize<DeadLetterEnvelope>(dlqResult!.Body.Span, jsonOpts);
         Assert.NotNull(envelope);
         Assert.Equal(expectedTransient, envelope!.IsTransient);
