@@ -17,7 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EasyRabbitFlow.Tests", "tes
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{CBF5BAFC-127C-49AA-A58F-0DBBF797E2BF}"
 	ProjectSection(SolutionItems) = preProject
-		.github\workflows\main.yml = .github\workflows\main.yml
+		.github\workflows\ci.yml = .github\workflows\ci.yml
+		.github\workflows\publish.yml = .github\workflows\publish.yml
 	EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RabbitFlowSample.AppHost", "sample\RabbitFlowSample.AppHost\RabbitFlowSample.AppHost.csproj", "{85B1206D-896E-400E-B861-BDDCDC220C6A}"
