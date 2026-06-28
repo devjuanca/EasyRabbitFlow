@@ -16,9 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Run the integration suite against each supported RabbitMQ 4.x image.
+        # Run the integration suite against a 3.x and a 4.x RabbitMQ image
+        # to cover both major versions still in use.
         rabbitmq:
-          - rabbitmq:4.3-management
+          - rabbitmq:3.13.7-management
           - rabbitmq:4.3.2-management
     name: build_and_test (${{ matrix.rabbitmq }})
     steps:
