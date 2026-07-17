@@ -6,6 +6,7 @@
 |--------|----------------------|
 | `Notifications/` | Fanout exchange, retry policies, dead-letter envelope + reprocessor, DI lifetimes |
 | `Orders/` | Topic exchange with `*` / `#` wildcard bindings |
+| `IntegrationEvents/` | Publisher-owned exchange (`DeclareExchange`) — no consumers; external clients bind their own queues |
 | `Payments/` | Dead-letter replicas (audit + alerting feeds from the same DLX) |
 | `SupportTickets/` | Priority queues (`MaxPriority` + `PublishOptions.Priority`) |
 | `Thumbnails/` | Temporary queues: `TemporaryRunResult`, per-job `Timeout`, whole-run `RunTimeout`, fire-and-forget |

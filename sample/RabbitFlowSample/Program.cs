@@ -6,6 +6,7 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using RabbitFlowSample.Common;
+using RabbitFlowSample.Samples.IntegrationEvents;
 using RabbitFlowSample.Samples.Notifications;
 using RabbitFlowSample.Samples.Orders;
 using RabbitFlowSample.Samples.Payments;
@@ -83,6 +84,9 @@ builder.Services.AddRabbitFlow(settings =>
         pub.PublisherId = "sample-api";
     });
 
+    // Publisher-owned exchange — declared without any consumer (see Samples/IntegrationEvents).
+    IntegrationEventsModule.RegisterTopology(settings);
+
     NotificationsModule.RegisterConsumers(settings);
 
     OrdersModule.RegisterConsumers(settings);
@@ -147,6 +151,8 @@ app.MapGet("/diagnostics/queues", async (IRabbitFlowState state, CancellationTok
 })
 .WithName("GetQueuesState")
 .WithTags("Diagnostics");
+
+IntegrationEventsModule.MapEndpoints(app);
 
 NotificationsModule.MapEndpoints(app);
 

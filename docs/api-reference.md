@@ -42,6 +42,7 @@ IHealthChecksBuilder AddRabbitFlow(this IHealthChecksBuilder builder,
 | `ConfigureHost(Action<HostSettings>)` | Set RabbitMQ connection details |
 | `ConfigureJsonSerializerOptions(Action<JsonSerializerOptions>)` | Customize JSON serialization |
 | `ConfigurePublisher(Action<PublisherConnectionOptions>?)` | Configure publisher behavior |
+| `DeclareExchange(string exchangeName, ExchangeType, Action<ExchangeDeclaration>?)` | Declare an application-owned exchange at startup, no consumer required — see [Configuration](configuration.md#application-owned-exchanges) |
 | `AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>>)` | Register a consumer |
 
 ---

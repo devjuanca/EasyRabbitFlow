@@ -1,0 +1,57 @@
+@host = https://localhost:7097
+
+### 1. Simulate an external subscriber: CRM service wants every user event
+POST {{host}}/integration-events/subscriptions
+Content-Type: application/json
+
+{
+  "queueName": "crm-service-users",
+  "bindingKey": "integration.user.*"
+}
+
+### 2. Simulate another external subscriber: audit service wants EVERYTHING
+POST {{host}}/integration-events/subscriptions
+Content-Type: application/json
+
+{
+  "queueName": "audit-service-firehose",
+  "bindingKey": "integration.#"
+}
+
+### 3. Publish a user event → routed to BOTH queues (crm matches integration.user.*, audit matches integration.#)
+POST {{host}}/integration-events
+Content-Type: application/json
+
+{
+  "domain": "user",
+  "action": "created",
+  "data": "{\"userId\": 42, \"email\": \"jane@example.com\"}"
+}
+
+### 4. Publish a booking event → routed ONLY to the audit queue (crm's pattern does not match)
+POST {{host}}/integration-events
+Content-Type: application/json
+
+{
+  "domain": "booking",
+  "action": "cancelled",
+  "data": "{\"bookingId\": \"B-1001\"}"
+}
+
+### 5. Verify routing: crm queue should hold 1 message
+GET {{host}}/integration-events/subscriptions/crm-service-users
+
+### 6. Verify routing: audit queue should hold 2 messages
+GET {{host}}/integration-events/subscriptions/audit-service-firehose
+
+### 7. Run this BEFORE creating any subscription: publishing still succeeds — with no matching
+###    binding the broker simply drops the message (topic semantics). The publisher never fails
+###    because subscribers are missing; the exchange always exists thanks to DeclareExchange.
+POST {{host}}/integration-events
+Content-Type: application/json
+
+{
+  "domain": "inventory",
+  "action": "restocked",
+  "data": null
+}

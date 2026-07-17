@@ -8,6 +8,7 @@ builder.Services.AddRabbitFlow(cfg =>
     cfg.ConfigureHost(...);                    // Connection settings
     cfg.ConfigureJsonSerializerOptions(...);   // Serialization (optional)
     cfg.ConfigurePublisher(...);               // Publisher behavior (optional)
+    cfg.DeclareExchange(...);                  // Application-owned exchanges (optional)
     cfg.AddConsumer<T>(...);                   // Register consumers
 });
 ```
@@ -66,5 +67,48 @@ cfg.ConfigurePublisher(pub =>
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DisposePublisherConnection` | bool | `false` | Dispose connection after each publish |
+
+### Application-Owned Exchanges
+
+A publisher-only service can declare the exchanges it owns without registering any consumer. This is the
+standard ownership split in event-driven topologies: **the producer owns the exchange; each consumer owns its
+queue and bindings**. External clients bind their own queues and routing keys to the exchange without the
+publishing service knowing about them.
+
+```csharp
+cfg.DeclareExchange("orders-events", ExchangeType.Topic);
+
+cfg.DeclareExchange("billing-events", ExchangeType.Fanout, exchange =>
+{
+    exchange.Durable = true;        // default
+    exchange.AutoDelete = false;    // default
+    exchange.Args = new Dictionary<string, object?>
+    {
+        ["alternate-exchange"] = "billing-events-unrouted"
+    };
+});
+```
+
+Call `DeclareExchange` once per exchange — as many as the service owns. The exchanges are created at
+application startup by a dedicated hosted service; `UseRabbitFlowConsumers()` is **not** required.
+
+| Parameter / Property | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `exchangeName` | string | — | Name of the exchange. Must be non-empty; names containing `deadletter` are reserved for framework-generated dead-letter topology. |
+| `exchangeType` | ExchangeType | `Direct` | Routing semantics: `Direct`, `Fanout`, `Topic`, or `Headers`. |
+| `Durable` | bool | `true` | Whether the exchange survives broker restarts. |
+| `AutoDelete` | bool | `false` | Whether the exchange is deleted when its last binding is removed. Rarely wanted for a publisher-owned exchange. |
+| `Args` | IDictionary | `null` | Optional exchange arguments (e.g. `alternate-exchange`). |
+
+Behavior notes:
+
+- **Idempotent** — an exchange that already exists with identical settings is a no-op.
+- **Mismatch-tolerant** — if the exchange already exists with a different type or arguments, the existing
+  exchange is adopted and a warning is logged instead of failing the application start. To apply the new
+  settings, delete the exchange on the broker (draining bound queues first) and restart.
+- **Broker down at startup** — the host still starts. When `AutomaticRecoveryEnabled` is `true` (default),
+  declaration keeps retrying in the background every `NetworkRecoveryInterval` until it succeeds. Publishes
+  to a not-yet-declared exchange fail and surface through `PublishResult.Success` / `Error` in the meantime.
+- Declaring an exchange twice with the same name throws at configuration time.
 
 > Every published message always carries a `MessageId`. By default it is an auto-generated GUID; pass a deterministic key via the `messageId` parameter (single) or `messageIdSelector` (batch) when you need true idempotency from business data — see [Idempotency](publishing.md#idempotency).
