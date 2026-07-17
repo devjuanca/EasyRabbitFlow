@@ -1,6 +1,8 @@
-﻿using EasyRabbitFlow.Settings;
+﻿using EasyRabbitFlow.Exceptions;
+using EasyRabbitFlow.Settings;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using RabbitMQ.Client;
 using System;
 using System.Linq;
@@ -9,6 +11,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using ExchangeType = EasyRabbitFlow.Settings.ExchangeType;
 
 namespace EasyRabbitFlow.Services
 {
@@ -98,6 +101,60 @@ namespace EasyRabbitFlow.Services
             settings?.Invoke(publisherOptions);
 
             _services.AddSingleton(publisherOptions);
+        }
+
+        /// <summary>
+        /// Declares an application-owned exchange, created at application startup independently of any consumer
+        /// registration. Intended for publisher-only services that own an exchange to which external clients
+        /// bind their own queues and routing keys. Call it once per exchange the service owns.
+        /// <para>
+        /// Declaration happens via a dedicated hosted service (no call to <c>UseRabbitFlowConsumers</c> is
+        /// required). Declares are idempotent; an exchange that already exists with different settings is
+        /// adopted with a warning instead of failing the application start. If the broker is unreachable at
+        /// startup, declaration keeps retrying in the background when
+        /// <see cref="HostSettings.AutomaticRecoveryEnabled"/> is true.
+        /// </para>
+        /// </summary>
+        /// <param name="exchangeName">Name of the exchange. Must be non-empty and must not contain the reserved
+        /// substring <c>deadletter</c>, which is appended by the framework when auto-generating dead-letter topology.</param>
+        /// <param name="exchangeType">Routing semantics of the exchange. Default is <see cref="ExchangeType.Direct"/>.</param>
+        /// <param name="configure">Optional delegate to tune durability, auto-delete and extra arguments.</param>
+        public void DeclareExchange(string exchangeName, ExchangeType exchangeType = ExchangeType.Direct, Action<ExchangeDeclaration>? configure = null)
+        {
+            if (string.IsNullOrWhiteSpace(exchangeName))
+            {
+                throw new RabbitFlowException("Exchange name must not be null or empty.");
+            }
+
+            // Only the dead-letter suffix is reserved here: "-exchange"/"-routing-key" are natural parts of an
+            // exchange name (and redeclaring an auto-generated "{queue}-exchange" with equal settings is a
+            // harmless idempotent no-op), but "deadletter" names are framework-owned machinery.
+            if (exchangeName.IndexOf(RabbitFlowTopologyNames.DeadLetterSuffix.TrimStart('-'), StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                throw new RabbitFlowException(
+                    $"Exchange name '{exchangeName}' contains the reserved substring 'deadletter'. " +
+                    "Dead-letter exchanges are auto-generated and owned by the framework; declare them via AutoGenerate on a consumer instead.");
+            }
+
+            foreach (var descriptor in _services)
+            {
+                if (descriptor.ServiceType == typeof(ExchangeDeclaration)
+                    && descriptor.ImplementationInstance is ExchangeDeclaration existing
+                    && string.Equals(existing.ExchangeName, exchangeName, StringComparison.Ordinal))
+                {
+                    throw new RabbitFlowException($"Exchange '{exchangeName}' is declared more than once.");
+                }
+            }
+
+            var declaration = new ExchangeDeclaration(exchangeName, exchangeType);
+
+            configure?.Invoke(declaration);
+
+            _services.AddSingleton(declaration);
+
+            // TryAddEnumerable dedupes by implementation type, so calling DeclareExchange multiple times
+            // registers the hosted service exactly once while every ExchangeDeclaration is still resolved.
+            _services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, TopologyHostedService>());
         }
 
         /// <summary>

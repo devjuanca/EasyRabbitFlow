@@ -6,6 +6,7 @@ ASP.NET Core minimal-API host that exercises the main features of [EasyRabbitFlo
 
 | Folder | Pattern | Highlights |
 |--------|---------|------------|
+| [IntegrationEvents](Samples/IntegrationEvents/README.md) | Publisher-owned exchange (`DeclareExchange`) | Exchange declared with zero consumers; external clients bind their own queues |
 | [Notifications](Samples/Notifications/README.md) | Fanout exchange | Pub/sub broadcast, retry policy, dead-letter envelope + reprocessor, DI lifetimes |
 | [Orders](Samples/Orders/README.md) | Topic exchange | `*` and `#` routing wildcards, multiple bindings sharing one exchange |
 | [Payments](Samples/Payments/README.md) | Dead-letter replicas | Same DLX, multiple replica queues (audit + live alerting) |
@@ -19,6 +20,7 @@ sample/RabbitFlowSample/
 ├── Program.cs                          # composition root: OpenAPI + RabbitFlow + module wiring
 ├── Common/                             # cross-sample helpers (DI demo services, fire-and-forget extension)
 ├── Samples/
+│   ├── IntegrationEvents/
 │   ├── Notifications/
 │   ├── Orders/
 │   ├── Payments/

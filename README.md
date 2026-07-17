@@ -17,6 +17,22 @@
 
 ---
 
+## What's New in v8.1
+
+- **Publisher-owned exchange declaration** — declare the exchanges your service owns directly in `AddRabbitFlow`, with no consumer registration required. External clients bind their own queues and routing keys; your service just publishes. Declared at startup by a dedicated hosted service: idempotent, adopts an existing exchange on settings mismatch (with a warning) instead of failing the start, and keeps retrying in the background if the broker is down. See [Application-Owned Exchanges](docs/configuration.md#application-owned-exchanges).
+
+```csharp
+builder.Services.AddRabbitFlow(cfg =>
+{
+    cfg.ConfigureHost(...);
+    cfg.DeclareExchange("orders-events", ExchangeType.Topic);
+    cfg.DeclareExchange("billing-events", ExchangeType.Fanout);
+});
+// No UseRabbitFlowConsumers() needed — works in a publisher-only service.
+```
+
+---
+
 ## What's New in v8.0
 
 - **OpenTelemetry-ready observability** — `ActivitySource` spans with W3C trace-context propagation across the broker, a `Meter` with message counters and a processing-duration histogram, and a native health check. See [Observability](docs/observability.md).
@@ -48,7 +64,7 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 | Guide | Contents |
 |-------|----------|
 | [Getting Started](#getting-started) | Installation and a four-step quick start |
-| [Configuration](docs/configuration.md) | Host settings, JSON serialization, publisher options |
+| [Configuration](docs/configuration.md) | Host settings, JSON serialization, publisher options, application-owned exchanges |
 | [Consumers](docs/consumers.md) | Implementing & registering consumers, auto-generate topology, retry policies, consumer timeout, message context |
 | [Dead-Letter Handling](docs/dead-letter.md) | Delivery guarantee, replicas, reprocessor, manual replay safety net |
 | [Publishing Messages](docs/publishing.md) | Single & batch publishing, idempotency, correlation, per-call AMQP options |
@@ -67,6 +83,7 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 |---------|----------------|
 | Fluent, strongly-typed configuration | ✅ |
 | Automatic queue / exchange / dead-letter generation | ✅ |
+| Publisher-owned exchange declaration — no consumer required (`DeclareExchange`) | ✅ |
 | Reflection-free per-message processing | ✅ |
 | Configurable in-process retry for transient failures | ✅ |
 | Temporary batch processing with auto-cleanup | ✅ |
