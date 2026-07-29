@@ -75,5 +75,7 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false;         // Reuse connection
+    pub.MaxPooledChannels = 8;                      // Confirm-channels kept open for reuse; raise (≤32) for
+                                                    // sustained high-concurrency single-message fan-outs
 });
 ```

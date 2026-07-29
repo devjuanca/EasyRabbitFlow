@@ -61,12 +61,24 @@ If not configured, EasyRabbitFlow falls back to `JsonSerializerOptions.Web` — 
 cfg.ConfigurePublisher(pub =>
 {
     pub.DisposePublisherConnection = false; // Keep connection alive (default)
+    pub.MaxPooledChannels = 8;              // Confirm-channels kept open for reuse (default)
 });
 ```
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DisposePublisherConnection` | bool | `false` | Dispose connection after each publish |
+| `PublisherId` | string | `""` | Label appended to the publisher connection name in the management UI |
+| `MaxPooledChannels` | int | `8` | Confirm-channels kept open for reuse by single-message publishes. A reuse cap, not a concurrency limit: publishes beyond it open a channel on demand and dispose it on return. Size it to the expected number of concurrent single-message publishes. Ignored when `DisposePublisherConnection` is `true`. |
+
+**Tuning `MaxPooledChannels`:** the default of 8 saturates moderate concurrency (up to ~16 concurrent
+publishes). If your service performs sustained high-concurrency fan-outs of *single-message* publishes
+(e.g. hundreds of `PublishAsync` calls in flight at once), raise it toward the expected concurrency — around
+32 is a good ceiling: all pooled channels share one connection, so far larger values add contention instead of
+throughput. The pool grows on demand up to the cap, so a higher value costs nothing until bursts actually
+occur; after a burst, up to that many idle channels stay open on the publisher connection. Note that
+`PublishBatchAsync` never uses the pool (each batch opens its own dedicated channel), so batch-heavy
+workloads gain nothing from raising this — prefer batching itself when you control the grouping.
 
 ### Application-Owned Exchanges
 

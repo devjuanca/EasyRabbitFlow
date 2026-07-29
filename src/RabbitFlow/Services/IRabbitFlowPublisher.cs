@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text.Json;
@@ -164,6 +165,13 @@ namespace EasyRabbitFlow.Services
         private IConnection? globalConnection;
         private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
 
+        // Reusable confirm-channels for single-message publishes. Opening (and synchronously closing) a channel
+        // per publish is what made large concurrent publish fan-outs starve the thread pool and stall consumers;
+        // renting from this pool bounds channel churn. Channels beyond the cap are created on demand and
+        // async-disposed on return. Channels from a replaced/closed connection report !IsOpen and are discarded on rent.
+        private readonly ConcurrentBag<IChannel> confirmChannelPool = new ConcurrentBag<IChannel>();
+        private readonly int maxPooledChannels;
+
         private static readonly CreateChannelOptions ConfirmChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
 
@@ -176,6 +184,7 @@ namespace EasyRabbitFlow.Services
             this.logger = logger;
             this.jsonOptions = jsonOptions ?? JsonSerializerOptions.Web;
             this.publisherOptions = publisherOptions ?? new PublisherConnectionOptions();
+            this.maxPooledChannels = Math.Max(1, this.publisherOptions.MaxPooledChannels);
         }
 
         public async Task<PublishResult> PublishAsync<TEvent>(TEvent @event, string exchangeName, string routingKey = "", string? messageId = null, string? correlationId = null, PublishOptions? options = null, CancellationToken cancellationToken = default) where TEvent : class
@@ -209,14 +218,18 @@ namespace EasyRabbitFlow.Services
 
             using var activity = RabbitFlowDiagnostics.StartPublish(destination, routingKey, resolvedMessageId, correlationId);
 
-            var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
-
             var serializerOptions = options?.JsonOptions ?? jsonOptions;
 
-            using var channel = await connection.CreateChannelAsync(ConfirmChannelOptions, cancellationToken);
+            IChannel? channel = null;
 
+            // Connection and channel acquisition live INSIDE the try: the public contract is that every failure
+            // surfaces as PublishResult.Failed, never as a thrown exception the caller didn't sign up for.
             try
             {
+                var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
+
+                channel = await RentConfirmChannelAsync(connection, cancellationToken);
+
                 await PublishToChannelAsync(channel, @event, destination, routingKey, serializerOptions, isQueue, resolvedMessageId, correlationId, options, cancellationToken);
 
                 logger.LogDebug("[RABBIT-FLOW]: Message of type {MessageType} published to {Destination}. MessageId={MessageId}",
@@ -238,11 +251,45 @@ namespace EasyRabbitFlow.Services
             }
             finally
             {
+                if (channel != null)
+                {
+                    await ReturnConfirmChannelAsync(channel);
+                }
+
                 if (publisherOptions.DisposePublisherConnection && globalConnection != null)
                 {
                     await DisposeGlobalConnection(cancellationToken);
                 }
             }
+        }
+
+        private async Task<IChannel> RentConfirmChannelAsync(IConnection connection, CancellationToken cancellationToken)
+        {
+            while (confirmChannelPool.TryTake(out var pooled))
+            {
+                if (pooled.IsOpen)
+                {
+                    return pooled;
+                }
+
+                try { await pooled.DisposeAsync(); } catch { }
+            }
+
+            return await connection.CreateChannelAsync(ConfirmChannelOptions, cancellationToken);
+        }
+
+        private async ValueTask ReturnConfirmChannelAsync(IChannel channel)
+        {
+            // Count vs cap is racy by design: a burst can briefly overshoot the pool, which only means a few
+            // extra channels get disposed instead of pooled.
+            if (!publisherOptions.DisposePublisherConnection && channel.IsOpen && confirmChannelPool.Count < maxPooledChannels)
+            {
+                confirmChannelPool.Add(channel);
+
+                return;
+            }
+
+            try { await channel.DisposeAsync(); } catch { }
         }
 
         private async Task<BatchPublishResult> PublishBatchInternalAsync<TEvent>(IReadOnlyList<TEvent> messages, string destination, string routingKey, ChannelMode channelMode, Func<TEvent, string>? messageIdSelector, string? correlationId, PublishOptions? options, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
@@ -256,16 +303,21 @@ namespace EasyRabbitFlow.Services
 
             using var activity = RabbitFlowDiagnostics.StartPublish(destination, routingKey, messageId: null, correlationId, messages.Count);
 
-            var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
-
             var serializerOptions = options?.JsonOptions ?? jsonOptions;
 
             var channelOptions = channelMode == ChannelMode.Transactional ? PlainChannelOptions : ConfirmChannelOptions;
 
-            using var channel = await connection.CreateChannelAsync(channelOptions, cancellationToken);
+            IChannel? channel = null;
 
+            // Connection and channel acquisition live INSIDE the try: every failure surfaces as
+            // BatchPublishResult.Failed, never as a thrown exception. Transactional channels carry
+            // tx state, so they are never pooled — one fresh channel per batch, async-disposed.
             try
             {
+                var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
+
+                channel = await connection.CreateChannelAsync(channelOptions, cancellationToken);
+
                 if (channelMode == ChannelMode.Transactional)
                 {
                     await channel.TxSelectAsync(cancellationToken);
@@ -318,7 +370,7 @@ namespace EasyRabbitFlow.Services
 
                 RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
 
-                if (channelMode == ChannelMode.Transactional)
+                if (channel != null && channelMode == ChannelMode.Transactional)
                 {
                     try
                     {
@@ -336,6 +388,11 @@ namespace EasyRabbitFlow.Services
             }
             finally
             {
+                if (channel != null)
+                {
+                    try { await channel.DisposeAsync(); } catch { }
+                }
+
                 if (publisherOptions.DisposePublisherConnection && globalConnection != null)
                 {
                     await DisposeGlobalConnection(cancellationToken);

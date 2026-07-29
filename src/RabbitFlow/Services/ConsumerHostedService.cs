@@ -130,6 +130,11 @@ namespace EasyRabbitFlow.Services
         private static readonly CreateChannelOptions ConfirmChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
 
+        // Extra time a handler gets AFTER its attempt token is cancelled to unwind cooperatively before the
+        // wait on it is abandoned. Without this, a handler stuck in a non-cancellable await holds its prefetch
+        // slot forever: the queue keeps a live consumer that processes nothing.
+        private static readonly TimeSpan HandlerAbandonGrace = TimeSpan.FromSeconds(30);
+
         private IConnection? _connection;
         private IChannel? _channel;
         private string _deadLetterQueueName = string.Empty;
@@ -766,7 +771,34 @@ namespace EasyRabbitFlow.Services
 
                         var consumerInstance = scope.ServiceProvider.GetRequiredService(_consumerType);
 
-                        await _markerFactory.InvokeHandleAsync(consumerInstance, evt, messageContext, attemptCt).ConfigureAwait(false);
+                        var handleTask = _markerFactory.InvokeHandleAsync(consumerInstance, evt, messageContext, attemptCt);
+
+                        // Timeout <= 0 (e.g. Timeout.InfiniteTimeSpan) means "no timeout": the attempt token never
+                        // fires, so there is no cancellation for the handler to ignore and the watchdog must not run —
+                        // _timeout + grace would otherwise abandon a healthy long-running handler after ~30s.
+                        if (_timeout > TimeSpan.Zero && !handleTask.IsCompleted)
+                        {
+                            using var abandonCts = new CancellationTokenSource();
+
+                            var winner = await Task.WhenAny(handleTask, Task.Delay(_timeout + HandlerAbandonGrace, abandonCts.Token)).ConfigureAwait(false);
+
+                            if (winner != handleTask)
+                            {
+                                // The handler ignored its cancelled attempt token. Abandon the wait so the prefetch
+                                // slot is reclaimed and the message is dead-lettered; the detached task keeps running
+                                // (and may fault once this iteration's DI scope is disposed) — observe it so its
+                                // eventual failure is logged instead of raising UnobservedTaskException.
+                                ObserveAbandonedHandler(handleTask);
+
+                                throw new RabbitFlowException(
+                                    $"Handler {_consumerType.Name} did not complete within its Timeout ({_timeout}) plus the abandon grace period ({HandlerAbandonGrace}) and did not honor cancellation. " +
+                                    "The wait was abandoned to free the prefetch slot; the still-running handler task was left detached.");
+                            }
+
+                            abandonCts.Cancel();
+                        }
+
+                        await handleTask.ConfigureAwait(false);
 
                         await SafeAckAsync(channel, args.DeliveryTag, rootCt);
 
@@ -823,6 +855,15 @@ namespace EasyRabbitFlow.Services
             {
                 try { _prefetchSemaphore.Release(); } catch { }
             }
+        }
+
+        private void ObserveAbandonedHandler(Task handleTask)
+        {
+            _ = handleTask.ContinueWith(
+                t => _logger.LogError(t.Exception, "[RABBIT-FLOW]: Abandoned handler for {Consumer} eventually faulted (its DI scope may already have been disposed).", _consumerType.Name),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
         }
 
         private async Task ApplyRetryDelay(int remainingAttempts, CancellationToken ct)
