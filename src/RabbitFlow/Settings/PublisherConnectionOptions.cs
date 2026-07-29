@@ -21,6 +21,23 @@
         /// Default is empty (connection name is <c>"Publisher_"</c>).
         /// </summary>
         public string PublisherId { get; set; } = "";
+
+        /// <summary>
+        /// Maximum number of confirm-channels kept open for reuse by single-message publishes.
+        /// The pool serves that many concurrent publishes without opening a new channel; publishes beyond it
+        /// create a channel on demand and dispose it on return, so this is a reuse cap, not a concurrency limit.
+        /// Size it to the expected number of concurrent single-message publishes: each pooled channel handles one
+        /// publish at a time, and a publish+confirm round-trip typically takes single-digit milliseconds. Values
+        /// below 1 are treated as 1. Ignored when <see cref="DisposePublisherConnection"/> is <c>true</c> (channels
+        /// cannot outlive the per-publish connection, so nothing is pooled).
+        /// Default is 8, which saturates moderate concurrency (≤16 concurrent publishes). For sustained
+        /// high-concurrency fan-outs of single-message publishes, raise it toward the expected concurrency
+        /// (around 32 is a good ceiling: all channels share one connection, so far larger pools add contention
+        /// instead of throughput). Batch publishes (<c>PublishBatchAsync</c>) never use the pool — each batch
+        /// opens its own channel — so batch-heavy workloads gain nothing from raising this.
+        /// The pool grows on demand up to the cap, so a higher value costs nothing until bursts actually occur.
+        /// </summary>
+        public int MaxPooledChannels { get; set; } = 8;
     }
 
     /// <summary>
