@@ -8,7 +8,7 @@ histogram) are visible live.
 
 ## Run
 
-Requires Docker (or Podman) running.
+Requires Docker (or Podman) running and the **.NET 9 SDK** (the AppHost targets `net9.0`; the sample API itself is `net8.0`).
 
 ```bash
 dotnet run --project sample/RabbitFlowSample.AppHost
@@ -23,8 +23,8 @@ The console prints the dashboard URL (with a login token). From the dashboard:
 
 The sample API also exposes:
 
-- `GET /health` — native EasyRabbitFlow health check (broker connectivity + key queues + consumer presence).
-- `GET /diagnostics/queues` — unified `QueueState` snapshot of every sample queue in one broker connection.
+- `GET /health` — native EasyRabbitFlow health check (broker connectivity + three key queues + consumer presence).
+- `GET /diagnostics/queues` — unified `QueueState` snapshot of the main sample queues in one broker connection (replicas, DLQs, and externally-bound subscriber queues are not included).
 
 ## How the wiring works
 

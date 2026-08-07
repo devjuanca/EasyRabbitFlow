@@ -4,9 +4,14 @@
 
 When a message exhausts its retries it is guaranteed to leave the main queue and reach the DLQ — it is never silently dropped. The `DeadLetterEnvelope` is published on a **publisher-confirms** channel, so the `await` only completes once the broker has confirmed receipt; if the publish is not confirmed (or serialization fails), the consumer falls back to broker-native `nack` dead-lettering. The dead-letter reprocessor uses confirms too: a re-enqueue or park only acks the message off the DLQ after the broker confirms the new copy, so an unconfirmed publish leaves the message safely on the DLQ.
 
+The guarantee assumes the dead-letter path exists and is enabled — concretely:
+
+- `AutoGenerate = true` and `GenerateDeadletterQueue = true` (the default), so the DLQ and its exchange exist. Without them, failures fall back to a plain `nack(requeue: false)`; if the queue has no `x-dead-letter-exchange` of its own, the broker **discards** the message.
+- `AutoAckOnError = false` (the default). With `AutoAckOnError = true`, failed messages are acknowledged and dropped by design — nothing reaches the DLQ.
+
 This closes the message-**loss** window. It does **not** provide exactly-once delivery: a confirmed publish whose subsequent ack fails is redelivered, so a message can reach the DLQ — or be reprocessed — more than once. As with any at-least-once broker, make consumers idempotent; see [Idempotency](publishing.md#idempotency).
 
-**Durability end-to-end.** The auto-generated DLQ and parking queue are declared **durable**, and every envelope the library publishes — onto the DLQ when a message dead-letters, and onto the parking queue when it is exhausted/permanent/malformed — is published **persistent** (`DeliveryMode = 2`). A message therefore survives a broker restart at every resting point, including the (potentially hours-long) wait in the DLQ between reprocessor cycles. This requires the broker's data directory to live on persistent storage (e.g. a `StatefulSet` with a `PersistentVolumeClaim` on `/var/lib/rabbitmq`); on ephemeral storage the whole broker state is lost on pod restart regardless of durability flags.
+**Durability end-to-end.** The parking queue is always declared **durable**; the auto-generated DLQ inherits `DurableQueue` and `AutoDeleteQueue` from `AutoGenerateSettings`, so it is durable with the defaults (keep them if you care about the guarantee below). Every envelope the library publishes — onto the DLQ when a message dead-letters, and onto the parking queue when it is exhausted/permanent/malformed — is published **persistent** (`DeliveryMode = 2`). A message therefore survives a broker restart at every resting point, including the (potentially hours-long) wait in the DLQ between reprocessor cycles. This requires the broker's data directory to live on persistent storage (e.g. a `StatefulSet` with a `PersistentVolumeClaim` on `/var/lib/rabbitmq`); on ephemeral storage the whole broker state is lost on pod restart regardless of durability flags.
 
 ## Dead-Letter Replicas
 
@@ -64,7 +69,17 @@ The payload shape is whatever the consumer's `ExtendDeadletterMessage` setting p
   "stackTrace": "...",
   "source": "OrderService",
   "innerExceptions": [],
-  "reprocessAttempts": 0
+  "reprocessAttempts": 0,
+  "isTransient": true,
+  "properties": {
+    "deliveryMode": 2,
+    "type": "OrderCreated",
+    "appId": "checkout-svc",
+    "priority": null,
+    "contentType": "application/json",
+    "replyTo": null,
+    "headers": { "traceparent": "00-..." }
+  }
 }
 ```
 
@@ -128,7 +143,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
                                            preserved via x-reprocess-attempts.
 ```
 
-If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle. Parked messages are published **persistent** (`DeliveryMode = 2`) onto the durable parking queue, so they survive a broker restart; for permanent/malformed messages the original AMQP properties (`MessageId`, `CorrelationId`, headers, …) are preserved as well.
+If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle — their body is parked **unchanged** (the counter is not rewritten; only exhausted messages get the final count stamped). Parked messages are published **persistent** (`DeliveryMode = 2`) onto the durable parking queue, so they survive a broker restart; for permanent/malformed messages the original AMQP properties (`MessageId`, `CorrelationId`, headers, …) are preserved as well.
 
 The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, plus `x-message-ttl` if `ParkingMessageTtl` is set).
 
@@ -152,14 +167,16 @@ Note that a parking queue with a TTL and no dead-letter target drops expired mes
 |----------|------|---------|-------------|
 | `Enabled` | bool | `true` | Whether the reprocessor is active for this consumer |
 | `MaxReprocessAttempts` | int | `3` | Maximum **re-enqueues** from DLQ back to main queue. Counts reprocesses only — not the original delivery — so `N` allows up to `N + 1` total handler executions before parking (e.g. `1` ⇒ 2 executions). Minimum `1`. |
-| `Interval` | TimeSpan | `3h` | Time between reprocessor runs. **Minimum 10 minutes** (hard floor — use the in-handler `RetryPolicy` for tighter retry cadences) |
+| `Interval` | TimeSpan | `3h` | Time between reprocessor runs. **Minimum 10 minutes** (hard floor — use the in-handler `RetryPolicy` for tighter retry cadences). The first cycle runs one full `Interval` **after startup** — with the default, nothing is reprocessed during the first 3 hours. |
 | `MaxMessagesPerCycle` | int | `int.MaxValue` | Optional safety cap on messages drained per cycle. By default each cycle drains the whole DLQ snapshot taken at the start of the run; lower this only if you need an explicit ceiling. |
 | `FinalAction` | `DeadLetterFinalAction` | `Park` | What to do with terminal **exhausted**/**permanent** messages: `Park` (move to the parking queue) or `Discard` (ack off the DLQ and drop). Does **not** apply to malformed messages, which are always parked. |
 | `ParkingMessageTtl` | TimeSpan? | `null` | When set, the parking queue is created with `x-message-ttl` so parked messages age out after this duration. Applies only on a queue the reprocessor creates; an existing queue is adopted as-is. Must be greater than zero. |
 
 **Constraints:**
 
-- Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning.
+- Requires `AutoGenerate = true`. If the consumer manages its own topology, the reprocessor is silently disabled with a warning. `GenerateDeadletterQueue` must also stay `true`: with no auto-generated DLQ the reprocessor still starts, but every cycle fails to read the queue and is skipped with a warning.
+- Re-enqueued messages are published **directly to the main queue** (via the default exchange), bypassing the consumer's exchange and any bindings — subscribers bound to the main exchange do not see replays, only the owning queue does.
+- Each cycle opens its own short-lived connection (named `reprocessor_{queue}`) and closes it when the cycle ends — periodic connection churn in the management UI is expected.
 - Forces `ExtendDeadletterMessage = true` so the envelope (including `reprocessAttempts`) is available — a warning is logged if you set it to `false`.
 - Operates only on the auto-generated dead-letter queue (`{queue}-deadletter`). Any [Dead-Letter Replicas](#dead-letter-replicas) bound to the same DLX are independent and never drained by the reprocessor.
 - **Only transient failures are reprocessed.** A message is eligible only if its envelope's `isTransient` flag is `true` — classified at failure time by the same rules the in-handler `RetryPolicy` uses (see [Transient Exceptions](transient-exceptions.md#transient-exceptions-and-custom-retry-logic)): `RabbitFlowTransientException` and derived types, cancellation/timeout, and transient HTTP failures. Permanent failures (validation, deserialization, business-rule violations) are moved to the parking queue so they remain visible for inspection without churning through the DLQ. Envelopes from older versions (without the flag) fall back to exact type-name matching.
@@ -183,7 +200,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 
 **How it works**
 
-For every inbound message, the consumer runs a cheap byte-level fingerprint scan looking for the two most distinctive envelope keys (`"messageData"` and `"exceptionType"`). Only when the fingerprint matches does it parse the body as `DeadLetterEnvelope`, extract the inner `MessageData`, and use it as the actual payload. If the envelope carried a `MessageId` or `CorrelationId`, those are also surfaced via `RabbitFlowMessageContext` when AMQP didn't already provide them.
+For every inbound message, the consumer runs a cheap byte-level fingerprint scan looking for the two most distinctive envelope keys (`"messageData"` and `"exceptionType"`). Only when the fingerprint matches does it parse the body as `DeadLetterEnvelope`, extract the inner `MessageData`, and use it as the actual payload. If the envelope carried a `MessageId` or `CorrelationId`, those are used for tracing and for the new envelope written on a re-failure when AMQP didn't already provide them; `RabbitFlowMessageContext` still reflects the AMQP properties of the inbound delivery.
 
 A warning is logged whenever an unwrap fires, so you can spot manual replays in the logs:
 

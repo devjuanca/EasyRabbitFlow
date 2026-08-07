@@ -1,6 +1,6 @@
 ## Sample Project
 
-`sample/RabbitFlowSample` is a runnable ASP.NET Core API that demonstrates every library feature with self-contained modules under `Samples/` (each has its own README, `.http` file, and topology):
+`sample/RabbitFlowSample` is a runnable ASP.NET Core API that demonstrates the library's main features with self-contained modules under `Samples/` (each has its own README, `.http` file, and topology):
 
 | Module | What it demonstrates |
 |--------|----------------------|
@@ -11,11 +11,11 @@
 | `SupportTickets/` | Priority queues (`MaxPriority` + `PublishOptions.Priority`) |
 | `Thumbnails/` | Temporary queues: `TemporaryRunResult`, per-job `Timeout`, whole-run `RunTimeout`, fire-and-forget |
 
-It also exposes `GET /health` (the native health check, monitoring queues + consumer presence) and `GET /diagnostics/queues` (unified `QueueState` snapshot of all sample queues).
+It also exposes `GET /health` (the native health check, monitoring three key queues + consumer presence) and `GET /diagnostics/queues` (unified `QueueState` snapshot of the main sample queues — replicas, DLQs, and externally-bound subscriber queues are not included).
 
 ### Option A — Aspire (recommended): full observability
 
-With Docker (or Podman) running:
+With Docker (or Podman) running (the AppHost targets .NET 9, so it needs the .NET 9 SDK; the sample API itself is .NET 8):
 
 ```bash
 dotnet run --project sample/RabbitFlowSample.AppHost
@@ -38,4 +38,4 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-manageme
 dotnet run --project sample/RabbitFlowSample
 ```
 
-The sample falls back to `localhost:5672` with `guest`/`guest`, and skips the OTLP exporter when no collector endpoint is configured. Swagger is served at the root URL printed in the console; the RabbitMQ management UI lives at `http://localhost:15672`.
+The sample falls back to `localhost:5672` with `guest`/`guest`, and skips the OTLP exporter when no collector endpoint is configured. Swagger UI is served at `/swagger` on the URL printed in the console; the RabbitMQ management UI lives at `http://localhost:15672`.

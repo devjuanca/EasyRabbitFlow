@@ -1,6 +1,6 @@
 ## Observability
 
-EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Everything is zero-cost until a listener subscribes.
+EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Everything is zero-cost until a listener subscribes. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
 
 ```csharp
 builder.Services.AddOpenTelemetry()
@@ -43,6 +43,10 @@ Notes:
 | `easyrabbitflow.messages.discarded` | Counter | `queue`, `reason` | Messages dropped by the reprocessor instead of parked when `FinalAction = Discard` (`exhausted` / `permanent`) |
 | `easyrabbitflow.consumer.message.duration` | Histogram (s) | `queue`, `outcome` | End-to-end processing time per delivery, including in-process retries |
 
+A handler abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) shows up as
+`messages.consumed{outcome=failure}` plus `messages.dead_lettered` — there is no dedicated watchdog metric,
+but the accompanying error log identifies the abandonment.
+
 ### Health Check
 
 A native `IHealthCheck` integrates with the standard health checks pipeline, built on the single-round-trip [queue state inspection](queue-operations.md#queue-state-inspection):
@@ -61,3 +65,8 @@ app.MapHealthChecks("/health");
 ```
 
 With no queues configured it acts as a pure broker-connectivity probe. Per-queue counts are exposed in the health report's `Data` dictionary (`{queue}.exists`, `{queue}.messages`, `{queue}.consumers`).
+
+Notes:
+
+- A configured queue that does not exist makes the check **Unhealthy**; the backlog and consumer rules are then skipped for that queue (there is nothing to measure).
+- The standard `failureStatus` parameter of `AddRabbitFlow(...)` is honored if you want failures reported as something other than `Unhealthy`.
