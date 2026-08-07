@@ -17,11 +17,22 @@
 
 ---
 
+## What's New in v8.2
+
+- **Publisher channel pool** — single-message publishes now rent their confirm-channel from a bounded pool (`PublisherConnectionOptions.MaxPooledChannels`, default 8) instead of opening and closing a channel per publish, which starved the thread pool under large concurrent fan-outs and stalled consumers. The cap is strict; channels are discarded after a failed publish (never returned with ambiguous confirm state), and the pool drains whenever the publisher connection is replaced or disposed. Transactional batch channels are never pooled. See [Publisher Options](docs/configuration.md#publisher-options).
+- **Publish never throws for broker failures** — connection and channel acquisition now happen inside the publish operation, so every failure surfaces as `PublishResult.Failed` / `BatchPublishResult.Failed` instead of an exception the caller didn't sign up for. See [Publishing](docs/publishing.md#publishing-messages).
+- **Stuck-handler watchdog** — a handler that ignores its cancelled attempt token is abandoned after `Timeout` plus a 30s grace period: the prefetch slot is reclaimed, the message dead-letters (as a non-transient failure), and the detached task is observed and logged. Skipped when `Timeout <= 0`. See [Consumer Timeout](docs/consumers.md#consumer-timeout).
+
+---
+
 ## What's New in v8.1
 
-- **Publisher-owned exchange declaration** — declare the exchanges your service owns directly in `AddRabbitFlow`, with no consumer registration required. External clients bind their own queues and routing keys; your service just publishes. Declared at startup by a dedicated hosted service: idempotent, adopts an existing exchange on settings mismatch (with a warning) instead of failing the start, and keeps retrying in the background if the broker is down. See [Application-Owned Exchanges](docs/configuration.md#application-owned-exchanges).
+- **Publisher-owned exchange declaration** — declare the exchanges your service owns directly in `AddRabbitFlow`, with no consumer registration required. External clients bind their own queues and routing keys; your service just publishes. Declared at startup by a dedicated hosted service: idempotent, adopts an existing exchange on settings mismatch (with a warning) instead of failing the start, and keeps retrying in the background if the broker is down (requires `AutomaticRecoveryEnabled = true`, the default). See [Application-Owned Exchanges](docs/configuration.md#application-owned-exchanges).
 
 ```csharp
+// If the file also imports RabbitMQ.Client, alias the enum:
+// using ExchangeType = EasyRabbitFlow.Settings.ExchangeType;
+
 builder.Services.AddRabbitFlow(cfg =>
 {
     cfg.ConfigureHost(...);
@@ -96,6 +107,8 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 | Built-in metrics (`Meter`) — counters + processing-duration histogram | ✅ |
 | Native health check (`AddHealthChecks().AddRabbitFlow()`) | ✅ |
 | Graceful shutdown: bounded drain of in-flight handlers before closing channels | ✅ |
+| Bounded confirm-channel pool for high-concurrency single-message publishing | ✅ |
+| Stuck-handler watchdog — a handler that ignores cancellation can't hold a prefetch slot forever | ✅ |
 | `RabbitFlowMessageContext` per-message metadata | ✅ |
 | Rich `PublishResult` / `BatchPublishResult` types | ✅ |
 | Thread-safe channel operations | ✅ |
@@ -110,11 +123,13 @@ EasyRabbitFlow registers a small set of services through `AddRabbitFlow(...)`. I
 | Service | Lifetime | What it does |
 |---------|----------|--------------|
 | [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (atomic transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
-| [`IRabbitFlowConsumer<TEvent>`](docs/consumers.md) | — | The interface **you** implement. Each consumer's `HandleAsync` receives the deserialized event, a `RabbitFlowMessageContext` (metadata), and a `CancellationToken`. Registered with `AddConsumer<TConsumer>(...)` and run by the hosted service. |
+| [`IRabbitFlowConsumer<TEvent>`](docs/consumers.md) | Transient | The interface **you** implement. Each consumer's `HandleAsync` receives the deserialized event, a `RabbitFlowMessageContext` (metadata), and a `CancellationToken`. Registered with `AddConsumer<TConsumer>(...)`, resolved per message from a fresh DI scope, and run by the hosted service. |
 | [`IRabbitFlowTemporary`](docs/temporary-processing.md) | Singleton | Fire-and-forget batch workflows over a throwaway queue that is created and torn down automatically. `RunAsync` returns a `TemporaryRunResult` with full counters and per-error detail. |
 | [`IRabbitFlowState`](docs/queue-operations.md) | Singleton | Single-round-trip queue inspection — message and consumer counts, existence — for one queue (`GetQueueStateAsync`) or many (`GetQueuesStateAsync`). |
 | [`IRabbitFlowPurger`](docs/queue-operations.md) | Singleton | Empties a queue of all its messages. |
-| [`ConsumerHostedService`](docs/consumers.md) | Hosted | Background service (started by `UseRabbitFlowConsumers()`) that owns the lifecycle of every registered consumer: declares topology, dispatches messages, applies retry policies, dead-letters failures, and drains in-flight handlers on shutdown. |
+| [`ConsumerHostedService`](docs/consumers.md) | Hosted | Background service (started by `UseRabbitFlowConsumers()`) that owns the lifecycle of every registered consumer: declares topology, dispatches messages, applies retry policies, abandons stuck handlers, dead-letters failures, and drains in-flight handlers on shutdown. |
+| [`DeadLetterReprocessorHostedService`](docs/dead-letter.md#dead-letter-reprocessor) | Hosted | Background service (also started by `UseRabbitFlowConsumers()`) that runs the dead-letter reprocessor cycles: re-enqueues transient failures from the DLQ and parks exhausted/permanent ones. |
+| [`TopologyHostedService`](docs/configuration.md#application-owned-exchanges) | Hosted | Background service (registered by `DeclareExchange(...)`, no `UseRabbitFlowConsumers()` required) that declares application-owned exchanges at startup. |
 
 See the [API Reference](docs/api-reference.md) for extension methods, configurator options, and observability constants.
 
@@ -316,7 +331,7 @@ Previously, the manual `DeadLetterEnvelope` publish from the consumer's error ha
 
 **`PublisherOptions` renamed to `PublisherConnectionOptions`**
 
-Cosmetic rename to avoid the one-letter visual collision with the new per-call `PublishOptions` type (see next entry). The shape is the same as before, plus the new `PublisherId` property (see below).
+Cosmetic rename to avoid the one-letter visual collision with the new per-call `PublishOptions` type (see next entry). The shape is the same as before, plus the new `PublisherId` property (see below). (v8.2 later added [`MaxPooledChannels`](docs/configuration.md#publisher-options) to this type.)
 
 **Migration:** rename the type at the call site. If you only use the `pub => ...` lambda form, you won't see the change.
 
@@ -417,7 +432,7 @@ Previously `MaxRetryCount = N` meant "process at most N times" (so `1` was the w
 - `1` — one retry after the first failure (2 attempts total).
 - `3` — three retries after the first failure (4 attempts total).
 
-**Migration:** any consumer that explicitly set `MaxRetryCount = N` will now perform one extra attempt. To preserve the old behavior, change `MaxRetryCount = N` to `MaxRetryCount = N - 1`. Consumers relying on the default get a behavior change too — the previous default `1` (one attempt, no retry) and the new default `0` are equivalent, so no action needed there. The auto-generated queue's `x-consumer-timeout` follows the new formula `Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace`.
+**Migration:** any consumer that explicitly set `MaxRetryCount = N` will now perform one extra attempt. To preserve the old behavior, change `MaxRetryCount = N` to `MaxRetryCount = N - 1`. Consumers relying on the default get a behavior change too — the previous default `1` (one attempt, no retry) and the new default `0` are equivalent, so no action needed there. The auto-generated queue's `x-consumer-timeout` follows the new formula `max(60s, Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace)` — floored at 60s because RabbitMQ rejects consumer timeouts below one minute.
 
 **`ConsumerSettings.ExtendDeadletterMessage` default changed from `false` to `true`**
 

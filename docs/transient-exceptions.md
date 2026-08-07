@@ -12,7 +12,10 @@ EasyRabbitFlow distinguishes between **transient** failures (worth retrying) and
 | `HttpRequestException` with **no response** | Connection refused, DNS failure, socket reset — the request never reached a server |
 | `HttpRequestException` with status **408, 429, 502, 503, 504** | Rate limiting and upstream/gateway unavailability — waiting helps |
 
-Classification is **inheritance-aware** and also inspects the **inner-exception chain** (up to 10 levels): an `InvalidOperationException` wrapping an `HttpRequestException(429)` is still transient. Anything else is treated as **permanent** and routed to the dead-letter queue without further retry.
+Classification is **inheritance-aware** and also inspects the **inner-exception chain** (up to 10 levels): an `InvalidOperationException` wrapping an `HttpRequestException(429)` is still transient. Anything else is treated as **permanent** and routed to the dead-letter queue without further retry. Two common permanent cases worth calling out:
+
+- **JSON deserialization failures** — the payload never reaches the handler; the message is dead-lettered with zero attempts.
+- **Abandoned handlers** — a handler that ignores its `CancellationToken` and is abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) surfaces as a non-transient `RabbitFlowException`. Note the asymmetry: a *cooperative* timeout (the handler honors the token) is an `OperationCanceledException` and therefore transient; ignoring the token is treated as a bug, not a retryable condition.
 
 > **HTTP rate limits and gateway errors are covered for free.** A `429` or `503` thrown by `HttpClient` (e.g. via `EnsureSuccessStatusCode()`) is recognized automatically — no wrapping needed. A `404` or `400` stays permanent.
 
@@ -68,6 +71,6 @@ public class NotificationConsumer : IRabbitFlowConsumer<NotificationEvent>
 | Exception | Purpose |
 |-----------|---------|
 | `RabbitFlowTransientException` | User-facing marker. Throw it from your handler to signal a retryable error to both the in-handler retry policy and the dead-letter reprocessor. |
-| `RabbitFlowException` | General library error |
-| `RabbitFlowOverRetriesException` | Thrown internally when all retry attempts are exhausted |
+| `RabbitFlowException` | General library error. Not transient — also used when the watchdog abandons a stuck handler. |
+| `RabbitFlowOverRetriesException` | Legacy type kept for backward compatibility; no longer thrown. When retries are exhausted, the dead-letter envelope records the **last real exception** instead. |
 

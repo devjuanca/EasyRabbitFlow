@@ -32,12 +32,14 @@ public class HealthCheckService
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `GetQueueStateAsync(queueName)` | `Task<QueueState>` | Full snapshot in one round trip: `Exists`, `MessageCount`, `ConsumerCount`, `IsEmpty`, `HasConsumers` |
+| `GetQueueStateAsync(queueName)` | `Task<QueueState>` | Full snapshot in one round trip: `QueueName`, `Exists`, `MessageCount`, `ConsumerCount`, `IsEmpty`, `HasConsumers` |
 | `GetQueuesStateAsync(queueNames)` | `Task<IReadOnlyList<QueueState>>` | Snapshots for several queues over a single connection, in input order |
 | `IsEmptyQueueAsync(queueName)` | `Task<bool>` | Is the queue empty? |
 | `GetQueueLengthAsync(queueName)` | `Task<uint>` | Number of messages in the queue |
 | `GetConsumersCountAsync(queueName)` | `Task<uint>` | Number of active consumers |
 | `HasConsumersAsync(queueName)` | `Task<bool>` | Does the queue have any consumers? |
+
+All methods also accept an optional `CancellationToken` as their last parameter.
 
 ---
 
@@ -52,3 +54,6 @@ await purger.PurgeMessagesAsync("orders-queue");
 // Purge multiple queues at once
 await purger.PurgeMessagesAsync(new[] { "orders-queue", "emails-queue", "notifications-queue" });
 ```
+
+Purging a queue that does not exist fails — errors are wrapped in an `InvalidOperationException` naming the
+queue. The multi-queue overload deduplicates names and skips empty entries before purging.

@@ -54,11 +54,11 @@ cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 | `Enable` | bool | `true` | Whether this consumer is active |
 | `QueueName` | string | *(set in constructor)* | Queue to consume from |
 | `ConsumerId` | string? | `null` | Custom connection ID (falls back to queue name) |
-| `PrefetchCount` | ushort | `1` | How many messages to prefetch |
-| `Timeout` | TimeSpan | `30s` | Processing timeout per message |
-| `AutoAckOnError` | bool | `false` | Auto-acknowledge on error (message lost) |
+| `PrefetchCount` | ushort | `1` | How many messages to prefetch. Also the **in-process concurrency limit** — at most this many handlers run at once. Must be ≥ 1: a value of `0` (AMQP "unlimited") leaves the consumer with zero processing slots, so it never handles anything. |
+| `Timeout` | TimeSpan | `30s` | Processing timeout per message. Also arms the [stuck-handler watchdog](#consumer-timeout); a non-positive value (e.g. `Timeout.InfiniteTimeSpan`) disables both. |
+| `AutoAckOnError` | bool | `false` | Auto-acknowledge on error — the message is **lost**, it never reaches the dead-letter queue |
 | `AutoGenerate` | bool | `false` | Auto-create queue/exchange/DLQ |
-| `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details |
+| `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details. Only effective when the DLQ is auto-generated (`AutoGenerate = true` and `GenerateDeadletterQueue = true`); otherwise failures are nacked without an envelope. |
 | `UnwrapDeadLetterEnvelopes` | bool | `false` | Defensive safety net: detect a `DeadLetterEnvelope` arriving on the main queue (e.g. from a manual DLQ replay) and process the inner payload. See [Manual DLQ Replay Safety Net](dead-letter.md#manual-dlq-replay-safety-net). |
 | `DisableNameValidation` | bool | `false` | Skip validation of reserved substrings (`deadletter`, `-exchange`, `-routing-key`) against the queue name and any auto-generate names. See [Reserved Name Substrings](#reserved-name-substrings). Only honored when `AutoGenerate = false`. |
 
@@ -113,7 +113,9 @@ cfg.AddConsumer<OrderConsumer>("orders-deadletter-archive", c =>
 
 ### Auto-Generate Topology
 
-When `AutoGenerate = true`, EasyRabbitFlow creates queues, exchanges, and dead-letter queues automatically:
+When `AutoGenerate = true`, EasyRabbitFlow creates queues, exchanges, and dead-letter queues automatically.
+(For exchanges owned by a publisher-only service — no consumer registered — use
+[`DeclareExchange`](configuration.md#application-owned-exchanges) instead.)
 
 ```csharp
 cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
@@ -209,8 +211,12 @@ Attempt 5 → fail → sent to dead-letter queue
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `MaxRetryCount` | int | `0` | Number of retries after the initial attempt fails (`0` = no retries) |
+| `MaxRetryCount` | int | `0` | Number of retries after the initial attempt fails (`0` = no retries; negative values are normalized to `0`) |
 | `RetryInterval` | int | `1000` | Fixed delay between retries (ms) |
+
+Note that only **transient** failures are retried. Non-transient exceptions — including a payload that fails
+JSON deserialization, the most common permanent failure in production — go straight to the dead-letter queue
+with zero retry attempts. See [Transient Exceptions](transient-exceptions.md#transient-exceptions-and-custom-retry-logic).
 
 ### Consumer Timeout
 
@@ -221,6 +227,27 @@ c.Timeout = TimeSpan.FromSeconds(30); // default
 ```
 
 Internally it drives a `CancellationTokenSource` passed to `HandleAsync`. On timeout, the token is cancelled, the attempt fails, and the retry policy kicks in.
+
+**Stuck-handler watchdog (v8.2.0)**
+
+Cancelling the token only works if the handler honors it. A handler that ignores its `CancellationToken`
+(e.g. a blocking call with no timeout) would otherwise hold its prefetch slot forever. To prevent that, the
+consumer waits at most `Timeout` **plus a 30-second grace period** (fixed, not configurable) for the handler
+task to complete. If it still hasn't:
+
+- The wait is **abandoned**: the prefetch slot is reclaimed and the message follows the failure path.
+- The abandoned handler task keeps running detached — it is observed, and its eventual failure is logged.
+  Its DI scope is disposed, so late access to scoped services from the runaway handler may throw.
+- The watchdog is **skipped when `Timeout <= 0`** (e.g. `Timeout.InfiniteTimeSpan`): an infinite timeout
+  means there is no cancellation to honor.
+
+> **⚠️ Abandonment is treated as a permanent failure, not a timeout.** A *cooperative* timeout (the handler
+> honors the token and throws `OperationCanceledException`) is classified as **transient**: it is retried
+> in-process and remains eligible for the [dead-letter reprocessor](dead-letter.md#dead-letter-reprocessor).
+> An *abandoned* handler surfaces as a non-transient `RabbitFlowException`: remaining in-process retries are
+> skipped, the dead-letter envelope is written with `isTransient = false`, and the reprocessor parks or
+> discards it instead of re-enqueuing. A handler that ignores cancellation is a bug to fix, not a condition
+> to retry.
 
 **Server-side timeout (`x-consumer-timeout`)**
 
@@ -249,7 +276,14 @@ The value is floored at 60s because RabbitMQ rejects consumer timeouts below one
 
 **Channel & connection recovery**
 
-EasyRabbitFlow manages consumer recovery itself rather than relying on the RabbitMQ client's built-in automatic/topology recovery (which is deliberately disabled on the connections it owns — running both at once makes the client re-bind/re-consume a recorded topology that doesn't include the main queue, surfacing as a `404 NOT_FOUND` on reconnect). When the broker closes a channel or connection (timeout exceeded, protocol violation, network blip, etc.), the consumer re-establishes the connection and channel, re-applies QoS, **re-declares its full topology**, and re-subscribes — with exponential backoff between attempts, seeded by `NetworkRecoveryInterval` (e.g. 10s, 20s, 40s… capped at 30s, or the configured value when larger).
+EasyRabbitFlow manages consumer recovery itself rather than relying on the RabbitMQ client's built-in automatic/topology recovery (which is deliberately disabled on the connections it owns — running both at once makes the client re-bind/re-consume a recorded topology that doesn't include the main queue, surfacing as a `404 NOT_FOUND` on reconnect). When the broker closes a channel or connection (timeout exceeded, protocol violation, network blip, etc.), the consumer re-establishes the connection and channel, re-applies QoS, **re-declares its full topology**, and re-subscribes — with exponential backoff between attempts, seeded by `NetworkRecoveryInterval` and capped at 30s or the configured interval when larger (with the default 10s: 10s, 20s, 30s, 30s…).
+
+The same mechanism protects **startup**: if the broker is unreachable or the initial setup (declare, bind,
+subscribe) fails when the host starts, the host still starts — the failure is logged and the consumer keeps
+retrying in the background on the same backoff until it succeeds (requires `AutomaticRecoveryEnabled = true`).
+
+On **shutdown**, the consumer stops accepting new deliveries and waits up to 30s for in-flight handlers to
+finish, so their messages are acked or dead-lettered instead of being redelivered on the next start.
 
 This is controlled by two `HostSettings` knobs:
 
@@ -262,7 +296,9 @@ See [Configuration](configuration.md#host-settings).
 >
 > Arguments that RabbitMQ verifies for equivalence — `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-message-ttl`, `x-max-length`, `x-max-priority`, `durable`, and any custom `Args` — cannot be changed by redeclaring an existing queue: the broker rejects the declare with `PRECONDITION_FAILED`. (The derived `x-consumer-timeout` is the exception — it is silently *ignored* rather than rejected; see the note above.)
 >
-> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer **adopts the existing queue as-is and keeps running**, logging a warning that names the queue — a running consumer is safer than one that won't start and silently leaves the system idle.
+> EasyRabbitFlow does **not** fail the consumer over this. It declares the queue on a throwaway channel, and if RabbitMQ rejects it with `PRECONDITION_FAILED`, the consumer checks whether the queue actually exists: if it does, it **adopts the existing queue as-is and keeps running**, logging a warning that names the queue — a running consumer is safer than one that won't start and silently leaves the system idle. If the broker rejected the declare and the queue does **not** exist (e.g. an argument the broker refuses to accept, or a conflicting policy), there is nothing to adopt: setup fails and the consumer stays in its recovery loop until the configuration is fixed.
+>
+> This adopt-on-mismatch protection covers the **main queue only**. The dead-letter queue, dead-letter exchange, [replicas](dead-letter.md#dead-letter-replicas), and the main exchange are declared on the consumer's own channel — a `PRECONDITION_FAILED` on any of those closes the channel and the consumer cannot start (it retries in the recovery loop). Resolve mismatches on those objects on the broker side.
 >
 > A related edge case is handled too: if the existing queue is a **stale `auto-delete` (or `x-expires`) queue** left over from a previous run — for example a broker that survived an app restart, as is common with Aspire — the broker may delete it the moment its previous consumer disconnects, *right as the new consumer is starting*. That produces an "adopt" (the queue still exists at declare time) immediately followed by a `404 NOT_FOUND` when binding/consuming (it's already gone). The consumer detects the 404 during setup, **recreates the queue with the current arguments** (it no longer exists, so there is no mismatch) and resumes — rather than crashing host startup.
 >

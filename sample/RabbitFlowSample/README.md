@@ -1,6 +1,6 @@
 # EasyRabbitFlow Sample API
 
-ASP.NET Core minimal-API host that exercises the main features of [EasyRabbitFlow](../../README.md). Each scenario lives in its own folder under [`Samples/`](./Samples) with a dedicated README, a self-contained `*.http` file, the consumers it needs, and a `*Module.cs` that wires the consumers and endpoints into the host.
+ASP.NET Core minimal-API host that exercises the main features of [EasyRabbitFlow](../../README.md). Each scenario lives in its own folder under [`Samples/`](./Samples) with a dedicated README, a self-contained `*.http` file, the consumers it needs (if any), and a `*Module.cs` that wires the scenario's registration and endpoints into the host.
 
 ## Samples
 
@@ -31,12 +31,14 @@ sample/RabbitFlowSample/
 
 Each `Samples/<feature>` folder ships:
 - A README describing the pattern and the topology it produces.
-- The events, consumers, and a `*Module` that exposes `RegisterConsumers` + `MapEndpoints`.
+- The events, consumers, and a `*Module` that exposes a registration method + `MapEndpoints`. Most modules expose `RegisterConsumers`; `IntegrationEvents` has no consumers and exposes `RegisterTopology` instead, and `Thumbnails` registers nothing (temporary queues need no upfront topology).
 - A `*.http` file with realistic requests covering happy paths and failure modes.
 
-`Program.cs` only owns shared concerns: OpenAPI, RabbitMQ host/publisher settings, DI for the demo services, and a sequence of `Module.RegisterConsumers / MapEndpoints` calls.
+`Program.cs` owns the shared concerns: OpenAPI, OpenTelemetry (tracing + metrics, with conditional OTLP export for Aspire), RabbitMQ host/publisher settings, DI for the demo services, the module registration/`MapEndpoints` sequence, the native health check on `GET /health`, and a `GET /diagnostics/queues` endpoint with a unified `QueueState` snapshot of the main sample queues.
 
 ## Running
+
+> The recommended way to run the sample is the [Aspire AppHost](../RabbitFlowSample.AppHost/README.md), which starts the broker container for you and adds a live traces/metrics dashboard (requires the .NET 9 SDK). The steps below run the API standalone.
 
 Prerequisites:
 - .NET 8 SDK
@@ -58,4 +60,4 @@ The launch profile binds the API to `https://localhost:7097` (HTTP fallback on `
 
 1. Create `Samples/<NewSample>/` with the events, consumers, and a `<NewSample>Module.cs` exposing `RegisterConsumers(RabbitFlowConfigurator)` and `MapEndpoints(IEndpointRouteBuilder)`.
 2. Add a `README.md` describing the pattern and a `<NewSample>.http` covering its endpoints.
-3. Wire it into `Program.cs` by calling `Register` + `MapEndpoints` for the new module.
+3. Wire it into `Program.cs` by calling `RegisterConsumers` (inside `AddRabbitFlow`) + `MapEndpoints` for the new module.

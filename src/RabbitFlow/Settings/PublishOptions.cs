@@ -74,7 +74,7 @@ namespace EasyRabbitFlow.Settings
         /// <summary>
         /// Per-call override for the JSON serializer used to encode the message body.
         /// When <c>null</c> (default), the publisher uses the <see cref="JsonSerializerOptions"/>
-        /// registered globally via <c>SetCustomJsonSerializerOptions</c> (or <see cref="JsonSerializerOptions.Web"/>
+        /// registered globally via <c>ConfigureJsonSerializerOptions</c> (or <see cref="JsonSerializerOptions.Web"/>
         /// if none was configured).
         /// </summary>
         public JsonSerializerOptions? JsonOptions { get; set; }

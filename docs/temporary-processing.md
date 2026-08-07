@@ -107,7 +107,9 @@ Picking which overload to use:
 | `onCompleted: result => …` | Synchronous wrap-up (logging, in-memory counters) |
 | `onCompletedAsync: async (result, ct) => …` | Wrap-up that needs to `await` I/O |
 
-Both overloads coexist. The completion callback receives the **same** `TemporaryRunResult` that `RunAsync` returns, so it has access to the full counters, `CorrelationId`, `QueueName`, `Duration`, `Success`, and `Errors` — not just the processed/failed counts.
+Both overloads coexist. The completion callback receives the same `TemporaryRunResult` that `RunAsync` returns, so it has access to the full counters, `CorrelationId`, `QueueName`, `Duration`, `Success`, and `Errors` — not just the processed/failed counts. (One exception: if the completion callback itself throws, `RunAsync` returns a rebuilt result that additionally carries a `Completion`-stage error entry the callback never saw.)
+
+Note that with a `null` or empty `messages` collection, `RunAsync` returns `TemporaryRunResult.Empty` immediately and **no callback is invoked** — including `onCompleted` / `onCompletedAsync`.
 
 ### With Result Collection
 
@@ -148,14 +150,15 @@ Console.WriteLine($"Collected {run.Results.Count} successful invoice results.");
        │                           │
        │                     All processed?
        │                           │ yes
-       ◄──────────────────── Delete temp queue
-       │                     Call onCompleted()
-       │
+       ◄──────────────────── Call onCompleted()
+       │                     Temp queue auto-removed
+       │                     (exclusive + auto-delete,
+       │                     gone when the connection closes)
   return TemporaryRunResult
 ```
 
 `TemporaryRunResult` exposes `TotalMessages`, `PublishedMessages`, `ProcessedMessages`,
-`SucceededMessages`, `FailedMessages`, `Success`, `Duration`, and `Errors`. Each entry in
+`SucceededMessages`, `FailedMessages`, `Success`, `StartedUtc`, `CompletedUtc`, `Duration`, and `Errors`. Each entry in
 `Errors` records the run stage where the failure happened (`Publish`, `Deserialize`, `Process`,
 `Timeout`, `Cancellation`, `Completion`); publish-stage errors also carry the `MessageIndex`
 of the failed input message. The `RunAsync<T, TResult>` overload returns
@@ -165,13 +168,17 @@ and rely on `onCompleted` / `onCompletedAsync` for background bookkeeping.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `PrefetchCount` | ushort | `1` | Parallel message processing (>0) |
-| `Timeout` | TimeSpan? | `null` | Per-message timeout |
-| `RunTimeout` | TimeSpan? | `null` | Whole-run timeout: cancels in-progress handlers, reports pending messages as failed, and returns the partial result |
-| `QueuePrefixName` | string? | `null` | Custom prefix for the temp queue name |
+| `PrefetchCount` | ushort | `1` | Parallel message processing. Must be > 0 (`0` throws `ArgumentOutOfRangeException`) |
+| `Timeout` | TimeSpan? | `null` | Per-message timeout. Must be positive when set |
+| `RunTimeout` | TimeSpan? | `null` | Whole-run timeout: cancels in-progress handlers, reports pending messages as failed, and returns the partial result. Must be positive when set |
+| `QueuePrefixName` | string? | `null` | Custom prefix for the temp queue name. The queue is named `{prefix}-temp-queue-{guid}`; when `null`, the prefix defaults to the lowercased event type name |
 | `CorrelationId` | string? | `Guid` | Correlation ID for tracing/logging |
 
 The run also ends early — instead of waiting forever — if the underlying connection or channel
 is shut down mid-run (broker restart, network failure): in-flight handlers are drained, the
 undelivered messages are reported as failed with a `ConnectionLost` error entry, and the
 partial result is returned.
+
+> **No telemetry:** temporary runs are not instrumented — they emit no `ActivitySource` spans and don't
+> count toward the [`EasyRabbitFlow` metrics](observability.md). The `TemporaryRunResult` counters are the
+> observability surface for these runs.

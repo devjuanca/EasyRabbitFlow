@@ -1,6 +1,10 @@
 ## Publishing Messages
 
-Inject `IRabbitFlowPublisher` to publish messages. All single-message publishes use **publisher confirms** — the `await` only completes after the broker confirms receipt.
+Inject `IRabbitFlowPublisher` to publish messages. All single-message publishes use **publisher confirms** — the `await` only completes after the broker confirms receipt. Confirm-channels are rented from a bounded pool sized by [`MaxPooledChannels`](configuration.md#publisher-options), so concurrent single-message fan-outs don't pay a channel-open per publish.
+
+**Exception contract:** publish methods never throw for broker or connection failures — every failure (unreachable broker, closed connection, timeout awaiting the confirm, cancellation) surfaces as a result with `Success = false` and the exception in `Error`. The only exceptions that propagate to the caller are argument validation ones, thrown before any I/O: `ArgumentNullException` when `message` is `null`, and `ArgumentException` when the batch collection is `null` or empty.
+
+> **`Success` means "accepted by the broker", not "routed to a queue".** Publishes are sent with `mandatory: false`, so a message published to an existing exchange whose routing key matches no binding is silently dropped by the broker — and still returns `Success = true`. This is the most common surprise with [application-owned exchanges](configuration.md#application-owned-exchanges): the producer declares the exchange, but until a consumer binds a queue, routed messages go nowhere.
 
 ### Single Message
 
@@ -70,8 +74,10 @@ Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
 
 Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter controls atomicity:
 
-- **`Transactional`** (default): All-or-nothing — if any message fails, the entire batch is rolled back.
-- **`Confirm`**: Each message is individually confirmed — a mid-batch failure does not roll back previous messages.
+- **`Transactional`** (default): All-or-nothing — if any message fails, the entire batch is rolled back. Uses AMQP transactions, **not** publisher confirms: `Success = true` means the `tx.commit` completed, not that each message was individually confirmed.
+- **`Confirm`**: Each message is individually confirmed by the broker — a mid-batch failure does not roll back previous messages.
+
+Batches always open their own dedicated channel; they never use the single-message channel pool.
 
 ```csharp
 // Atomic batch (Transactional — default)
@@ -117,7 +123,7 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 |----------|------|-------------|
 | `Success` | bool | Whether all messages were published |
 | `MessageCount` | int | Number of messages in the batch |
-| `MessageIds` | IReadOnlyList\<string\> | Identifiers per message (in input order) — produced by `messageIdSelector` when supplied or auto-generated GUIDs otherwise. Always one entry per published message. |
+| `MessageIds` | IReadOnlyList\<string\> | Identifiers per message (in input order) — produced by `messageIdSelector` when supplied or auto-generated GUIDs otherwise. On success, one entry per message. On failure, contains only the ids generated before the failing message (while `MessageCount` still reports the full batch size); in `Transactional` mode those messages were rolled back and never delivered. |
 | `Destination` | string | Target exchange or queue name |
 | `RoutingKey` | string | Routing key used |
 | `ChannelMode` | ChannelMode | Mode used (`Transactional` or `Confirm`) |
@@ -228,7 +234,7 @@ Pass a `correlationId` when publishing to trace related messages end-to-end:
 await publisher.PublishAsync(order, "orders-queue", correlationId: "req-abc-123");
 
 // Exchange publish with correlation
-await publisher.PublishAsync(event, "notifications", routingKey: "new", correlationId: requestId);
+await publisher.PublishAsync(notification, "notifications", routingKey: "new", correlationId: requestId);
 
 // Batch — same correlationId shared across all messages
 await publisher.PublishBatchAsync(events, "orders-queue", correlationId: batchId);
@@ -271,7 +277,7 @@ await publisher.PublishAsync(
 | `Type` | string? | `null` | AMQP `type` — typically a logical event name independent of the .NET CLR type. |
 | `AppId` | string? | `null` | AMQP `app-id` — identifies the publishing application. |
 | `Expiration` | TimeSpan? | `null` | Per-message TTL. Broker discards or dead-letters after this window. Serialized as a millisecond string. |
-| `Priority` | byte? | `null` | AMQP `priority` (0–9). **Requires the destination queue to be declared with [`MaxPriority`](consumers.md#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
+| `Priority` | byte? | `null` | AMQP `priority`. Written to the wire as-is (the 0–9 range is RabbitMQ convention, not validated by the library). **Requires the destination queue to be declared with [`MaxPriority`](consumers.md#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
 | `Timestamp` | DateTimeOffset? | `null` | AMQP `timestamp` — serialized as Unix seconds. |
 | `ReplyTo` | string? | `null` | AMQP `reply-to` — names the queue/exchange a consumer should reply on (RPC-style flows). |
 | `ContentType` | string? | `null` | AMQP `content-type`. Not set by default to preserve historical wire format; set to `"application/json"` if your consumers need it. |
