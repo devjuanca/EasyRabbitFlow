@@ -168,9 +168,16 @@ namespace EasyRabbitFlow.Services
         // Reusable confirm-channels for single-message publishes. Opening (and synchronously closing) a channel
         // per publish is what made large concurrent publish fan-outs starve the thread pool and stall consumers;
         // renting from this pool bounds channel churn. Channels beyond the cap are created on demand and
-        // async-disposed on return. Channels from a replaced/closed connection report !IsOpen and are discarded on rent.
+        // async-disposed on return. Only channels whose publish completed successfully are returned: after a
+        // failure (cancellation awaiting the confirm, timeout, protocol error) the channel may hold ambiguous
+        // confirm-tracking state that IsOpen does not reveal, so it is discarded. The pool is drained whenever
+        // the global connection is replaced or disposed.
         private readonly ConcurrentBag<IChannel> confirmChannelPool = new ConcurrentBag<IChannel>();
         private readonly int maxPooledChannels;
+
+        // Channels currently stored in the pool. Slots are reserved via CAS before adding, making
+        // maxPooledChannels a strict cap (ConcurrentBag.Count alone races under concurrent returns).
+        private int pooledChannelCount;
 
         private static readonly CreateChannelOptions ConfirmChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
@@ -222,6 +229,8 @@ namespace EasyRabbitFlow.Services
 
             IChannel? channel = null;
 
+            var channelReusable = false;
+
             // Connection and channel acquisition live INSIDE the try: the public contract is that every failure
             // surfaces as PublishResult.Failed, never as a thrown exception the caller didn't sign up for.
             try
@@ -231,6 +240,8 @@ namespace EasyRabbitFlow.Services
                 channel = await RentConfirmChannelAsync(connection, cancellationToken);
 
                 await PublishToChannelAsync(channel, @event, destination, routingKey, serializerOptions, isQueue, resolvedMessageId, correlationId, options, cancellationToken);
+
+                channelReusable = true;
 
                 logger.LogDebug("[RABBIT-FLOW]: Message of type {MessageType} published to {Destination}. MessageId={MessageId}",
                     typeof(TEvent).FullName, destination, resolvedMessageId);
@@ -253,7 +264,16 @@ namespace EasyRabbitFlow.Services
             {
                 if (channel != null)
                 {
-                    await ReturnConfirmChannelAsync(channel);
+                    // Only a channel whose publish succeeded goes back to the pool; a failed or ambiguous
+                    // operation may leave confirm-tracking state behind, so the channel is discarded even if open.
+                    if (channelReusable)
+                    {
+                        await ReturnConfirmChannelAsync(channel);
+                    }
+                    else
+                    {
+                        await SafeDisposeChannelAsync(channel);
+                    }
                 }
 
                 if (publisherOptions.DisposePublisherConnection && globalConnection != null)
@@ -267,12 +287,14 @@ namespace EasyRabbitFlow.Services
         {
             while (confirmChannelPool.TryTake(out var pooled))
             {
+                Interlocked.Decrement(ref pooledChannelCount);
+
                 if (pooled.IsOpen)
                 {
                     return pooled;
                 }
 
-                try { await pooled.DisposeAsync(); } catch { }
+                await SafeDisposeChannelAsync(pooled);
             }
 
             return await connection.CreateChannelAsync(ConfirmChannelOptions, cancellationToken);
@@ -280,15 +302,46 @@ namespace EasyRabbitFlow.Services
 
         private async ValueTask ReturnConfirmChannelAsync(IChannel channel)
         {
-            // Count vs cap is racy by design: a burst can briefly overshoot the pool, which only means a few
-            // extra channels get disposed instead of pooled.
-            if (!publisherOptions.DisposePublisherConnection && channel.IsOpen && confirmChannelPool.Count < maxPooledChannels)
+            if (!publisherOptions.DisposePublisherConnection && channel.IsOpen && TryReservePoolSlot())
             {
                 confirmChannelPool.Add(channel);
 
                 return;
             }
 
+            await SafeDisposeChannelAsync(channel);
+        }
+
+        private bool TryReservePoolSlot()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref pooledChannelCount);
+
+                if (current >= maxPooledChannels)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref pooledChannelCount, current + 1, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+
+        private async Task DrainConfirmChannelPoolAsync()
+        {
+            while (confirmChannelPool.TryTake(out var channel))
+            {
+                Interlocked.Decrement(ref pooledChannelCount);
+
+                await SafeDisposeChannelAsync(channel);
+            }
+        }
+
+        private static async ValueTask SafeDisposeChannelAsync(IChannel channel)
+        {
             try { await channel.DisposeAsync(); } catch { }
         }
 
@@ -486,9 +539,12 @@ namespace EasyRabbitFlow.Services
 
             try
             {
-                // Replace a connection that closed since the last publish.
+                // Replace a connection that closed since the last publish. Its pooled channels belong to the
+                // dying connection, so drain them first — otherwise they linger until future rents discard them.
                 if (globalConnection != null && !globalConnection.IsOpen)
                 {
+                    await DrainConfirmChannelPoolAsync();
+
                     try { await globalConnection.DisposeAsync(); } catch { }
 
                     globalConnection = null;
@@ -512,6 +568,8 @@ namespace EasyRabbitFlow.Services
 
                 try
                 {
+                    await DrainConfirmChannelPoolAsync();
+
                     await globalConnection.CloseAsync(cancellationToken);
                     await globalConnection.DisposeAsync();
                     globalConnection = null;
