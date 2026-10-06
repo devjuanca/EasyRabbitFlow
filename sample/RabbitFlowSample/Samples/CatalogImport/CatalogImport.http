@@ -1,0 +1,19 @@
+@host = https://localhost:7097
+
+### Products are imported while the next supplier page is loading (12 successful results).
+POST {{host}}/catalog-imports
+Content-Type: application/json
+
+{ "pages": 3, "pageSize": 4, "pageDelayMs": 750 }
+
+### A fast source: the request still waits for all 100 handlers to finish.
+POST {{host}}/catalog-imports
+Content-Type: application/json
+
+{ "pages": 4, "pageSize": 25, "pageDelayMs": 0 }
+
+### Invalid input returns 400 before creating a queue.
+POST {{host}}/catalog-imports
+Content-Type: application/json
+
+{ "pages": 0, "pageSize": 4, "pageDelayMs": 750 }

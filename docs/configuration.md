@@ -91,6 +91,14 @@ Pool lifecycle guarantees:
 - The pool is fully drained whenever the publisher connection is replaced (e.g. after a broker restart) or
   disposed — stale channels never linger across connections.
 
+**Shutdown.** `IRabbitFlowPublisher` is a disposable singleton, so the DI container disposes it when the host
+stops (both `ServiceProvider.Dispose()` and `DisposeAsync()` work): the confirm-channel pool is drained and the
+publisher connection is closed. The close is best-effort — if the connection already died, the failure is logged
+as a warning and the resources are released anyway, never thrown into the host's shutdown. Disposing twice is a
+no-op. A publish attempted after disposal does not throw: it returns a failed `PublishResult` /
+`BatchPublishResult` whose `Error` is an `ObjectDisposedException`, consistent with the
+[exception contract](publishing.md#publishing-messages).
+
 ### Application-Owned Exchanges
 
 A publisher-only service can declare the exchanges it owns without registering any consumer. This is the

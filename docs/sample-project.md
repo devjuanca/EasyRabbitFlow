@@ -10,6 +10,9 @@
 | `Payments/` | Dead-letter replicas (audit + alerting feeds from the same DLX) |
 | `SupportTickets/` | Priority queues (`MaxPriority` + `PublishOptions.Priority`) |
 | `Thumbnails/` | Temporary queues: `TemporaryRunResult`, per-job `Timeout`, whole-run `RunTimeout`, fire-and-forget |
+| `CatalogImport/` | Temporary queues over an `IAsyncEnumerable<T>` source: progressive publication, `SourceCompleted` |
+| `RunMonitoring/` | Fire-and-forget temporary run observed from a status endpoint via `OnProgress` and a progress store (heartbeat, stale detection) |
+| `WebhookIngest/` | Infinite `IAsyncEnumerable<T>` source with `MaxInFlightMessages` backpressure, long-lived run in a hosted service |
 
 It also exposes `GET /health` (the native health check, monitoring three key queues + consumer presence) and `GET /diagnostics/queues` (unified `QueueState` snapshot of the main sample queues — replicas, DLQs, and externally-bound subscriber queues are not included).
 

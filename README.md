@@ -17,6 +17,17 @@
 
 ---
 
+## What's New in v8.3
+
+- **Temporary runs over asynchronous sources** — `IRabbitFlowTemporary.RunAsync` accepts an `IAsyncEnumerable<T>` (three new overloads, mirroring the collection ones): elements are published and processed as the source yields them, without materializing it, and the run completes once the source ends and the observed messages finish. Cancellation, `RunTimeout` or a broker connection loss interrupt the source and return a partial result. See [Asynchronous Sources](docs/temporary-processing.md#asynchronous-sources-iasyncenumerablet).
+- **Backpressure for asynchronous sources** — `RunTemporaryOptions.MaxInFlightMessages` caps the elements pulled from the source that have not reached a terminal state, so the pause propagates to the producer instead of the temporary queue absorbing the whole source. Must be at least `PrefetchCount`; ignored by the collection overloads. See [Backpressure](docs/temporary-processing.md#backpressure-maxinflightmessages).
+- **Source state in the result** — `TemporaryRunResult.SourceCompleted` tells whether an asynchronous source finished normally (`null` for collections), `Success` is `false` for an interrupted source, and a failing source is reported in the new `Enumeration` error stage.
+- **Disposable publisher** — on host shutdown the container now disposes the `IRabbitFlowPublisher` singleton: the confirm-channel pool is drained and the publisher connection is closed cleanly (a close failure is logged, never thrown into the shutdown). A publish attempted after disposal returns a failed result. See [Publisher Options](docs/configuration.md#publisher-options).
+- **Progress reporting for temporary runs** — `RunTemporaryOptions.OnProgress` receives a `TemporaryRunProgress` snapshot (published, processed, succeeded, failed and in-flight counters) every `ProgressInterval` while the run is in progress. Calls never overlap, never block processing and act as a heartbeat; store the snapshot where other instances can read it, since a temporary queue is exclusive and cannot be inspected from another connection. See [Progress Reporting](docs/temporary-processing.md#progress-reporting-onprogress).
+- **Consumer exchange/routing-key names** — `ConfigureAutoGenerate` `ExchangeName` and `RoutingKey` now reserve only `deadletter` (same rule as `DeclareExchange`), so a consumer can bind to an existing exchange such as `snapshots-exchange`. Queue names still reserve `deadletter`, `-exchange` and `-routing-key`. See [Reserved Name Substrings](docs/consumers.md#reserved-name-substrings).
+
+---
+
 ## What's New in v8.2
 
 - **Publisher channel pool** — single-message publishes now rent their confirm-channel from a bounded pool (`PublisherConnectionOptions.MaxPooledChannels`, default 8) instead of opening and closing a channel per publish, which starved the thread pool under large concurrent fan-outs and stalled consumers. The cap is strict; channels are discarded after a failed publish (never returned with ambiguous confirm state), and the pool drains whenever the publisher connection is replaced or disposed. Transactional batch channels are never pooled. See [Publisher Options](docs/configuration.md#publisher-options).
@@ -80,7 +91,7 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 | [Dead-Letter Handling](docs/dead-letter.md) | Delivery guarantee, replicas, reprocessor, manual replay safety net |
 | [Publishing Messages](docs/publishing.md) | Single & batch publishing, idempotency, correlation, per-call AMQP options |
 | [Queue Operations](docs/queue-operations.md) | Queue state inspection and purging |
-| [Temporary Batch Processing](docs/temporary-processing.md) | Fire-and-forget batch workflows with auto-cleanup |
+| [Temporary Batch Processing](docs/temporary-processing.md) | Collection and asynchronous-source workflows with auto-cleanup |
 | [Observability](docs/observability.md) | Distributed tracing, metrics, health check |
 | [Transient Exceptions](docs/transient-exceptions.md) | Transient vs. permanent failures and custom retry logic |
 | [Sample Project](docs/sample-project.md) | Runnable sample API and Aspire AppHost |
@@ -97,7 +108,7 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 | Publisher-owned exchange declaration — no consumer required (`DeclareExchange`) | ✅ |
 | Reflection-free per-message processing | ✅ |
 | Configurable in-process retry for transient failures | ✅ |
-| Temporary batch processing with auto-cleanup | ✅ |
+| Temporary batch processing with auto-cleanup (`IReadOnlyList<T>` / `IAsyncEnumerable<T>`, opt-in backpressure) | ✅ |
 | Queue state & purge utilities | ✅ |
 | Full DI integration (scoped/transient/singleton) | ✅ |
 | Publisher confirms (single) & transactional batch | ✅ |
@@ -124,7 +135,7 @@ EasyRabbitFlow registers a small set of services through `AddRabbitFlow(...)`. I
 |---------|----------|--------------|
 | [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (atomic transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
 | [`IRabbitFlowConsumer<TEvent>`](docs/consumers.md) | Transient | The interface **you** implement. Each consumer's `HandleAsync` receives the deserialized event, a `RabbitFlowMessageContext` (metadata), and a `CancellationToken`. Registered with `AddConsumer<TConsumer>(...)`, resolved per message from a fresh DI scope, and run by the hosted service. |
-| [`IRabbitFlowTemporary`](docs/temporary-processing.md) | Singleton | Fire-and-forget batch workflows over a throwaway queue that is created and torn down automatically. `RunAsync` returns a `TemporaryRunResult` with full counters and per-error detail. |
+| [`IRabbitFlowTemporary`](docs/temporary-processing.md) | Singleton | Collection or asynchronous-source processing over an automatically managed temporary queue. `RunAsync` returns counters, per-error detail and asynchronous source completion state. |
 | [`IRabbitFlowState`](docs/queue-operations.md) | Singleton | Single-round-trip queue inspection — message and consumer counts, existence — for one queue (`GetQueueStateAsync`) or many (`GetQueuesStateAsync`). |
 | [`IRabbitFlowPurger`](docs/queue-operations.md) | Singleton | Empties a queue of all its messages. |
 | [`ConsumerHostedService`](docs/consumers.md) | Hosted | Background service (started by `UseRabbitFlowConsumers()`) that owns the lifecycle of every registered consumer: declares topology, dispatches messages, applies retry policies, abandons stuck handlers, dead-letters failures, and drains in-flight handlers on shutdown. |

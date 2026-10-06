@@ -6,12 +6,15 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using RabbitFlowSample.Common;
+using RabbitFlowSample.Samples.CatalogImport;
 using RabbitFlowSample.Samples.IntegrationEvents;
 using RabbitFlowSample.Samples.Notifications;
 using RabbitFlowSample.Samples.Orders;
 using RabbitFlowSample.Samples.Payments;
+using RabbitFlowSample.Samples.RunMonitoring;
 using RabbitFlowSample.Samples.SupportTickets;
 using RabbitFlowSample.Samples.Thumbnails;
+using RabbitFlowSample.Samples.WebhookIngest;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -117,6 +120,12 @@ builder.Services.AddScoped<GuidScopedService>();
 
 builder.Services.AddTransient<GuidTransientService>();
 
+// Long-lived temporary run fed by an infinite, bursty source (see Samples/WebhookIngest).
+WebhookIngestModule.RegisterServices(builder.Services);
+
+// In-memory progress store for fire-and-forget temporary runs (see Samples/RunMonitoring).
+RunMonitoringModule.RegisterServices(builder.Services);
+
 var app = builder.Build();
 
 app.UseSwagger();
@@ -163,5 +172,11 @@ PaymentsModule.MapEndpoints(app);
 SupportTicketsModule.MapEndpoints(app);
 
 ThumbnailsModule.MapEndpoints(app);
+
+CatalogImportModule.MapEndpoints(app);
+
+WebhookIngestModule.MapEndpoints(app);
+
+RunMonitoringModule.MapEndpoints(app);
 
 app.Run();

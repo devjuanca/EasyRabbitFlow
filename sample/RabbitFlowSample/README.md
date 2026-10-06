@@ -12,6 +12,9 @@ ASP.NET Core minimal-API host that exercises the main features of [EasyRabbitFlo
 | [Payments](Samples/Payments/README.md) | Dead-letter replicas | Same DLX, multiple replica queues (audit + live alerting) |
 | [SupportTickets](Samples/SupportTickets/README.md) | Priority queues | `MaxPriority` on declaration + `PublishOptions.Priority` per message |
 | [Thumbnails](Samples/Thumbnails/README.md) | Temporary queues (`IRabbitFlowTemporary`) | On-demand worker pool, await-completion vs. fire-and-forget |
+| [CatalogImport](Samples/CatalogImport/README.md) | Asynchronous input (`IAsyncEnumerable<T>`) | Paginated supplier feed, progressive publication, source completion and handler drain |
+| [RunMonitoring](Samples/RunMonitoring/README.md) | Progress reporting (`RunTemporaryOptions.OnProgress`) | Fire-and-forget run observed from a status endpoint through a progress store; heartbeat and stale detection; why `IRabbitFlowState` cannot inspect a temporary queue |
+| [WebhookIngest](Samples/WebhookIngest/README.md) | Infinite source + backpressure (`MaxInFlightMessages`) | Webhook endpoint feeding a bounded channel, long-lived run in a hosted service, 429 when the buffer is full |
 
 ## Project layout
 
@@ -21,17 +24,20 @@ sample/RabbitFlowSample/
 ├── Common/                             # cross-sample helpers (DI demo services, fire-and-forget extension)
 ├── Samples/
 │   ├── IntegrationEvents/
+│   ├── CatalogImport/
 │   ├── Notifications/
 │   ├── Orders/
 │   ├── Payments/
+│   ├── RunMonitoring/
 │   ├── SupportTickets/
-│   └── Thumbnails/
+│   ├── Thumbnails/
+│   └── WebhookIngest/
 └── README.md
 ```
 
 Each `Samples/<feature>` folder ships:
 - A README describing the pattern and the topology it produces.
-- The events, consumers, and a `*Module` that exposes a registration method + `MapEndpoints`. Most modules expose `RegisterConsumers`; `IntegrationEvents` has no consumers and exposes `RegisterTopology` instead, and `Thumbnails` registers nothing (temporary queues need no upfront topology).
+- The events, consumers, and a `*Module` exposing endpoints and any necessary registration. Most modules expose `RegisterConsumers`; `IntegrationEvents` exposes `RegisterTopology`, while temporary queue samples need no upfront topology (`CatalogImport` only exposes `MapEndpoints`; `WebhookIngest` exposes `RegisterServices` for its hosted service; `RunMonitoring` exposes `RegisterServices` for its progress store).
 - A `*.http` file with realistic requests covering happy paths and failure modes.
 
 `Program.cs` owns the shared concerns: OpenAPI, OpenTelemetry (tracing + metrics, with conditional OTLP export for Aspire), RabbitMQ host/publisher settings, DI for the demo services, the module registration/`MapEndpoints` sequence, the native health check on `GET /health`, and a `GET /diagnostics/queues` endpoint with a unified `QueueState` snapshot of the main sample queues.
