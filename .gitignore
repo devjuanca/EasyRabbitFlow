@@ -684,3 +684,6 @@ FodyWeavers.xsd
 
 # Claude Code workspace
 .claude/
+
+# Local implementation backlog
+/BACKLOG.md

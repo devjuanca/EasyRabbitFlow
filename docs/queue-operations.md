@@ -41,6 +41,13 @@ public class HealthCheckService
 
 All methods also accept an optional `CancellationToken` as their last parameter.
 
+> **Exclusive queues cannot be inspected.** RabbitMQ only lets the connection that declared an exclusive queue
+> access it, even passively, and every `IRabbitFlowState` call opens its own connection. Inspecting an exclusive
+> queue owned by another connection fails with `405 RESOURCE_LOCKED`, which is thrown as an
+> `OperationInterruptedException` by every method, `GetQueueStateAsync` included (only a missing queue is reported as
+> `Exists = false`). The queues created by `IRabbitFlowTemporary` are exclusive: to monitor a temporary run, use
+> [`RunTemporaryOptions.OnProgress`](temporary-processing.md#progress-reporting-onprogress) instead.
+
 ---
 
 ## Queue Purging

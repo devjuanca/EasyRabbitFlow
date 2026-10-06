@@ -18,7 +18,8 @@ namespace EasyRabbitFlow.Settings
             string? queueName,
             DateTime startedUtc,
             DateTime completedUtc,
-            IReadOnlyList<TemporaryRunError> errors)
+            IReadOnlyList<TemporaryRunError> errors,
+            bool? sourceCompleted = null)
         {
             TotalMessages = totalMessages;
             PublishedMessages = publishedMessages;
@@ -30,12 +31,20 @@ namespace EasyRabbitFlow.Settings
             StartedUtc = startedUtc;
             CompletedUtc = completedUtc;
             Errors = errors;
+            SourceCompleted = sourceCompleted;
         }
 
         /// <summary>
-        /// Number of messages supplied by the caller.
+        /// Number of messages supplied by the caller. For asynchronous sources, counts only observed
+        /// elements, not elements that might have been produced after an interruption.
         /// </summary>
         public int TotalMessages { get; }
+
+        /// <summary>
+        /// True if an asynchronous source finished enumeration and disposal normally; false if interrupted
+        /// or failed. Null for the collection overloads, whose total is known before processing.
+        /// </summary>
+        public bool? SourceCompleted { get; }
 
         /// <summary>
         /// Number of messages successfully published to the temporary queue.
@@ -87,7 +96,8 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         public bool Success => TotalMessages == PublishedMessages
             && TotalMessages == ProcessedMessages
-            && FailedMessages == 0;
+            && FailedMessages == 0
+            && SourceCompleted != false;
 
         /// <summary>
         /// Errors observed while publishing or processing messages.
@@ -115,8 +125,9 @@ namespace EasyRabbitFlow.Settings
             DateTime startedUtc,
             DateTime completedUtc,
             IReadOnlyList<TemporaryRunError> errors,
-            IReadOnlyList<TResult> results)
-            : base(totalMessages, publishedMessages, processedMessages, succeededMessages, failedMessages, correlationId, queueName, startedUtc, completedUtc, errors)
+            IReadOnlyList<TResult> results,
+            bool? sourceCompleted = null)
+            : base(totalMessages, publishedMessages, processedMessages, succeededMessages, failedMessages, correlationId, queueName, startedUtc, completedUtc, errors, sourceCompleted)
         {
             Results = results;
         }
@@ -177,7 +188,7 @@ namespace EasyRabbitFlow.Settings
         public ulong? DeliveryTag { get; }
 
         /// <summary>
-        /// Zero-based index of the failed message in the input collection.
+        /// Zero-based index of the failed message in the input collection or asynchronous source.
         /// Populated for <see cref="TemporaryRunErrorStage.Publish"/> errors, where the message never reached the queue.
         /// </summary>
         public int? MessageIndex { get; }
@@ -200,6 +211,8 @@ namespace EasyRabbitFlow.Settings
         Timeout,
         Cancellation,
         Completion,
-        ConnectionLost
+        ConnectionLost,
+        /// <summary>An asynchronous source failed while enumerating or disposing its enumerator.</summary>
+        Enumeration
     }
 }

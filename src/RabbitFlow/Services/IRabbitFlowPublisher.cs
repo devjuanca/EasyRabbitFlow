@@ -156,7 +156,7 @@ namespace EasyRabbitFlow.Services
             CancellationToken cancellationToken = default) where TEvent : class;
     }
 
-    internal sealed class RabbitFlowPublisher : IRabbitFlowPublisher
+    internal sealed class RabbitFlowPublisher : IRabbitFlowPublisher, IAsyncDisposable, IDisposable
     {
         private readonly ConnectionFactory connectionFactory;
         private readonly JsonSerializerOptions jsonOptions;
@@ -178,6 +178,7 @@ namespace EasyRabbitFlow.Services
         // Channels currently stored in the pool. Slots are reserved via CAS before adding, making
         // maxPooledChannels a strict cap (ConcurrentBag.Count alone races under concurrent returns).
         private int pooledChannelCount;
+        private int disposed;
 
         private static readonly CreateChannelOptions ConfirmChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
@@ -214,6 +215,23 @@ namespace EasyRabbitFlow.Services
             return await PublishBatchInternalAsync(messages, queueName, "", channelMode, messageIdSelector, correlationId, options, isQueue: true, cancellationToken);
         }
 
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await DisposeGlobalConnection(CancellationToken.None);
+        }
+
+        // Sync bridge for containers disposed via ServiceProvider.Dispose(): without it, Microsoft DI
+        // throws InvalidOperationException on singletons that only implement IAsyncDisposable.
+        public void Dispose()
+        {
+            DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
         private async Task<PublishResult> PublishMessageAsync<TEvent>(TEvent @event, string destination, string routingKey, string? messageId, string? correlationId, PublishOptions? options, bool isQueue, CancellationToken cancellationToken = default) where TEvent : class
         {
             if (@event is null)
@@ -235,6 +253,8 @@ namespace EasyRabbitFlow.Services
             // surfaces as PublishResult.Failed, never as a thrown exception the caller didn't sign up for.
             try
             {
+                ThrowIfDisposed();
+
                 var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
                 channel = await RentConfirmChannelAsync(connection, cancellationToken);
@@ -302,9 +322,16 @@ namespace EasyRabbitFlow.Services
 
         private async ValueTask ReturnConfirmChannelAsync(IChannel channel)
         {
-            if (!publisherOptions.DisposePublisherConnection && channel.IsOpen && TryReservePoolSlot())
+            if (!publisherOptions.DisposePublisherConnection && Volatile.Read(ref disposed) == 0 && channel.IsOpen && TryReservePoolSlot())
             {
                 confirmChannelPool.Add(channel);
+
+                // An in-flight publish can reach this Add after DisposeAsync already drained the pool;
+                // re-drain so the channel doesn't outlive the drain instead of being disposed.
+                if (Volatile.Read(ref disposed) != 0)
+                {
+                    await DrainConfirmChannelPoolAsync();
+                }
 
                 return;
             }
@@ -367,6 +394,8 @@ namespace EasyRabbitFlow.Services
             // tx state, so they are never pooled — one fresh channel per batch, async-disposed.
             try
             {
+                ThrowIfDisposed();
+
                 var connection = await ResolveConnection(publisherOptions.PublisherId, cancellationToken);
 
                 channel = await connection.CreateChannelAsync(channelOptions, cancellationToken);
@@ -527,6 +556,8 @@ namespace EasyRabbitFlow.Services
 
         private async Task<IConnection> ResolveConnection(string connectionId, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             // The RabbitMQ client's automatic recovery is disabled (EasyRabbitFlow manages recovery itself), so this
             // long-lived publisher connection is not healed by the client when it drops — it must be re-created here.
             // Fast path: reuse it while open.
@@ -539,6 +570,8 @@ namespace EasyRabbitFlow.Services
 
             try
             {
+                ThrowIfDisposed();
+
                 // Replace a connection that closed since the last publish. Its pooled channels belong to the
                 // dying connection, so drain them first — otherwise they linger until future rents discard them.
                 if (globalConnection != null && !globalConnection.IsOpen)
@@ -562,22 +595,48 @@ namespace EasyRabbitFlow.Services
 
         private async Task DisposeGlobalConnection(CancellationToken cancellationToken = default)
         {
-            if (globalConnection != null)
+            await semaphore.WaitAsync(cancellationToken);
+
+            try
             {
-                await semaphore.WaitAsync(cancellationToken);
+                await DrainConfirmChannelPoolAsync();
 
-                try
-                {
-                    await DrainConfirmChannelPoolAsync();
+                var connection = globalConnection;
+                globalConnection = null;
 
-                    await globalConnection.CloseAsync(cancellationToken);
-                    await globalConnection.DisposeAsync();
-                    globalConnection = null;
-                }
-                finally
+                if (connection != null)
                 {
-                    semaphore.Release();
+                    try
+                    {
+                        // Best-effort clean AMQP close: the connection can die between the IsOpen check
+                        // and CloseAsync, and a shutdown-path failure must not propagate into the host's
+                        // container disposal. DisposeAsync below still reclaims the resources.
+                        if (connection.IsOpen)
+                        {
+                            await connection.CloseAsync(cancellationToken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "[RABBIT-FLOW]: Clean close of publisher connection failed; disposing anyway.");
+                    }
+                    finally
+                    {
+                        await connection.DisposeAsync();
+                    }
                 }
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (Volatile.Read(ref disposed) != 0)
+            {
+                throw new ObjectDisposedException(nameof(RabbitFlowPublisher));
             }
         }
     }

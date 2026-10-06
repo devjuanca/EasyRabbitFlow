@@ -51,9 +51,9 @@ public class NameValidationTests
 
     [Theory]
     [InlineData("orders-deadletter")]
-    [InlineData("custom-exchange")]
-    [InlineData("custom-routing-key")]
-    public void AutoGenerateSettings_ExchangeName_WithReservedSubstring_Throws(string exchangeName)
+    [InlineData("orders-deadletter-exchange")]
+    [InlineData("Custom-DeadLetter")]
+    public void AutoGenerateSettings_ExchangeName_WithDeadletter_Throws(string exchangeName)
     {
         var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
         {
@@ -66,9 +66,9 @@ public class NameValidationTests
 
     [Theory]
     [InlineData("orders-deadletter")]
-    [InlineData("rk-exchange")]
-    [InlineData("rk-routing-key")]
-    public void AutoGenerateSettings_RoutingKey_WithReservedSubstring_Throws(string routingKey)
+    [InlineData("orders-deadletter-routing-key")]
+    [InlineData("RK-DEADLETTER")]
+    public void AutoGenerateSettings_RoutingKey_WithDeadletter_Throws(string routingKey)
     {
         var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
         {
@@ -77,6 +77,49 @@ public class NameValidationTests
         }));
 
         Assert.Contains(routingKey, ex.Message);
+    }
+
+    [Theory]
+    [InlineData("orders-exchange")]
+    [InlineData("snapshots-exchange")]
+    [InlineData("custom-routing-key")]
+    [InlineData("Orders-Exchange")]
+    public void AutoGenerateSettings_ExchangeName_WithExchangeOrRoutingKeySuffix_DoesNotThrow(string exchangeName)
+    {
+        AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag => ag.ExchangeName = exchangeName);
+        });
+    }
+
+    [Theory]
+    [InlineData("orders-routing-key")]
+    [InlineData("rk-exchange")]
+    [InlineData("ORDERS-ROUTING-KEY")]
+    public void AutoGenerateSettings_RoutingKey_WithExchangeOrRoutingKeySuffix_DoesNotThrow(string routingKey)
+    {
+        AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag => ag.RoutingKey = routingKey);
+        });
+    }
+
+    [Fact]
+    public void AutoGenerateSettings_ConventionalSuffixes_DoNotRelaxQueueNameRule()
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders-exchange", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.ExchangeName = "snapshots-exchange";
+                ag.RoutingKey = "orders-routing-key";
+            });
+        }));
+
+        Assert.Contains("orders-exchange", ex.Message);
     }
 
     [Fact]

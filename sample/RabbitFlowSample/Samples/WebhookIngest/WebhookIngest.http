@@ -1,0 +1,34 @@
+@host = https://localhost:7097
+
+### A single webhook arrives at an unpredictable moment: accepted into the buffer (202).
+POST {{host}}/webhooks/stripe
+Content-Type: application/json
+
+{ "eventId": "evt_001", "type": "payment.succeeded", "payload": { "amount": 1290, "currency": "eur" } }
+
+### An event whose type ends in ".fail" makes the handler throw: watch the log and the failed counter.
+POST {{host}}/webhooks/stripe
+Content-Type: application/json
+
+{ "eventId": "evt_002", "type": "payment.refunded.fail", "payload": { "amount": 1290 } }
+
+### Missing fields are rejected before touching the buffer (400).
+POST {{host}}/webhooks/stripe
+Content-Type: application/json
+
+{ "eventId": "", "type": "" }
+
+### Provider replays a backlog: 200 events from 32 parallel senders. The in-flight window (16) and the
+### buffer (64) fill within the first second; senders that wait more than 500 ms for a slot get 429.
+### Nobody is dropped silently — the sender is told to retry. Expect a substantial share of rejections.
+POST {{host}}/webhooks/shopify/burst?count=200&concurrency=32
+
+### Same backlog from a single sequential sender: every event is accepted, because one writer never waits
+### more than ~60 ms for a slot. Backpressure still applies — watch `buffered` sit at 64 while it drains.
+POST {{host}}/webhooks/shopify/burst?count=200&concurrency=1
+
+### Small burst with one failure every 10 events: failures visible in /status and in the log.
+POST {{host}}/webhooks/shopify/burst?count=40&concurrency=4&failEvery=10
+
+### Live counters: buffered drains at ~16 events/s; runs increments on rotation or broker reconnection.
+GET {{host}}/webhooks/status

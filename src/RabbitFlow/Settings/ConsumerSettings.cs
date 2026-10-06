@@ -101,8 +101,8 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         /// Gets or sets a value indicating whether to skip <c>RabbitFlowNameRules</c> validation against
-        /// reserved substrings (e.g. <c>deadletter</c>, <c>-exchange</c>, <c>-routing-key</c>) for the
-        /// queue name and any auto-generate exchange/routing-key names.
+        /// reserved substrings: <c>deadletter</c>, <c>-exchange</c> and <c>-routing-key</c> for the queue
+        /// name, and only <c>deadletter</c> for any auto-generate exchange/routing-key names.
         /// </summary>
         /// <remarks>
         /// Only takes effect when <see cref="AutoGenerate"/> is <c>false</c>. When the framework owns
@@ -198,12 +198,12 @@ namespace EasyRabbitFlow.Settings
                 return;
             }
 
-            RabbitFlowNameRules.Validate(QueueName, "queueName");
+            RabbitFlowNameRules.ValidateQueueName(QueueName, "queueName");
 
             if (_autoGenerateSettings != null)
             {
-                RabbitFlowNameRules.Validate(_autoGenerateSettings.ExchangeName, nameof(AutoGenerateSettings<TConsumer>.ExchangeName));
-                RabbitFlowNameRules.Validate(_autoGenerateSettings.RoutingKey, nameof(AutoGenerateSettings<TConsumer>.RoutingKey));
+                RabbitFlowNameRules.ValidateBindingName(_autoGenerateSettings.ExchangeName, nameof(AutoGenerateSettings<TConsumer>.ExchangeName));
+                RabbitFlowNameRules.ValidateBindingName(_autoGenerateSettings.RoutingKey, nameof(AutoGenerateSettings<TConsumer>.RoutingKey));
             }
         }
 

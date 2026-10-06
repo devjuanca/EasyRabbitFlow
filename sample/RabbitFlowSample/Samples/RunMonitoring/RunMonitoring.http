@@ -1,0 +1,22 @@
+@host = https://localhost:7097
+
+### 1. Start a run: 40 jobs of 500 ms, 2 at a time, every 7th fails. Returns 202 with the runId at once.
+POST {{host}}/run-monitoring/runs
+Content-Type: application/json
+
+{ "messages": 40, "handlerDelayMs": 500, "failEvery": 7, "prefetchCount": 2 }
+
+### 2. Poll it (paste the runId from step 1). Repeat while it runs: counters grow, state goes Starting → Running → Completed.
+GET {{host}}/run-monitoring/runs/run-REPLACE-ME
+
+### 3. Every run known to this process.
+GET {{host}}/run-monitoring/runs
+
+### 4. While step 1 is still running: IRabbitFlowState cannot inspect the temporary queue (405 RESOURCE_LOCKED).
+GET {{host}}/run-monitoring/runs/run-REPLACE-ME/broker-state
+
+### Invalid input returns 400 before starting anything.
+POST {{host}}/run-monitoring/runs
+Content-Type: application/json
+
+{ "messages": 0 }

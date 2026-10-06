@@ -7,6 +7,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -17,6 +18,46 @@ namespace EasyRabbitFlow.Services
 
     public interface IRabbitFlowTemporary
     {
+        /// <summary>
+        /// Publishes and processes a single-pass asynchronous source incrementally. Completes only
+        /// after the source ends and observed messages finish processing. Silence does not end the run.
+        /// Cancellation, RunTimeout or a broker connection loss interrupt the source and return a partial
+        /// result; handlers already running keep going, bounded only by Timeout / RunTimeout. Source errors
+        /// are reported at the Enumeration stage, without invoking onError for an unknown message.
+        /// The source must cooperate with cancellation; unfinished enumeration is disposed when it settles.
+        /// </summary>
+        Task<TemporaryRunResult> RunAsync<T>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Action<TemporaryRunResult>? onCompleted = null,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class;
+
+        /// <summary>
+        /// Processes an asynchronous source incrementally and invokes an asynchronous completion callback,
+        /// including for an empty source or a partial result. SourceCompleted indicates normal source termination.
+        /// </summary>
+        Task<TemporaryRunResult> RunAsync<T>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Func<TemporaryRunResult, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class;
+
+        /// <summary>
+        /// Processes an asynchronous source incrementally and collects successful handler results in memory.
+        /// Results and error details grow with the run; the input source is never materialized.
+        /// </summary>
+        Task<TemporaryRunResult<TResult>> RunAsync<T, TResult>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task<TResult>> onMessageReceived,
+            Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class;
+
         /// <summary>
         /// Publishes a collection of messages to a temporary RabbitMQ exchange and consumes them asynchronously.
         /// Each message is processed using the provided handler function, with support for cancellation and per-message timeout.
@@ -218,7 +259,51 @@ namespace EasyRabbitFlow.Services
                 cancellationToken);
         }
 
-        private async Task<TemporaryRunResult<TResult>> RunCoreAsync<T, TResult>(
+        public Task<TemporaryRunResult> RunAsync<T>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Action<TemporaryRunResult>? onCompleted = null,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class
+            => RunAsync(messages, onMessageReceived, (result, _) =>
+            {
+                onCompleted?.Invoke(result);
+                return Task.CompletedTask;
+            }, onError, options, cancellationToken);
+
+        public async Task<TemporaryRunResult> RunAsync<T>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task> onMessageReceived,
+            Func<TemporaryRunResult, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class
+        {
+            if (onMessageReceived is null) 
+                throw new ArgumentNullException(nameof(onMessageReceived));
+            
+            if (onCompletedAsync is null) 
+                throw new ArgumentNullException(nameof(onCompletedAsync));
+            
+            return await RunCoreAsync<T, object?>(messages, async (message, ct) =>
+            {
+                await onMessageReceived(message, ct).ConfigureAwait(false);
+                
+                return null;
+            }, false, (result, ct) => onCompletedAsync(result, ct), onError, options, cancellationToken).ConfigureAwait(false);
+        }
+
+        public Task<TemporaryRunResult<TResult>> RunAsync<T, TResult>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task<TResult>> onMessageReceived,
+            Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError = null,
+            RunTemporaryOptions? options = null,
+            CancellationToken cancellationToken = default) where T : class
+            => RunCoreAsync(messages, onMessageReceived, true, onCompletedAsync, onError, options, cancellationToken);
+
+        private Task<TemporaryRunResult<TResult>> RunCoreAsync<T, TResult>(
             IReadOnlyList<T> messages,
             Func<T, CancellationToken, Task<TResult>> onMessageReceived,
             bool collectResults,
@@ -228,13 +313,54 @@ namespace EasyRabbitFlow.Services
             CancellationToken cancellationToken) where T : class
         {
             options ??= new RunTemporaryOptions();
-
-            var startedUtc = DateTime.UtcNow;
-
             if (messages is null || messages.Count == 0)
             {
-                return TemporaryRunResult<TResult>.Empty(options.CorrelationId, startedUtc);
+                return Task.FromResult(TemporaryRunResult<TResult>.Empty(options.CorrelationId, DateTime.UtcNow));
             }
+
+            return RunCoreAsync(EnumerateList(messages), onMessageReceived, collectResults,
+                onCompletedAsync, onError, options, cancellationToken, messages.Count);
+        }
+
+#pragma warning disable CS1998 // Synchronous adapter: a known list needs no awaits.
+        private static async IAsyncEnumerable<T> EnumerateList<T>(IReadOnlyList<T> messages)
+        {
+            for (var i = 0; i < messages.Count; i++) yield return messages[i];
+        }
+#pragma warning restore CS1998
+
+        private async Task<TemporaryRunResult<TResult>> RunCoreAsync<T, TResult>(
+            IAsyncEnumerable<T> messages,
+            Func<T, CancellationToken, Task<TResult>> onMessageReceived,
+            bool collectResults,
+            Func<TemporaryRunResult<TResult>, CancellationToken, Task> onCompletedAsync,
+            Func<T, CancellationToken, Task>? onError,
+            RunTemporaryOptions? options,
+            CancellationToken cancellationToken,
+            int? knownCount = null) where T : class
+        {
+            if (messages is null) throw new ArgumentNullException(nameof(messages));
+            if (onMessageReceived is null) throw new ArgumentNullException(nameof(onMessageReceived));
+            if (onCompletedAsync is null) throw new ArgumentNullException(nameof(onCompletedAsync));
+            options ??= new RunTemporaryOptions();
+
+            // Opt-in backpressure, asynchronous sources only: bounds the elements pulled from the source that have not
+            // reached a terminal state. Collection runs ignore it — their input already lives in memory, so bounding
+            // the broker-side backlog gains nothing.
+            SemaphoreSlim? inFlight = null;
+            if (!knownCount.HasValue && options.MaxInFlightMessages.HasValue)
+            {
+                if (options.MaxInFlightMessages.Value < options.PrefetchCount)
+                {
+                    throw new ArgumentException(
+                        $"MaxInFlightMessages ({options.MaxInFlightMessages.Value}) must be greater than or equal to PrefetchCount ({options.PrefetchCount}); otherwise handlers could never reach their configured concurrency.",
+                        nameof(options));
+                }
+
+                inFlight = new SemaphoreSlim(options.MaxInFlightMessages.Value, options.MaxInFlightMessages.Value);
+            }
+
+            var startedUtc = DateTime.UtcNow;
 
             var resultsQueue = new ConcurrentQueue<TResult>();
 
@@ -252,22 +378,32 @@ namespace EasyRabbitFlow.Services
 
             var _queue = $"{queuePrefixName ?? eventName}-temp-queue-{executionId}";
 
-            // effectiveCt = caller token + optional whole-run timeout; governs every internal wait
+            // effectiveCt = caller token + optional whole-run timeout; governs handlers and every internal wait.
             using var runTimeoutCts = options.RunTimeout.HasValue ? new CancellationTokenSource(options.RunTimeout.Value) : null;
 
-            using var effectiveCts = runTimeoutCts != null ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, runTimeoutCts.Token) : null;
+            using var effectiveCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, runTimeoutCts?.Token ?? CancellationToken.None);
+            var effectiveCt = effectiveCts.Token;
 
-            var effectiveCt = effectiveCts?.Token ?? cancellationToken;
+            // producerCt = effectiveCt + broker shutdown. It governs only source enumeration and publication:
+            // once the connection is gone nothing else can be admitted, so a source waiting for its next element
+            // must be interrupted — while handlers that already own their (acked) message keep running, exactly
+            // as in the collection overloads. They are bounded only by Timeout / RunTimeout.
+            using var stopCts = new CancellationTokenSource();
+            using var producerCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveCt, stopCts.Token);
+            var producerCt = producerCts.Token;
 
-            using var connection = await _connectionFactory.CreateConnectionAsync($"{_queue}", cancellationToken);
+            using var connection = await _connectionFactory.CreateConnectionAsync($"{_queue}", effectiveCt);
 
-            using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+            using var channel = await connection.CreateChannelAsync(cancellationToken: effectiveCt);
 
-            var maxMessages = messages.Count;
+            var maxMessages = knownCount ?? 0;
+            var producerFinished = 0;
+            var sourceCompleted = false;
 
-            await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, cancellationToken: cancellationToken);
+            await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, cancellationToken: effectiveCt);
 
-            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetchCount, global: false, cancellationToken: cancellationToken);
+            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetchCount, global: false, cancellationToken: effectiveCt);
 
             var published = 0;
 
@@ -289,7 +425,8 @@ namespace EasyRabbitFlow.Services
 
             var channelGate = new SemaphoreSlim(1, 1);
 
-            var activeTasks = new ConcurrentBag<Task>();
+            var activeTasks = new ConcurrentDictionary<ulong, Task>();
+            var activeHandlers = 0;
 
             var connectionLost = 0;
 
@@ -302,7 +439,9 @@ namespace EasyRabbitFlow.Services
                 // On connection loss undelivered messages can never arrive: stop once in-flight handlers drain.
                 var endedEarly = Volatile.Read(ref connectionLost) == 1;
 
-                if ((terminalCount >= maxMessages || endedEarly) && (activeTasks.Count == 0 || activeTasks.All(task => task.IsCompleted)))
+                if (Volatile.Read(ref producerFinished) == 1 &&
+                    (terminalCount >= Volatile.Read(ref maxMessages) || endedEarly) &&
+                    Volatile.Read(ref activeHandlers) == 0)
                 {
                     tcs.TrySetResult(true);
                 }
@@ -314,6 +453,7 @@ namespace EasyRabbitFlow.Services
                 {
                     shutdownReason = ea.ReplyText;
                     _logger.LogError("[RabbitFlowTemporary] Connection or channel shut down while the run was in progress: {reason}. CorrelationId: {correlationId}", ea.ReplyText, correlationId);
+                    stopCts.Cancel();
                     TryComplete();
                 }
 
@@ -336,6 +476,8 @@ namespace EasyRabbitFlow.Services
                 }
 
                 Interlocked.Increment(ref processed);
+                // Terminal state reached: hand the in-flight permit back so the producer can pull the next element.
+                inFlight?.Release();
                 TryComplete();
             }
 
@@ -405,6 +547,7 @@ namespace EasyRabbitFlow.Services
                     await SafeAckAsync(ea.DeliveryTag).ConfigureAwait(false);
 
                     // The processing task takes over the semaphore slot and releases it when done
+                    Interlocked.Increment(ref activeHandlers);
                     var processingTask = Task.Run(async () =>
                     {
                         try
@@ -475,7 +618,13 @@ namespace EasyRabbitFlow.Services
 
                     ownsSemaphore = false;
 
-                    activeTasks.Add(processingTask);
+                    activeTasks[ea.DeliveryTag] = processingTask;
+                    _ = processingTask.ContinueWith(_ =>
+                    {
+                        activeTasks.TryRemove(ea.DeliveryTag, out var completedTask);
+                        Interlocked.Decrement(ref activeHandlers);
+                        TryComplete();
+                    }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 }
                 catch (Exception ex)
                 {
@@ -492,65 +641,81 @@ namespace EasyRabbitFlow.Services
                 }
             };
 
-            var consumerTag = await channel.BasicConsumeAsync(_queue, autoAck: false, consumer);
+            var consumerTag = await channel.BasicConsumeAsync(_queue, autoAck: false, consumer, cancellationToken: effectiveCt);
 
-            for (var index = 0; index < messages.Count; index++)
+            // Progress reporting runs beside the run, never inside a handler, and starts before publishing so a long
+            // asynchronous source is observable while it is still being read. Canceled when the run starts closing.
+            using var progressCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveCt);
+
+            TemporaryRunProgress SnapshotProgress() => new TemporaryRunProgress(
+                correlationId, _queue, startedUtc, DateTime.UtcNow,
+                Volatile.Read(ref maxMessages), Volatile.Read(ref published), Volatile.Read(ref processed),
+                Volatile.Read(ref succeeded), Volatile.Read(ref failed), Volatile.Read(ref activeHandlers));
+
+            var progressLoop = options.OnProgress is { } onProgress
+                ? ReportProgressAsync(onProgress, options.ProgressInterval, SnapshotProgress, correlationId, progressCts.Token)
+                : null;
+
+            try
             {
-                var msg = messages[index];
-
-                try
+                var index = 0;
+                await foreach (var msg in ReadSourceAsync(messages, inFlight, producerCt).ConfigureAwait(false))
                 {
-                    var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg, _jsonOptions));
-
-                    await channelGate.WaitAsync(effectiveCt).ConfigureAwait(false);
+                    // Count the element as observed before publishing: if the run is interrupted mid-publish it is
+                    // reported below as unaccounted (failed) rather than silently dropped from the source.
+                    if (!knownCount.HasValue) Interlocked.Increment(ref maxMessages);
                     try
                     {
-                        await channel.BasicPublishAsync("", _queue, body);
-                        Interlocked.Increment(ref published);
+                        var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg, _jsonOptions));
+                        await channelGate.WaitAsync(producerCt).ConfigureAwait(false);
+                        try
+                        {
+                            await channel.BasicPublishAsync("", _queue, body, producerCt);
+                            Interlocked.Increment(ref published);
+                        }
+                        finally
+                        {
+                            channelGate.Release();
+                        }
                     }
-                    finally
+                    catch (OperationCanceledException) when (producerCt.IsCancellationRequested)
                     {
-                        channelGate.Release();
+                        // Run interruption, not a broken message: classified by the outer handler.
+                        throw;
                     }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref failed);
+                        Interlocked.Increment(ref publishFailed);
+                        // Never published, so no handler will ever release this element's permit: do it here.
+                        inFlight?.Release();
+                        runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Publish, ex, _queue, messageIndex: index));
+                        _logger.LogError(ex, "[RabbitFlowTemporary] Error publishing message at index {index}. CorrelationId: {correlationId}", index, correlationId);
+                        await InvokeOnErrorAsync(onError, msg, cancellationToken, _logger, correlationId);
+                    }
+                    index++;
                 }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref failed);
-                    Interlocked.Increment(ref publishFailed);
-                    runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Publish, ex, _queue, messageIndex: index));
-
-                    _logger.LogError(ex, "[RabbitFlowTemporary] Error publishing message at index {index} to temporary queue. CorrelationId: {correlationId}", index, correlationId);
-
-                    await InvokeOnErrorAsync(onError, msg, cancellationToken, _logger, correlationId);
-
-                    TryComplete();
-                }
+                sourceCompleted = true;
             }
-
-            // Monitoring task: closes the completion gap between the last CompleteProcessed and pending active tasks
-            _ = Task.Run(async () =>
+            catch (OperationCanceledException) when (producerCt.IsCancellationRequested)
             {
-                try
-                {
-                    while (!effectiveCt.IsCancellationRequested)
-                    {
-                        TryComplete();
-
-                        if (tcs.Task.IsCompleted) break;
-
-                        // Check periodically
-                        await Task.Delay(100, effectiveCt);
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    // Ignore cancellation
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "[RabbitFlowTemporary] Error in completion monitoring task. CorrelationId: {correlationId}", correlationId);
-                }
-            }, effectiveCt);
+                var stage = Volatile.Read(ref connectionLost) == 1 ? TemporaryRunErrorStage.ConnectionLost
+                    : cancellationToken.IsCancellationRequested ? TemporaryRunErrorStage.Cancellation
+                    : TemporaryRunErrorStage.Timeout;
+                runErrors.Enqueue(TemporaryRunError.FromMessage(stage, "The input source was interrupted before completion.", _queue));
+            }
+            catch (Exception ex)
+            {
+                // A failed source cannot hang the run: every observed element was either published (and will reach a
+                // terminal state) or counted as a publish failure, so TryComplete fires once admitted handlers finish.
+                // Those handlers are bounded only by Timeout / RunTimeout, like every other run.
+                runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Enumeration, ex, _queue));
+            }
+            finally
+            {
+                Volatile.Write(ref producerFinished, 1);
+                TryComplete();
+            }
 
             using var ctr = effectiveCt.Register(() =>
             {
@@ -573,6 +738,15 @@ namespace EasyRabbitFlow.Services
             }
             finally
             {
+                // No progress call starts once the run is closing; a call already running gets a bounded window,
+                // so a callback that ignores its token cannot hold the completion callback back.
+                progressCts.Cancel();
+
+                if (progressLoop != null)
+                {
+                    await Task.WhenAny(progressLoop, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
+                }
+
                 channel.ChannelShutdownAsync -= OnShutdownAsync;
 
                 connection.ConnectionShutdownAsync -= OnShutdownAsync;
@@ -581,7 +755,7 @@ namespace EasyRabbitFlow.Services
                 // Second pass catches a task dispatched concurrently with the early end.
                 for (var pass = 0; pass < 2; pass++)
                 {
-                    var drainTasks = activeTasks.Where(task => !task.IsCompleted).ToArray();
+                    var drainTasks = activeTasks.Values.Where(task => !task.IsCompleted).ToArray();
 
                     if (drainTasks.Length == 0)
                     {
@@ -628,7 +802,7 @@ namespace EasyRabbitFlow.Services
                 finalResult = new TemporaryRunResult<TResult>(
                     maxMessages, published, processed, succeeded, failed,
                     correlationId, _queue, startedUtc, completedUtc,
-                    runErrors.ToArray(), resultsQueue.ToArray());
+                    runErrors.ToArray(), resultsQueue.ToArray(), knownCount.HasValue ? (bool?)null : sourceCompleted);
 
                 // Always run the completion callback
                 try
@@ -647,13 +821,123 @@ namespace EasyRabbitFlow.Services
                     finalResult = new TemporaryRunResult<TResult>(
                         maxMessages, published, processed, succeeded, failed,
                         correlationId, _queue, startedUtc, completedUtc,
-                        runErrors.ToArray(), resultsQueue.ToArray());
+                        runErrors.ToArray(), resultsQueue.ToArray(), knownCount.HasValue ? (bool?)null : sourceCompleted);
                 }
 
-                channelGate.Dispose();
+                // Late handlers may still release their slots if they ignored cancellation.
+                // Their primitives are left for GC instead of being disposed under running code.
             }
 
             return finalResult;
+        }
+
+        // One call at a time: the next interval starts only after the previous call returns, so a slow callback
+        // delays reporting instead of piling calls up. A failing callback is logged and never affects the run.
+        private async Task ReportProgressAsync(
+            Func<TemporaryRunProgress, CancellationToken, Task> onProgress,
+            TimeSpan interval,
+            Func<TemporaryRunProgress> snapshot,
+            string? correlationId,
+            CancellationToken ct)
+        {
+            while (true)
+            {
+                try
+                {
+                    await Task.Delay(interval, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                try
+                {
+                    await onProgress(snapshot(), ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[RabbitFlowTemporary] Error in progress callback. CorrelationId: {correlationId}", correlationId);
+                }
+            }
+        }
+
+        private async IAsyncEnumerable<T> ReadSourceAsync<T>(IAsyncEnumerable<T> source, SemaphoreSlim? inFlight,
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            var enumerator = source.GetAsyncEnumerator(ct);
+            Task<bool>? pendingMove = null;
+            try
+            {
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    // Backpressure gate: a permit is taken BEFORE asking the source for its next element, so a full
+                    // window means MoveNextAsync is simply not called and the producer stays parked at its yield.
+                    if (inFlight != null)
+                    {
+                        await inFlight.WaitAsync(ct).ConfigureAwait(false);
+                    }
+
+                    pendingMove = enumerator.MoveNextAsync().AsTask();
+                    await WaitForSourceOperationAsync(pendingMove, ct).ConfigureAwait(false);
+                    var hasNext = await pendingMove.ConfigureAwait(false);
+                    pendingMove = null;
+                    if (!hasNext)
+                    {
+                        // The permit taken for this attempt was never matched by an element.
+                        inFlight?.Release();
+                        yield break;
+                    }
+                    yield return enumerator.Current;
+                }
+            }
+            finally
+            {
+                if (pendingMove != null && !pendingMove.IsCompleted)
+                {
+                    // Never call DisposeAsync concurrently with MoveNextAsync. A source that ignores
+                    // cancellation owns that unfinished operation until it eventually settles.
+                    _ = DisposeSourceAfterMoveAsync(enumerator, pendingMove);
+                }
+                else
+                {
+                    var disposal = enumerator.DisposeAsync().AsTask();
+                    await WaitForSourceOperationAsync(disposal, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private static async Task WaitForSourceOperationAsync(Task operation, CancellationToken ct)
+        {
+            if (!operation.IsCompleted)
+            {
+                var canceled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (ct.Register(() => canceled.TrySetResult(true)))
+                {
+                    if (await Task.WhenAny(operation, canceled.Task).ConfigureAwait(false) != operation)
+                    {
+                        _ = operation.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                        ct.ThrowIfCancellationRequested();
+                    }
+                }
+            }
+            await operation.ConfigureAwait(false);
+        }
+
+        private async Task DisposeSourceAfterMoveAsync<T>(IAsyncEnumerator<T> enumerator, Task pendingMove)
+        {
+            try { await pendingMove.ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogDebug(ex, "[RabbitFlowTemporary] Abandoned source operation ended."); }
+            try { await enumerator.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[RabbitFlowTemporary] Deferred source disposal failed."); }
         }
 
         private static async Task InvokeOnErrorAsync<T>(Func<T, CancellationToken, Task>? onError, T message, CancellationToken cancellationToken, ILogger logger, string? correlationId)

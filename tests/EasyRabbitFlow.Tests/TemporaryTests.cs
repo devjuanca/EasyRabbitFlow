@@ -17,6 +17,43 @@ public class TemporaryTests
     }
 
     [Fact]
+    public async Task RunAsync_BrokerDisconnect_DoesNotCancelInFlightHandler()
+    {
+        // Arrange: a handler that already acked its message must be able to finish its (non-broker) work
+        // even if the temporary connection is dropped meanwhile.
+        using var sp = (ServiceProvider)_fixture.BuildServiceProvider();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerOutcome = "not-run";
+
+        var run = sp.GetRequiredService<IRabbitFlowTemporary>().RunAsync(
+            new List<TestEvent> { new() { Id = "1", Message = "1" } },
+            async (_, ct) =>
+            {
+                started.TrySetResult(true);
+                try { await release.Task.WaitAsync(ct); handlerOutcome = "completed"; }
+                catch (OperationCanceledException) { handlerOutcome = "canceled"; throw; }
+            }, cancellationToken: deadline.Token);
+
+        await started.Task.WaitAsync(deadline.Token);
+
+        // Act
+        Assert.Equal(0, await _fixture.CloseAllConnectionsAsync("temporary-test"));
+        await Task.Delay(1500);
+        Assert.False(run.IsCompleted);
+        release.TrySetResult(true);
+        var result = await run.WaitAsync(deadline.Token);
+
+        // Assert
+        Assert.Equal("completed", handlerOutcome);
+        Assert.Equal(1, result.SucceededMessages);
+        Assert.Equal(0, result.FailedMessages);
+        Assert.Equal(1, result.ProcessedMessages);
+        Assert.DoesNotContain(result.Errors, e => e.Stage == TemporaryRunErrorStage.Process);
+    }
+
+    [Fact]
     public async Task RunAsync_ProcessesAllMessages()
     {
         // Arrange

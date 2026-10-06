@@ -60,7 +60,7 @@ cfg.AddConsumer<EmailConsumer>("email-queue", c =>
 | `AutoGenerate` | bool | `false` | Auto-create queue/exchange/DLQ |
 | `ExtendDeadletterMessage` | bool | `true` | Enrich dead-letter messages with error details. Only effective when the DLQ is auto-generated (`AutoGenerate = true` and `GenerateDeadletterQueue = true`); otherwise failures are nacked without an envelope. |
 | `UnwrapDeadLetterEnvelopes` | bool | `false` | Defensive safety net: detect a `DeadLetterEnvelope` arriving on the main queue (e.g. from a manual DLQ replay) and process the inner payload. See [Manual DLQ Replay Safety Net](dead-letter.md#manual-dlq-replay-safety-net). |
-| `DisableNameValidation` | bool | `false` | Skip validation of reserved substrings (`deadletter`, `-exchange`, `-routing-key`) against the queue name and any auto-generate names. See [Reserved Name Substrings](#reserved-name-substrings). Only honored when `AutoGenerate = false`. |
+| `DisableNameValidation` | bool | `false` | Skip validation of reserved substrings (`deadletter`, `-exchange`, `-routing-key` in the queue name; `deadletter` in any auto-generate `ExchangeName` / `RoutingKey`). See [Reserved Name Substrings](#reserved-name-substrings). Only honored when `AutoGenerate = false`. |
 
 ### Reserved Name Substrings
 
@@ -72,13 +72,16 @@ When `AutoGenerate = true`, EasyRabbitFlow derives the dead-letter topology by a
 {queueName}-deadletter-routing-key
 ```
 
-To prevent collisions and ambiguous topology, `AddConsumer<T>` validates the supplied `queueName` (and any `ExchangeName` / `RoutingKey` configured via `ConfigureAutoGenerate`) against three reserved substrings — case-insensitive:
+To prevent collisions and ambiguous topology, `AddConsumer<T>` validates the supplied names against reserved substrings — case-insensitive:
 
-- `deadletter`
-- `-exchange`
-- `-routing-key`
+| Name | Reserved substrings |
+|------|---------------------|
+| `queueName` | `deadletter`, `-exchange`, `-routing-key` |
+| `ExchangeName` / `RoutingKey` (via `ConfigureAutoGenerate`) | `deadletter` only |
 
-If any name contains one of these, registration throws `RabbitFlowException`:
+The queue name is the base every generated name is derived from, so all three suffixes are reserved there. The generated dead-letter names derive only from the queue name and always contain `deadletter`, so an exchange name or routing key can only collide with them through that substring: `-exchange` / `-routing-key` are allowed there. This lets a consumer bind its auto-generated queue to an existing exchange that follows the conventional `-exchange` suffix (e.g. `snapshots-exchange`), and it is the same rule [`DeclareExchange`](configuration.md#application-owned-exchanges) applies.
+
+If a name contains a reserved substring, registration throws `RabbitFlowException`:
 
 ```csharp
 // Throws — "orders-deadletter" collides with the auto-generated DLQ name.
@@ -86,13 +89,14 @@ cfg.AddConsumer<OrderConsumer>("orders-deadletter", c => { /* ... */ });
 ```
 
 ```csharp
-// Throws — auto-generate exchange/routing-key names follow the same rule.
 cfg.AddConsumer<OrderConsumer>("orders", c =>
 {
     c.AutoGenerate = true;
     c.ConfigureAutoGenerate(ag =>
     {
-        ag.ExchangeName = "orders-exchange"; // throws
+        ag.ExchangeName = "snapshots-exchange";   // OK — "-exchange" is allowed here
+        ag.RoutingKey = "orders-routing-key";     // OK — "-routing-key" is allowed here
+        // ag.ExchangeName = "orders-deadletter"; // throws — "deadletter" is reserved everywhere
     });
 });
 ```
