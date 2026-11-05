@@ -18,6 +18,20 @@ public class ReprocessorTests
         _fixture = fixture;
     }
 
+    // The tests publish to the DLQ without publisher confirms and then run a cycle at once. On a quorum queue
+    // the publish is only visible once the Raft log commits it, so a cycle started immediately can find the DLQ
+    // empty and park nothing. Waiting for the depth mirrors reality (the reprocessor runs hours later) and keeps
+    // the assertions about the cycle itself.
+    private static async Task WaitForDepthAsync(IChannel ch, string queue, uint expected)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+
+        while (await ch.MessageCountAsync(queue) < expected && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+    }
+
     [Fact]
     public async Task RunCycle_Reenqueues_Transients_Parks_TheRest_And_RestoresProperties()
     {
@@ -108,6 +122,8 @@ public class ReprocessorTests
                 maxMessagesPerCycle: 100,
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: null);
+
+            await WaitForDepthAsync(ch, dlqName, 3);
 
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
@@ -239,6 +255,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: null);
 
+            await WaitForDepthAsync(ch, dlqName, 2);
+
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -343,6 +361,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Discard,
                 parkingMessageTtl: null);
 
+            await WaitForDepthAsync(ch, dlqName, 3);
+
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -392,6 +412,8 @@ public class ReprocessorTests
                 maxMessagesPerCycle: 100,
                 finalAction: DeadLetterFinalAction.Discard,
                 parkingMessageTtl: null);
+
+            await WaitForDepthAsync(ch, dlqName, 1);
 
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
@@ -450,6 +472,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: TimeSpan.FromSeconds(2));
 
+            await WaitForDepthAsync(ch, dlqName, 1);
+
             // Act — message is parked into a queue declared with x-message-ttl = 2s
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -459,6 +483,65 @@ public class ReprocessorTests
             await Task.Delay(TimeSpan.FromSeconds(4));
 
             Assert.Equal(0u, await ch.MessageCountAsync(parkingName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Theory]
+    [InlineData(QueueType.Classic, "classic")]
+    [InlineData(QueueType.Quorum, "quorum")]
+    public async Task RunCycle_AppliesParkingQueueType_OnQueueCreation(QueueType parkingQueueType, string expectedType)
+    {
+        // The parking queue is created on demand with the dead-letter queue's type, whatever the broker default is.
+        var queueName = $"test-reproc-ptype-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            var permanent = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"q1"}"""),
+                ExceptionType = "InvalidOperationException",
+                IsTransient = false,
+                ReprocessAttempts = 0
+            };
+            await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(permanent, jsonOpts)));
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                Factory(),
+                jsonOpts,
+                consumerName: "ReprocessorParkingTypeConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Park,
+                parkingMessageTtl: null,
+                parkingQueueType: parkingQueueType);
+
+            await WaitForDepthAsync(ch, dlqName, 1);
+
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            Assert.Equal(1u, await ch.MessageCountAsync(parkingName));
+            Assert.Equal(expectedType, await _fixture.GetQueueTypeAsync(parkingName));
         }
         finally
         {

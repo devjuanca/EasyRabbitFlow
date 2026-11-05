@@ -44,6 +44,95 @@ public class PublisherTests
         Assert.True(messageCount >= 1, $"Expected at least 1 message in queue, found {messageCount}");
     }
 
+    [Theory]
+    [InlineData("no-options", false)]
+    [InlineData("ids-only", false)]
+    [InlineData("options-default", false)]
+    [InlineData("options-persistent", true)]
+    public async Task PublishAsync_DeliveryModeOnTheWire_IsTransientUnlessRequested(string path, bool expectPersistent)
+    {
+        // Every publish path (no properties at all, ids without options, options with the default mode, options asking
+        // for Persistent) must put the same documented delivery mode on the wire: transient unless Persistent is set.
+        var queueName = $"test-publish-dm-{Guid.NewGuid():N}";
+        var sp = _fixture.BuildServiceProvider();
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: true);
+
+        var evt = new TestEvent { Id = path, Message = "delivery-mode" };
+
+        var result = path switch
+        {
+            "no-options" => await publisher.PublishAsync(evt, queueName),
+            "ids-only" => await publisher.PublishAsync(evt, queueName, messageId: "m-1", correlationId: "c-1"),
+            "options-default" => await publisher.PublishAsync(evt, queueName, options: new EasyRabbitFlow.Settings.PublishOptions()),
+            _ => await publisher.PublishAsync(evt, queueName, options: new EasyRabbitFlow.Settings.PublishOptions { DeliveryMode = EasyRabbitFlow.Settings.MessageDeliveryMode.Persistent })
+        };
+
+        Assert.True(result.Success);
+
+        BasicGetResult? got = null;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (got == null && DateTime.UtcNow < deadline)
+        {
+            got = await ch.BasicGetAsync(queueName, autoAck: true);
+            if (got == null) await Task.Delay(50);
+        }
+
+        Assert.NotNull(got);
+
+        var persistentOnWire = got!.BasicProperties.IsDeliveryModePresent() && got.BasicProperties.DeliveryMode == DeliveryModes.Persistent;
+
+        Assert.Equal(expectPersistent, persistentOnWire);
+    }
+
+    [Theory]
+    [InlineData("classic", EasyRabbitFlow.Settings.ChannelMode.Transactional)]
+    [InlineData("classic", EasyRabbitFlow.Settings.ChannelMode.Confirm)]
+    [InlineData("quorum", EasyRabbitFlow.Settings.ChannelMode.Transactional)]
+    [InlineData("quorum", EasyRabbitFlow.Settings.ChannelMode.Confirm)]
+    public async Task PublishBatchAsync_ToQueue_DeliversEveryMessage_OnBothQueueTypes(string queueType, EasyRabbitFlow.Settings.ChannelMode mode)
+    {
+        // Batch publishing relies on AMQP transactions (tx.select / tx.commit) or publisher confirms. Both must work
+        // against classic and quorum queues on every supported broker; the queue type is pinned explicitly so the
+        // test means the same on every CI leg.
+        var queueName = $"test-batch-{queueType}-{mode}-{Guid.NewGuid():N}".ToLowerInvariant();
+        var sp = _fixture.BuildServiceProvider();
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = queueType });
+
+        try
+        {
+            var messages = Enumerable.Range(1, 25).Select(i => new TestEvent { Id = i.ToString(), Message = $"batch-{i}" }).ToList();
+
+            var result = await publisher.PublishBatchAsync(messages, queueName, channelMode: mode);
+
+            Assert.True(result.Success, $"Batch failed: {result.Error?.Message}");
+            Assert.Equal(25, result.MessageCount);
+
+            uint depth = 0;
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (depth < 25 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+                depth = await ch.MessageCountAsync(queueName);
+            }
+
+            Assert.Equal(25u, depth);
+            Assert.Equal(queueType, await _fixture.GetQueueTypeAsync(queueName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+        }
+    }
+
     [Fact]
     public async Task PublishAsync_ToExchange_MessageRouted()
     {

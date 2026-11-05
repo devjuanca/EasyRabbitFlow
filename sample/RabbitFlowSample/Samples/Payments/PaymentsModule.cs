@@ -33,12 +33,6 @@ public static class PaymentsModule
             c.AutoGenerate = true;
             c.ExtendDeadletterMessage = true;   // dead-letter copies carry the full DeadLetterEnvelope
 
-            c.ConfigureRetryPolicy(r =>
-            {
-                r.MaxRetryCount = 1;            // one retry after the initial attempt
-                r.RetryInterval = 500;
-            });
-
             c.ConfigureAutoGenerate(ag =>
             {
                 ag.GenerateDeadletterQueue = true;   // required for replicas to bind

@@ -31,12 +31,8 @@ public static class NotificationsModule
                 opt.ExchangeType = ExchangeType.Fanout;
             });
 
-            c.ConfigureRetryPolicy(r =>
-            {
-                r.MaxRetryCount = 1;             // one retry after the initial attempt
-                r.RetryInterval = 1000;         // fixed, ephemeral delay between retries
-            });
-
+            // Retries happen through the dead-letter reprocessor (see PaymentsModule), not in-process:
+            // the delivery is acknowledged as soon as it fails and retried later from the DLQ.
             c.ExtendDeadletterMessage = true;    // wrap failed messages in DeadLetterEnvelope
             c.UnwrapDeadLetterEnvelopes = true;  // accept envelope-wrapped messages on manual DLQ replay
         });
