@@ -283,6 +283,26 @@ TemporaryRunResult<InvoiceResult> run = await _temporary.RunAsync<Invoice, Invoi
 Console.WriteLine($"Collected {run.Results.Count} successful invoice results.");
 ```
 
+### Queue type and broker versions
+
+The temporary queue is declared **exclusive, non-durable and auto-delete**, explicitly as a **classic** queue
+(`x-queue-type = classic`, v8.4.0; the only type that can be exclusive and non-durable) and without
+`x-consumer-timeout`. That combination behaves the same on every supported broker:
+
+| Broker | Behaviour |
+|---|---|
+| 3.13 | Classic queue. The broker-wide `consumer_timeout` (30 min) is the only ack timeout; see below for why it practically never applies. |
+| 4.x, classic default | Classic queue. Exclusive queues are not affected by the `transient_nonexcl_queues` deprecation (only *non-exclusive* non-durable queues are). Classic queues on 4.3+ have no consumer timeout at all. |
+| 4.x with `default_queue_type = quorum` | Classic queue, because the declare says so. (Before v8.4.0 the library relied on the broker falling back to classic for exclusive/non-durable declarations, which 4.3.7 and 4.4.0 do; now the type no longer depends on it. Guarded by a test.) `QueueType` / `MaxBrokerDeliveries` do not apply to temporary runs. |
+
+Each delivery is **acknowledged right after deserialization, before the handler runs**, so a long handler never
+holds an unacknowledged delivery. The only unacknowledged window is a delivery waiting for a processing slot while
+the previous handlers of that slot are still running (the broker refills the prefetch window as soon as deliveries
+are acked), which is bounded by `Timeout`. A broker ack timeout can therefore only interfere on 3.13 when handlers run
+for longer than its 30-minute default; it then closes the channel and the run ends early with a partial result, like
+any connection loss. Broker-initiated consumer cancellation (`basic.cancel`) cannot target an exclusive queue from
+elsewhere: the only way to lose the queue is to lose the connection, which the run already handles.
+
 ### Progress Reporting (`OnProgress`)
 
 A temporary queue is **exclusive** to the connection that declared it, so no other connection — another instance of

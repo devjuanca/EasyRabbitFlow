@@ -15,7 +15,7 @@ EasyRabbitFlow distinguishes between **transient** failures (worth retrying) and
 Classification is **inheritance-aware** and also inspects the **inner-exception chain** (up to 10 levels): an `InvalidOperationException` wrapping an `HttpRequestException(429)` is still transient. Anything else is treated as **permanent** and routed to the dead-letter queue without further retry. Two common permanent cases worth calling out:
 
 - **JSON deserialization failures** — the payload never reaches the handler; the message is dead-lettered with zero attempts.
-- **Abandoned handlers** — a handler that ignores its `CancellationToken` and is abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) surfaces as a non-transient `RabbitFlowException`. Note the asymmetry: a *cooperative* timeout (the handler honors the token) is an `OperationCanceledException` and therefore transient; ignoring the token is treated as a bug, not a retryable condition.
+- **Abandoned handlers** — a handler that ignores its `CancellationToken` and is abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) surfaces as a non-transient `RabbitFlowHandlerAbandonedException` (a `RabbitFlowException`). Note the asymmetry: a *cooperative* timeout (the handler honors the token) is an `OperationCanceledException` and therefore transient; ignoring the token is treated as a bug, not a retryable condition.
 
 > **HTTP rate limits and gateway errors are covered for free.** A `429` or `503` thrown by `HttpClient` (e.g. via `EnsureSuccessStatusCode()`) is recognized automatically — no wrapping needed. A `404` or `400` stays permanent.
 

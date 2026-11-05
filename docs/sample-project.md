@@ -4,7 +4,7 @@
 
 | Module | What it demonstrates |
 |--------|----------------------|
-| `Notifications/` | Fanout exchange, retry policies, dead-letter envelope + reprocessor, DI lifetimes |
+| `Notifications/` | Fanout exchange, dead-letter envelope + reprocessor, DI lifetimes |
 | `Orders/` | Topic exchange with `*` / `#` wildcard bindings |
 | `IntegrationEvents/` | Publisher-owned exchange (`DeclareExchange`) — no consumers; external clients bind their own queues |
 | `Payments/` | Dead-letter replicas (audit + alerting feeds from the same DLX) |

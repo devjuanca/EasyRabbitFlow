@@ -79,6 +79,13 @@ Use `PublishBatchAsync` to publish multiple messages in a single operation. The 
 
 Batches always open their own dedicated channel; they never use the single-message channel pool.
 
+> **Queue types and broker versions.** Both modes work against classic and quorum queues on RabbitMQ 3.13 and 4.x
+> (covered by the integration suite on every CI leg). Keep in mind what RabbitMQ itself promises for
+> `Transactional`: `tx.commit-ok` means every publish of the batch is visible, but the broker documents **no atomicity
+> guarantee** across queues — a batch routed to several queues can land in some of them if the broker fails
+> mid-commit — and none for a single queue either in failure scenarios. For business-critical fan-out prefer `Confirm`
+> plus idempotent consumers. See [RabbitMQ semantics](https://www.rabbitmq.com/docs/semantics).
+
 ```csharp
 // Atomic batch (Transactional — default)
 var result = await publisher.PublishBatchAsync(
@@ -287,3 +294,17 @@ await publisher.PublishAsync(
 Consumers read every field above (except `JsonOptions`, which is publisher-side only) via [`RabbitFlowMessageContext`](consumers.md#message-context).
 
 > **Priority footgun:** setting `options.Priority` on a queue that was **not** declared with `x-max-priority` is silently ignored by the broker — messages are delivered in FIFO order regardless. For auto-generated queues, configure [`AutoGenerateSettings.MaxPriority`](consumers.md#auto-generate-topology); for queues declared externally, add `x-max-priority` to the queue arguments yourself.
+
+### Durability: three different guarantees
+
+"Durable queue", "persistent message" and "publisher confirm" are often conflated. They are independent, and only together do they give at-least-once delivery across a broker restart:
+
+| Guarantee | Set where | What it covers | What it does **not** cover |
+|---|---|---|---|
+| **Durable queue** (`DurableQueue = true`, the default) | queue declaration | the queue *definition* survives a broker restart | its messages: transient messages on a durable queue are lost on restart |
+| **Persistent message** (`PublishOptions.DeliveryMode = Persistent`) | each publish | the message is written to disk and survives a restart — **only** on a durable queue | that the broker received it (no confirm), or that a consumer processed it |
+| **Publisher confirm** (always on for `PublishAsync`; see [Publishing](#publishing-messages)) | the publish channel | the broker *accepted* the message (routed to a queue, or persisted when it had to be) | processing by a consumer; a transient message is still lost on restart |
+
+Every publish path of `IRabbitFlowPublisher` — with or without `messageId`/`correlationId`, with or without `PublishOptions` — sends the message **transient** unless `PublishOptions.DeliveryMode = MessageDeliveryMode.Persistent` is set; the default has never changed. The dead-letter envelope the consumer writes to the DLQ and the messages the reprocessor parks are the exceptions: they are always persistent, since they may wait hours for the next cycle.
+
+**Quorum queues** store every message on disk regardless of `DeliveryMode` (replication requires it), so on a quorum queue a transient publish survives a restart anyway; keep setting `Persistent` for business messages so the guarantee does not depend on the queue type. See [Queue types](consumers.md#queue-types).

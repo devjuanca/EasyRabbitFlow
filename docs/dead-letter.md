@@ -102,15 +102,13 @@ The shape is the public type `DeadLetterEnvelope` so dead-letter messages can be
 
 ## Dead-Letter Reprocessor
 
-When in-handler retries are not enough — for example, when the failure is caused by a downstream system that takes hours to recover — you can attach a **dead-letter reprocessor** to a consumer. The reprocessor runs on a fixed cadence, drains the consumer's auto-generated dead-letter queue, and re-publishes each message to the main queue until a maximum attempt count is reached.
+The **dead-letter reprocessor** is the library's retry mechanism: attach it to a consumer and it runs on a fixed cadence, drains the consumer's auto-generated dead-letter queue, and re-publishes each transient failure to the main queue until a maximum attempt count is reached — without ever holding a delivery unacknowledged, so the broker's consumer timeout is never stretched. (In-process retries, `ConfigureRetryPolicy`, are deprecated since v8.4.0.)
 
 ```csharp
 cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 {
     c.AutoGenerate = true;                       // required
     c.ExtendDeadletterMessage = true;            // forced when reprocessor is enabled
-
-    c.ConfigureRetryPolicy(r => r.MaxRetryCount = 3);
 
     c.ConfigureDeadLetterReprocess(r =>
     {
@@ -145,13 +143,16 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 
 If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle — their body is parked **unchanged** (the counter is not rewritten; only exhausted messages get the final count stamped). Parked messages are published **persistent** (`DeliveryMode = 2`) onto the durable parking queue, so they survive a broker restart; for permanent/malformed messages the original AMQP properties (`MessageId`, `CorrelationId`, headers, …) are preserved as well.
 
-The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, plus `x-message-ttl` if `ParkingMessageTtl` is set).
+The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, the dead-letter queue's type from [`DeadLetterQueueType` / `QueueType`](consumers.md#queue-types) — or the broker's `default_queue_type` when neither is set — plus `x-message-ttl` if `ParkingMessageTtl` is set).
 
 ### Discarding instead of parking
 
-By default every terminal message is parked. Set `FinalAction = DeadLetterFinalAction.Discard` to instead **drop** exhausted and permanent messages — they are acknowledged off the DLQ without being re-published anywhere. This suits high-volume failures that carry no recovery value and where parking would only accumulate noise. In `Discard` mode the parking queue is only ever created if a **malformed** message appears, because:
+By default every terminal message is parked. Set `FinalAction = DeadLetterFinalAction.Discard` to instead **drop** exhausted and permanent messages — they are acknowledged off the DLQ without being re-published anywhere. This suits high-volume failures that carry no recovery value and where parking would only accumulate noise. In `Discard` mode the parking queue is only ever created if a **malformed** or a **poisoned** message appears, because:
 
-- **Malformed messages are always parked, never discarded** — regardless of `FinalAction`. Their bytes could not be deserialized into an envelope, so dropping them would lose data with no recoverable trace. They are the one terminal category the discard switch does not govern.
+- **Malformed messages are always parked, never discarded** — regardless of `FinalAction`. Their bytes could not be deserialized into an envelope, so dropping them would lose data with no recoverable trace.
+- **Poisoned messages are always parked too** (v8.4.0) — envelopes written with `RabbitFlowPoisonMessageException` by the [poison guard](consumers.md#registering-consumers) (`MaxBrokerDeliveries`). The handler never ran, so their only fault may have been a run of restarts; they are kept for inspection.
+
+These are the two terminal categories the discard switch does not govern.
 
 Discarded messages are not silently invisible to operators: each one increments the `easyrabbitflow.messages.discarded` counter (tagged `reason = exhausted | permanent`) and is logged at debug level.
 
