@@ -45,8 +45,8 @@ so a log platform can filter on the prefix and facet on the fields. Levels:
 
 | Level | What |
 |---|---|
-| `Error` | A delivery that is dead-lettered (handler exception after the last attempt, deserialization failure, abandoned handler), a dead-letter envelope that could not be written, a recovery that keeps failing (third attempt onwards), a temporary-run handler that throws, broker callback exceptions |
-| `Warning` | A retried attempt (transient failure or cooperative timeout), a poison message given up on, a broker-initiated consumer cancel, channel/connection shutdown, the first recovery attempts, topology adopted with different arguments, per-message timeouts and cancellations inside a temporary run |
+| `Error` | A delivery that is dead-lettered (handler exception after the last attempt, deserialization failure, abandoned handler), a dead-letter envelope that could not be written or that stays unroutable after the dead-letter topology was re-declared (the message goes back to the queue), a failed re-declare of that topology, a recovery that keeps failing (third attempt onwards), a temporary-run handler that throws, broker callback exceptions |
+| `Warning` | A retried attempt (transient failure or cooperative timeout), a poison message given up on, a broker-initiated consumer cancel, channel/connection shutdown, the first recovery attempts, a dead-letter envelope returned by the broker as unroutable (before the re-declare), a shutdown that could not get hold of a running recovery in time, topology adopted with different arguments, per-message timeouts and cancellations inside a temporary run |
 | `Information` | Startup facts (reprocessor enabled, parking queue created), a successful recovery, reprocessor cycle summaries |
 | `Debug` | Each publish, reprocessor details |
 

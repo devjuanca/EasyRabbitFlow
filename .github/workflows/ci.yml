@@ -5,6 +5,14 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  # Manual run: the same matrix, optionally with the broker-dependent consumer timeout test, which stays out
+  # of the push/PR runs because whether a quorum queue fires its consumer timeout is not deterministic.
+  workflow_dispatch:
+    inputs:
+      broker_timeout_tests:
+        description: "Also run the broker-dependent consumer timeout test (RABBITFLOW_BROKER_TIMEOUT_TESTS=1; minutes long, may need a retry)"
+        type: boolean
+        default: true
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
@@ -54,11 +62,13 @@ jobs:
       # with default_queue_type = quorum. RABBITFLOW_SLOW_TESTS enables the
       # slow (tens of seconds) but deterministic tests, such as the bounded
       # shutdown with a stuck handler. The broker-dependent consumer timeout
-      # test (RABBITFLOW_BROKER_TIMEOUT_TESTS) stays manual: whether a quorum
-      # queue fires its consumer timeout proved non-deterministic across runs.
+      # test (RABBITFLOW_BROKER_TIMEOUT_TESTS) only runs on a manual dispatch
+      # that asks for it: whether a quorum queue fires its consumer timeout
+      # proved non-deterministic across runs.
       - name: Test
         env:
           RABBITMQ_IMAGE: ${{ matrix.rabbitmq }}
           RABBITMQ_DEFAULT_QUEUE_TYPE: ${{ matrix.default_queue_type }}
           RABBITFLOW_SLOW_TESTS: ${{ matrix.default_queue_type == 'quorum' && '1' || '' }}
+          RABBITFLOW_BROKER_TIMEOUT_TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.broker_timeout_tests && '1' || '' }}
         run: dotnet test tests/EasyRabbitFlow.Tests --configuration Release --no-build --logger "console;verbosity=normal"

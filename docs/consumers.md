@@ -188,7 +188,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 > [dead-letter reprocessor](dead-letter.md#dead-letter-reprocessor): it retries from the DLQ with a persistent
 > counter (`x-reprocess-attempts`), on its own cadence, and never holds a delivery unacknowledged — so it does not
 > stretch the broker's [consumer timeout](#consumer-timeout) either. In-process retries are what the
-> `x-consumer-timeout` formula accounts for; without them it is simply `max(60s, Timeout + 30s)`.
+> `x-consumer-timeout` formula accounts for; without them it is simply `max(60s, Timeout + 30s + 10s)`.
 
 Configure how failed messages are retried in-process:
 
@@ -284,6 +284,21 @@ task to complete. If it still hasn't:
 > failure metric carries `reason = abandoned`, and the reprocessor parks or discards it instead of re-enqueuing. A
 > handler that ignores cancellation is a bug to fix, not a condition to retry.
 
+**How long a delivery can stay unacknowledged**
+
+With `T` = `Timeout`, `G` = the 30s grace, `I` = `RetryInterval` and `N` = `MaxRetryCount + 1` attempts, each path holds the delivery unacknowledged for at most:
+
+| Path | One attempt | Whole delivery (worst case) | Then |
+|------|-------------|-----------------------------|------|
+| Handler completes in time | `T` | `T` | ack |
+| Late success: the handler swallows the cancellation and completes before the watchdog | `T + G` | `T + G` | ack (treated as success) |
+| Cooperative cancellation: the handler throws `OperationCanceledException` after its token fires | `T + G` | `N × (T + G) + (N − 1) × I` | retried as a transient timeout; dead-lettered after the last attempt |
+| Transient error (`RabbitFlowTransientException`, transient HTTP, …) | `< T` | `N × T + (N − 1) × I` | retried; dead-lettered after the last attempt |
+| Abandoned handler: ignores cancellation until the watchdog gives up | `T + G` | `(N − 1) × (T + G) + (N − 1) × I + (T + G)` when earlier attempts were cooperative timeouts | dead-lettered at once as non-transient; no further attempts |
+| Non-transient error | `< T` | `< T` | dead-lettered at once |
+
+The longest row is `N × (T + G) + (N − 1) × I`. Dead-lettering itself (publishing the envelope, its confirm and the ack of the original) happens after it, still unacknowledged; the derived `x-consumer-timeout` below budgets both.
+
 **Server-side timeout (`x-consumer-timeout`)**
 
 RabbitMQ enforces a delivery acknowledgement timeout: a delivery not acked within the window is returned to the queue for redelivery, and the broker intervenes on the consumer. Because the in-process retry policy holds the delivery **unacknowledged** for the whole retry cycle, that cycle must fit inside this window. What exactly happens depends on the broker version and queue type:
@@ -297,13 +312,13 @@ RabbitMQ enforces a delivery acknowledgement timeout: a delivery not acked withi
 - The timeout was introduced in **RabbitMQ 3.8.15** as a **broker-wide** setting (`consumer_timeout`), default 15 minutes — raised to **30 minutes in 3.8.17**. On 4.3+ the broker-wide default for quorum queues is much longer (24 hours per the 4.3.3 release notes), so in practice the per-queue argument the library derives is what bounds the delivery. The broker evaluates the timeout periodically, so a delivery can outlive the configured value by up to the evaluation interval.
 - Overriding it **per queue** via the `x-consumer-timeout` queue argument requires **RabbitMQ 3.12+**. On older brokers the argument is ignored and only the broker-wide `consumer_timeout` applies — so a long `Timeout` there must be accommodated by raising `consumer_timeout` on the broker instead.
 
-When `AutoGenerate = true`, EasyRabbitFlow sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle plus a grace period:
+When `AutoGenerate = true`, EasyRabbitFlow sets `x-consumer-timeout` on the declared queue to accommodate the full retry cycle, including the grace period of every attempt:
 
 ```text
-x-consumer-timeout = max(60s, Timeout × (MaxRetryCount + 1) + RetryInterval × MaxRetryCount + 30s grace)
+x-consumer-timeout = max(60s, (Timeout + 30s grace) × (MaxRetryCount + 1) + RetryInterval × MaxRetryCount + 10s)
 ```
 
-The value is floored at 60s because RabbitMQ rejects consumer timeouts below one minute. This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
+The grace is budgeted per attempt, not once: a handler that honours cancellation slowly can take almost `Timeout + 30s` on each attempt and still be retried as a transient timeout, so the delivery stays unacknowledged for the whole of that cycle. The final 10s covers dead-lettering after the last attempt (publishing the envelope, its confirm, a possible re-declare of the dead-letter topology, the ack). The value is floored at 60s because RabbitMQ rejects consumer timeouts below one minute. This keeps the broker-side policy in sync with your configured retry behavior, so the broker never kills a consumer mid-retry.
 
 When `Timeout <= 0` (e.g. `Timeout.InfiniteTimeSpan`, "no handler timeout") the argument is **not emitted** (v8.4.0; earlier versions derived a 60s broker timeout from the negative value, cutting off handlers that were meant to run indefinitely). The broker's own consumer timeout — the global `consumer_timeout` or a `consumer-timeout` policy — still applies where the queue type evaluates it, so a quorum queue on 4.3+ with a global timeout can still cancel a very long handler; the consumer then re-subscribes (see [Channel & connection recovery](#channel--connection-recovery)) and the delivery is redelivered.
 
@@ -336,6 +351,9 @@ finish, so their messages are acked or dead-lettered instead of being redelivere
 still waiting for a prefetch slot at that point is released unacked (the broker redelivers it once the channel
 closes), so shutdown stays bounded even when the slot is held by a handler that ignores cancellation (v8.4.0;
 before, such a wait could hold the channel open until the [watchdog](#consumer-timeout) abandoned the handler).
+A recovery pass that is running at that moment (for example in its backoff while the broker is down) is cancelled
+by the shutdown and the consumer waits at most 10s, or until the host's shutdown token fires, for it to leave;
+if it does not, the channel is disposed without the orderly close and a warning is logged.
 
 This is controlled by two `HostSettings` knobs:
 

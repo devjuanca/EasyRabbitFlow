@@ -5,10 +5,19 @@ namespace EasyRabbitFlow.Tests;
 public class ConsumerTimeoutRulesTests
 {
     [Fact]
-    public void Default_30s_NoRetries_IsFlooredAtOneMinute()
+    public void Default_30s_NoRetries_IsTimeoutPlusGracePlusMargin()
     {
-        // 30s × 1 attempt + 30s grace = 60s, exactly the broker minimum.
+        // (30s + 30s grace) × 1 attempt + 10s dead-letter margin = 70s.
         var ms = ConsumerTimeoutRules.ServerTimeoutMs(TimeSpan.FromSeconds(30), totalAttempts: 1, retryIntervalMs: 0);
+
+        Assert.Equal(70_000L, ms);
+    }
+
+    [Fact]
+    public void TwentySeconds_NoRetries_LandsExactlyOnTheFloor()
+    {
+        // (20s + 30s grace) × 1 attempt + 10s margin = 60s, exactly the broker minimum.
+        var ms = ConsumerTimeoutRules.ServerTimeoutMs(TimeSpan.FromSeconds(20), totalAttempts: 1, retryIntervalMs: 0);
 
         Assert.Equal(60_000L, ms);
     }
@@ -22,12 +31,25 @@ public class ConsumerTimeoutRulesTests
     }
 
     [Fact]
-    public void CoversEveryAttempt_EveryRetryDelay_AndTheGrace()
+    public void CoversEveryAttempt_EveryRetryDelay_AndTheGraceOfEachAttempt()
     {
-        // 10 min × 3 attempts + 5s × 2 retries + 30s grace = 1 840 000 ms.
+        // (10 min + 30s grace) × 3 attempts + 5s × 2 retries + 10s margin = 1 910 000 ms.
         var ms = ConsumerTimeoutRules.ServerTimeoutMs(TimeSpan.FromMinutes(10), totalAttempts: 3, retryIntervalMs: 5_000);
 
-        Assert.Equal(1_840_000L, ms);
+        Assert.Equal(1_910_000L, ms);
+    }
+
+    [Fact]
+    public void SlowCooperativeCancellation_OnEveryAttempt_StaysInsideTheWindow()
+    {
+        // Each attempt may legitimately last Timeout + grace: the handler sees its token cancelled at Timeout,
+        // unwinds just before the watchdog abandons it, and the resulting OperationCanceledException is retried
+        // as a transient timeout. Three such attempts hold the delivery unacknowledged for 3 × (Timeout + grace);
+        // the broker window must not expire before the last one ends.
+        // (50s + 30s) × 3 attempts = 240s of handler time, plus the 10s dead-letter margin.
+        var ms = ConsumerTimeoutRules.ServerTimeoutMs(TimeSpan.FromSeconds(50), totalAttempts: 3, retryIntervalMs: 0);
+
+        Assert.Equal(250_000L, ms);
     }
 
     [Theory]
@@ -54,8 +76,8 @@ public class ConsumerTimeoutRulesTests
     {
         var ms = ConsumerTimeoutRules.ServerTimeoutMs(TimeSpan.FromMinutes(2), totalAttempts: 0, retryIntervalMs: 60_000);
 
-        // One attempt, no retry delay: 120s + 30s.
-        Assert.Equal(150_000L, ms);
+        // One attempt, no retry delay: 120s + 30s grace + 10s margin.
+        Assert.Equal(160_000L, ms);
     }
 
     [Fact]

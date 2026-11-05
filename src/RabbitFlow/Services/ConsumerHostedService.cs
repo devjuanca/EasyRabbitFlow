@@ -120,7 +120,7 @@ namespace EasyRabbitFlow.Services
         private readonly object? _autoGenObj;
         private readonly long? _serverConsumerTimeoutMs;
         private readonly SemaphoreSlim _channelGate = new SemaphoreSlim(1, 1);
-        private readonly SemaphoreSlim _recoveryGate = new SemaphoreSlim(1, 1);
+        private readonly ConsumerRecoveryGate _recoveryGate = new ConsumerRecoveryGate();
         private readonly SemaphoreSlim _prefetchSemaphore;
 
         // Cancelled by StopAsync. A delivery waiting for a prefetch slot does so on the client's consumer dispatcher;
@@ -142,15 +142,21 @@ namespace EasyRabbitFlow.Services
         // slot forever: the queue keeps a live consumer that processes nothing.
         private static readonly TimeSpan HandlerAbandonGrace = TimeSpan.FromSeconds(30);
 
+        // How long shutdown waits for a running recovery pass to leave the gate before closing without it. The pass
+        // stops at its next iteration once _stopping is set and its waits observe the stop token, so this is normally
+        // a few milliseconds; the cap keeps a stuck connection attempt from stretching the host's shutdown budget.
+        private static readonly TimeSpan RecoveryGateStopWait = TimeSpan.FromSeconds(10);
+
         private IConnection? _connection;
         private IChannel? _channel;
         private AsyncEventingBasicConsumer? _consumer;
         private string? _consumerTag;
-        // Set when a recovery is requested while another one holds the gate; the holder re-runs once more.
-        private int _recoveryPending;
         private string _deadLetterQueueName = string.Empty;
         private string _deadLetterExchangeName = string.Empty;
         private string _deadLetterRoutingKey = string.Empty;
+        // What the dead-letter queue, its exchange, binding and replicas were declared with, kept so they can be
+        // declared again on the consumer channel when the broker returns an envelope as unroutable.
+        private DeadLetterTopology? _deadLetterTopology;
         private volatile bool _stopping;
         private volatile bool _rebuilding;
         // Set once the broker rejects the 'x-consumer-timeout' queue argument (RabbitMQ 4.x), so later (re)declares
@@ -346,10 +352,32 @@ namespace EasyRabbitFlow.Services
             {
             }
 
+            // A recovery pass may hold the gate (for instance in its backoff while the broker is down). Wait for it
+            // only as long as the host allows: if it does not leave in time, skip the orderly channel close and just
+            // dispose; the process is going away and the broker redelivers whatever stays unacknowledged.
+            var gateAcquired = false;
+
             try
             {
-                await _recoveryGate.WaitAsync().ConfigureAwait(false);
+                // A free gate is taken at once, whatever the state of the host's token: the token only bounds the
+                // wait for a recovery that is actually running.
+                gateAcquired = await _recoveryGate.WaitAsync(TimeSpan.Zero, CancellationToken.None).ConfigureAwait(false)
+                    || await _recoveryGate.WaitAsync(RecoveryGateStopWait, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
 
+            if (!gateAcquired)
+            {
+                _logger.LogWarning("[RABBIT-FLOW]: Shutdown of {Consumer} on queue '{Queue}' did not get hold of the running recovery in time; closing without the orderly channel close.", _consumerType.Name, _queueName);
+            }
+
+            try
+            {
                 try
                 {
                     // Close the channel and wait (bounded) for the broker's close-ok: it confirms the acks of the
@@ -357,7 +385,7 @@ namespace EasyRabbitFlow.Services
                     // recovery paths dispose dead channels off the critical path.
                     var channelToClose = _channel;
 
-                    if (channelToClose != null && channelToClose.IsOpen)
+                    if (gateAcquired && channelToClose != null && channelToClose.IsOpen)
                     {
                         try
                         {
@@ -374,7 +402,10 @@ namespace EasyRabbitFlow.Services
                 }
                 finally
                 {
-                    try { _recoveryGate.Release(); } catch (ObjectDisposedException) { }
+                    if (gateAcquired)
+                    {
+                        try { _recoveryGate.Release(); } catch (ObjectDisposedException) { }
+                    }
                 }
             }
             catch (ObjectDisposedException)
@@ -564,58 +595,15 @@ namespace EasyRabbitFlow.Services
 
                 _deadLetterRoutingKey = RabbitFlowTopologyNames.DeadLetterRoutingKey(_queueName);
 
-                var deadLetterArgs = new Dictionary<string, object?>();
+                _deadLetterTopology = new DeadLetterTopology(durableQueue, durableExchange, autoDeleteQueue, deadLetterQueueType, replicas);
 
-                if (deadLetterQueueType.HasValue)
-                {
-                    deadLetterArgs["x-queue-type"] = deadLetterQueueType.Value.ToArgument();
-                }
-
-                // Same declare-or-adopt as the main queue: a dead-letter queue that already exists with another
-                // type (or other arguments) must not close the consumer channel and leave the consumer in a
-                // recovery loop; it is adopted as-is with a warning.
-                await DeclareOrAdoptQueueAsync(_deadLetterQueueName, durableQueue, false, autoDeleteQueue, deadLetterArgs, ct);
-
-                await channel.ExchangeDeclareAsync(_deadLetterExchangeName, "direct", durableExchange, cancellationToken: ct);
-
-                await channel.QueueBindAsync(_deadLetterQueueName, _deadLetterExchangeName, _deadLetterRoutingKey, cancellationToken: ct);
+                await DeclareDeadLetterTopologyAsync(channel, _deadLetterTopology, ct);
 
                 args ??= new Dictionary<string, object?>();
 
                 args["x-dead-letter-exchange"] = _deadLetterExchangeName;
 
                 args["x-dead-letter-routing-key"] = _deadLetterRoutingKey;
-
-                if (replicas != null)
-                {
-                    foreach (var replica in replicas)
-                    {
-                        if (replica == null)
-                        {
-                            continue;
-                        }
-
-                        var replicaType = replica.GetType();
-
-                        var replicaQueue = (string?)replicaType.GetProperty(nameof(DeadLetterReplica.QueueName))?.GetValue(replica);
-
-                        if (string.IsNullOrWhiteSpace(replicaQueue))
-                        {
-                            _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter replica with empty QueueName for {Consumer}.", _consumerType.Name);
-                            continue;
-                        }
-
-                        var replicaDurable = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.Durable))?.GetValue(replica) ?? true;
-
-                        var replicaAutoDelete = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.AutoDelete))?.GetValue(replica) ?? false;
-
-                        var replicaArgs = replicaType.GetProperty(nameof(DeadLetterReplica.Arguments))?.GetValue(replica) as IDictionary<string, object?>;
-
-                        await channel.QueueDeclareAsync(replicaQueue!, replicaDurable, false, replicaAutoDelete, replicaArgs, cancellationToken: ct);
-
-                        await channel.QueueBindAsync(replicaQueue!, _deadLetterExchangeName, _deadLetterRoutingKey, cancellationToken: ct);
-                    }
-                }
             }
             else if (replicas != null)
             {
@@ -660,6 +648,81 @@ namespace EasyRabbitFlow.Services
 
                 await channel.QueueBindAsync(_queueName, exchangeName, routingKey, cancellationToken: ct);
             }
+        }
+
+        // Declares the dead-letter queue, its exchange, the binding between them and the replica queues. Runs as part
+        // of the topology declaration and again, on a throwaway channel, when the broker returns a dead-letter
+        // envelope as unroutable because that queue or binding is gone.
+        private async Task DeclareDeadLetterTopologyAsync(IChannel channel, DeadLetterTopology topology, CancellationToken ct)
+        {
+            var deadLetterArgs = new Dictionary<string, object?>();
+
+            if (topology.QueueType.HasValue)
+            {
+                deadLetterArgs["x-queue-type"] = topology.QueueType.Value.ToArgument();
+            }
+
+            // Same declare-or-adopt as the main queue: a dead-letter queue that already exists with another
+            // type (or other arguments) must not close the consumer channel and leave the consumer in a
+            // recovery loop; it is adopted as-is with a warning.
+            await DeclareOrAdoptQueueAsync(_deadLetterQueueName, topology.DurableQueue, false, topology.AutoDeleteQueue, deadLetterArgs, ct);
+
+            await channel.ExchangeDeclareAsync(_deadLetterExchangeName, "direct", topology.DurableExchange, cancellationToken: ct);
+
+            await channel.QueueBindAsync(_deadLetterQueueName, _deadLetterExchangeName, _deadLetterRoutingKey, cancellationToken: ct);
+
+            if (topology.Replicas != null)
+            {
+                foreach (var replica in topology.Replicas)
+                {
+                    if (replica == null)
+                    {
+                        continue;
+                    }
+
+                    var replicaType = replica.GetType();
+
+                    var replicaQueue = (string?)replicaType.GetProperty(nameof(DeadLetterReplica.QueueName))?.GetValue(replica);
+
+                    if (string.IsNullOrWhiteSpace(replicaQueue))
+                    {
+                        _logger.LogWarning("[RABBIT-FLOW]: Skipping dead-letter replica with empty QueueName for {Consumer}.", _consumerType.Name);
+                        continue;
+                    }
+
+                    var replicaDurable = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.Durable))?.GetValue(replica) ?? true;
+
+                    var replicaAutoDelete = (bool?)replicaType.GetProperty(nameof(DeadLetterReplica.AutoDelete))?.GetValue(replica) ?? false;
+
+                    var replicaArgs = replicaType.GetProperty(nameof(DeadLetterReplica.Arguments))?.GetValue(replica) as IDictionary<string, object?>;
+
+                    await channel.QueueDeclareAsync(replicaQueue!, replicaDurable, false, replicaAutoDelete, replicaArgs, cancellationToken: ct);
+
+                    await channel.QueueBindAsync(replicaQueue!, _deadLetterExchangeName, _deadLetterRoutingKey, cancellationToken: ct);
+                }
+            }
+        }
+
+        private sealed class DeadLetterTopology
+        {
+            public DeadLetterTopology(bool durableQueue, bool durableExchange, bool autoDeleteQueue, QueueType? queueType, System.Collections.IEnumerable? replicas)
+            {
+                DurableQueue = durableQueue;
+                DurableExchange = durableExchange;
+                AutoDeleteQueue = autoDeleteQueue;
+                QueueType = queueType;
+                Replicas = replicas;
+            }
+
+            public bool DurableQueue { get; }
+
+            public bool DurableExchange { get; }
+
+            public bool AutoDeleteQueue { get; }
+
+            public QueueType? QueueType { get; }
+
+            public System.Collections.IEnumerable? Replicas { get; }
         }
 
         // Declares a queue (the main queue or the dead-letter queue) on a throwaway channel so an argument mismatch
@@ -1035,6 +1098,22 @@ namespace EasyRabbitFlow.Services
             }
         }
 
+        // Publishes the dead-letter envelope persistent, so it survives a broker restart while it waits in the durable
+        // DLQ for the next reprocessor cycle (which can be up to Interval — hours — away), and mandatory, so a missing
+        // dead-letter queue or binding surfaces as a PublishException with IsReturn instead of a confirmed drop. Fresh
+        // properties per call: the client stamps its publish sequence number on them to correlate a basic.return.
+        private Task PublishEnvelopeAsync(IChannel channel, string? messageId, string? correlationId, byte[] bytes, CancellationToken ct)
+        {
+            var properties = new BasicProperties
+            {
+                DeliveryMode = DeliveryModes.Persistent,
+                MessageId = messageId,
+                CorrelationId = correlationId
+            };
+
+            return channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, mandatory: true, basicProperties: properties, body: bytes, cancellationToken: ct).AsTask();
+        }
+
         // What HandleErrorAsync is going to do with a failed delivery, for the terminal log line.
         private string FailureDisposition()
         {
@@ -1114,6 +1193,8 @@ namespace EasyRabbitFlow.Services
 
         private async Task HandleErrorAsync(IChannel channel, ulong deliveryTag, object? evt, byte[]? body, int reprocessAttempts, string? messageId, string? correlationId, IReadOnlyBasicProperties? originalProperties, Exception exception, CancellationToken ct)
         {
+            var requeueAfterReturn = false;
+
             await _channelGate.WaitAsync(ct).ConfigureAwait(false);
 
             try
@@ -1184,22 +1265,48 @@ namespace EasyRabbitFlow.Services
 
                     var published = false;
 
+                    var returned = false;
+
                     if (bytes != null)
                     {
                         try
                         {
-                            // Publish the envelope persistent so it survives a broker restart while it waits in the
-                            // durable DLQ for the next reprocessor cycle (which can be up to Interval — hours — away).
-                            var dlqProps = new BasicProperties
+                            try
                             {
-                                DeliveryMode = DeliveryModes.Persistent,
-                                MessageId = messageId,
-                                CorrelationId = correlationId
-                            };
+                                await PublishEnvelopeAsync(channel, messageId, correlationId, bytes, ct);
+                            }
+                            catch (PublishException ex) when (ex.IsReturn && _deadLetterTopology != null)
+                            {
+                                // The broker had no queue to route the envelope to: the dead-letter queue or its binding
+                                // is gone (deleted by hand, expired, auto-deleted). A confirm alone would not tell — the
+                                // broker confirms an unroutable message it dropped — which is why the envelope travels
+                                // mandatory. Rebuild the dead-letter topology on this channel and publish once more.
+                                // From here on any failure must keep the message in the queue: the broker's own
+                                // dead-letter route is the one that just proved missing.
+                                returned = true;
 
-                            await channel.BasicPublishAsync(exchange: _deadLetterExchangeName, routingKey: _deadLetterRoutingKey, mandatory: false, basicProperties: dlqProps, body: bytes, cancellationToken: ct);
+                                _logger.LogWarning(ex, "[RABBIT-FLOW]: Dead-letter envelope for {Consumer} was returned by the broker as unroutable; re-declaring the dead-letter topology of '{Queue}' and publishing it again.", _consumerType.Name, _queueName);
+
+                                // On a throwaway channel: a declare the broker refuses (406 on a re-created exchange or
+                                // replica, 404 on a binding) closes the channel it ran on, and that must not be the
+                                // consumer channel with its in-flight deliveries. Bindings are not tied to a channel.
+                                using (var declareChannel = await _connection!.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false))
+                                {
+                                    await DeclareDeadLetterTopologyAsync(declareChannel, _deadLetterTopology, ct);
+                                }
+
+                                await PublishEnvelopeAsync(channel, messageId, correlationId, bytes, ct);
+                            }
 
                             published = true;
+                        }
+                        catch (PublishException ex) when (ex.IsReturn)
+                        {
+                            _logger.LogError(ex, "[RABBIT-FLOW]: Dead-letter envelope for {Consumer} is still unroutable after re-declaring the dead-letter topology; returning the message to queue '{Queue}' for a later delivery.", _consumerType.Name, _queueName);
+                        }
+                        catch (Exception ex) when (returned)
+                        {
+                            _logger.LogError(ex, "[RABBIT-FLOW]: Re-declaring the dead-letter topology of '{Queue}' after a returned envelope failed for {Consumer}; returning the message to the queue for a later delivery.", _queueName, _consumerType.Name);
                         }
                         catch (Exception ex)
                         {
@@ -1221,6 +1328,15 @@ namespace EasyRabbitFlow.Services
                         }
 
                         RabbitFlowDiagnostics.DeadLetteredMessages.Add(1, queueTag);
+                    }
+                    else if (returned)
+                    {
+                        // Broker-native dead-lettering would meet the same missing route and drop the raw message, so
+                        // the delivery goes back to the queue instead, once this gate is released: the next delivery
+                        // runs the handler and the envelope again, once per redelivery until the topology is back. The
+                        // library never drops it; on a quorum queue the broker's own delivery-limit still bounds how
+                        // many redeliveries it allows.
+                        requeueAfterReturn = true;
                     }
                     else
                     {
@@ -1249,6 +1365,53 @@ namespace EasyRabbitFlow.Services
                 }
             }
             finally { _channelGate.Release(); }
+
+            if (requeueAfterReturn)
+            {
+                await RequeueAfterReturnedEnvelopeAsync(channel, deliveryTag, ct);
+            }
+        }
+
+        // Returns a delivery whose envelope the broker could not route to the queue, after a pause and outside the
+        // channel gate so the acks of other handlers are not held up. Without the pause a fast-failing handler and a
+        // route that stays broken would spin (handler, envelope, return, requeue) at the speed of a few broker round
+        // trips while holding the head of the queue.
+        private async Task RequeueAfterReturnedEnvelopeAsync(IChannel channel, ulong deliveryTag, CancellationToken ct)
+        {
+            try
+            {
+                await Task.Delay(_recoveryBaseDelayMs, _stopCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Shutting down: left unacknowledged, the broker redelivers it when the channel closes.
+                return;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            try
+            {
+                await _channelGate.WaitAsync(ct).ConfigureAwait(false);
+
+                try
+                {
+                    if (channel.IsOpen)
+                    {
+                        await channel.BasicNackAsync(deliveryTag, false, true, ct);
+                    }
+                }
+                finally
+                {
+                    _channelGate.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[RABBIT-FLOW]: Could not return the delivery to queue '{Queue}'; the broker redelivers it when the channel closes.", _queueName);
+            }
         }
 
         private static DeadLetterMessageProperties? CaptureMessageProperties(IReadOnlyBasicProperties? properties)
@@ -1465,14 +1628,26 @@ namespace EasyRabbitFlow.Services
                 return;
             }
 
+            // Cancelled both by StopAsync and by a host that aborts startup; taken now because StopAsync disposes
+            // the source once it is done.
+            CancellationToken stopToken;
+
             try
             {
-                if (!await _recoveryGate.WaitAsync(0))
-                {
-                    // Another recovery is running: ask it to run once more when it is done, so a cancel or a
-                    // shutdown that arrives after it already built its channel is not lost.
-                    Interlocked.Exchange(ref _recoveryPending, 1);
+                stopToken = _stopCts.Token;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
 
+            try
+            {
+                if (!_recoveryGate.TryEnter())
+                {
+                    // Another recovery is running: the gate recorded this request, so the holder runs once more
+                    // before leaving (or triggers a new pass on its way out) and a cancel or a shutdown that
+                    // arrives after it already built its channel is not lost.
                     return;
                 }
             }
@@ -1492,13 +1667,22 @@ namespace EasyRabbitFlow.Services
 
                     try
                     {
-                        Interlocked.Exchange(ref _recoveryPending, 0);
+                        _recoveryGate.BeginPass();
 
-                        await EnsureConnectionAsync(_lifetimeCt);
+                        await EnsureConnectionAsync(stopToken);
 
-                        await EnsureChannelAsync(_lifetimeCt);
+                        await EnsureChannelAsync(stopToken);
 
-                        if (Interlocked.Exchange(ref _recoveryPending, 0) == 1)
+                        if (_stopping)
+                        {
+                            // Shutdown gave up waiting for this pass and already disposed what it could; whatever
+                            // this pass built after that would otherwise outlive the consumer.
+                            DisposeChannel();
+                            DisposeConnection();
+                            return;
+                        }
+
+                        if (_recoveryGate.TakePending())
                         {
                             // Something invalidated the channel while this pass ran; both Ensure* calls are
                             // idempotent, so go round again.
@@ -1508,7 +1692,7 @@ namespace EasyRabbitFlow.Services
                         _logger.LogInformation("[RABBIT-FLOW]: Consumer {Consumer} recovered after {Attempts} attempt(s).", _consumerType.Name, attempt);
                         return;
                     }
-                    catch (OperationCanceledException) when (_lifetimeCt.IsCancellationRequested)
+                    catch (OperationCanceledException) when (stopToken.IsCancellationRequested)
                     {
                         return;
                     }
@@ -1522,13 +1706,28 @@ namespace EasyRabbitFlow.Services
                         _logger.Log(attempt < 3 ? LogLevel.Warning : LogLevel.Error, ex,
                             "[RABBIT-FLOW]: Recovery attempt {Attempt} failed for {Consumer} on queue '{Queue}'. Retrying in {DelayMs}ms.", attempt, _consumerType.Name, _queueName, delay);
 
-                        try { await Task.Delay(delay, _lifetimeCt); } catch { return; }
+                        try { await Task.Delay(delay, stopToken); } catch (OperationCanceledException) { return; }
                     }
                 }
             }
             finally
             {
-                try { _recoveryGate.Release(); } catch (ObjectDisposedException) { }
+                var pending = false;
+
+                try
+                {
+                    pending = _recoveryGate.Exit();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                if (pending && !_stopping)
+                {
+                    // A request arrived after this pass's last check and found the gate still held, so nobody
+                    // else will honour it: start the next pass from here.
+                    _ = TriggerRecoveryAsync();
+                }
             }
         }
 

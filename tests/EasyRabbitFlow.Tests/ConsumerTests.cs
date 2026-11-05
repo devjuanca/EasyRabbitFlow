@@ -881,6 +881,89 @@ public class ConsumerTests
         await hostedService.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Consumer_DeadLetterQueueDeletedAtRuntime_RecreatesItAndParksTheEnvelope()
+    {
+        // The dead-letter envelope is published on a confirm channel, but a publisher confirm also acknowledges a
+        // message the broker dropped for having no route. If the dead-letter queue (and with it the binding) is gone,
+        // the consumer must not ack the original on the strength of that confirm: it re-declares the dead-letter
+        // topology and publishes the envelope again, so the failed message ends up parked and the main queue empty.
+        AlwaysFailConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-dlq-gone-{Guid.NewGuid():N}";
+        var deadLetterQueueName = EasyRabbitFlow.Settings.RabbitFlowTopologyNames.DeadLetterQueue(queueName);
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<AlwaysFailConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        // Act - remove the dead-letter queue from another connection; the broker drops its binding with it, so the
+        // dead-letter exchange has nowhere to route the envelope.
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeleteAsync(deadLetterQueueName);
+        }
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        var result = await publisher.PublishAsync(new TestEvent { Id = "boom", Message = "fails" }, queueName, messageId: "msg-dlq-gone");
+        Assert.True(result.Success);
+
+        // Assert - the envelope lands in a recreated dead-letter queue and the main queue is left empty.
+        uint parked = 0;
+        string probeOutcome = "not probed";
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (parked < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(250);
+
+            try
+            {
+                using var probeConn = await _fixture.CreateDirectConnectionAsync();
+                using var probeCh = await probeConn.CreateChannelAsync();
+                var ok = await probeCh.QueueDeclarePassiveAsync(deadLetterQueueName);
+                parked = ok.MessageCount;
+                probeOutcome = $"exists, messages={parked}";
+            }
+            catch (RabbitMQ.Client.Exceptions.OperationInterruptedException ex)
+            {
+                probeOutcome = $"passive declare failed: {ex.ShutdownReason?.ReplyCode} {ex.ShutdownReason?.ReplyText}";
+            }
+        }
+
+        Assert.True(parked == 1,
+            $"The envelope did not reach a recreated dead-letter queue. DLQ: {probeOutcome}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        Assert.Contains(EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Lines, l => l.Contains("was returned by the broker as unroutable"));
+
+        using (var probeConn = await _fixture.CreateDirectConnectionAsync())
+        using (var probeCh = await probeConn.CreateChannelAsync())
+        {
+            var main = await probeCh.QueueDeclarePassiveAsync(queueName);
+            Assert.Equal(0u, main.MessageCount);
+        }
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
     [SkippableFact]
     public async Task Consumer_WithAutoGenerate_OnQuorumByDefaultBroker_GetsQuorumQueues()
     {
