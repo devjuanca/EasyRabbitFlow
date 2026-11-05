@@ -29,6 +29,7 @@ public static class NotificationsModule
             {
                 opt.ExchangeName = ExchangeName;
                 opt.ExchangeType = ExchangeType.Fanout;
+                opt.QueueType = QueueType.Classic;   // stated explicitly: never depends on the broker's default_queue_type
             });
 
             // Retries happen through the dead-letter reprocessor (see PaymentsModule), not in-process:
