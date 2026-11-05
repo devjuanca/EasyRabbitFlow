@@ -137,6 +137,7 @@ namespace EasyRabbitFlow.Services
 
         private IConnection? _connection;
         private IChannel? _channel;
+        private AsyncEventingBasicConsumer? _consumer;
         private string _deadLetterQueueName = string.Empty;
         private string _deadLetterExchangeName = string.Empty;
         private string _deadLetterRoutingKey = string.Empty;
@@ -416,6 +417,13 @@ namespace EasyRabbitFlow.Services
 
                             _ = ProcessMessageAsync(ea);
                         };
+
+                        // Broker-initiated basic.cancel arrives here, with the channel still open (see
+                        // OnConsumerUnregisteredAsync). This instance never cancels its own consumer, so the event
+                        // is only ever raised by the broker.
+                        consumer.UnregisteredAsync += OnConsumerUnregisteredAsync;
+
+                        _consumer = consumer;
 
                         await _channel.BasicConsumeAsync(queue: _queueName, autoAck: false, consumer: consumer, cancellationToken: ct);
 
@@ -1147,6 +1155,37 @@ namespace EasyRabbitFlow.Services
             return Task.CompletedTask;
         }
 
+        // The broker cancels a consumer (basic.cancel) without closing its channel when the queue is deleted, when
+        // the node hosting the queue goes away, or — on RabbitMQ 4.3+ quorum queues — when a delivery exceeds the
+        // consumer acknowledgement timeout. The channel and connection stay open, so neither shutdown handler fires
+        // and the client has already removed the consumer from the channel: left alone, the queue keeps a live
+        // channel that consumes nothing until the process restarts. Recovery must rebuild the channel, because
+        // EnsureChannelAsync short-circuits on an open one. The channel is disposed off this callback: closing it
+        // waits for the consumer dispatcher to drain, and this handler runs on that dispatcher.
+        private Task OnConsumerUnregisteredAsync(object sender, ConsumerEventArgs args)
+        {
+            if (_stopping || _rebuilding || !_recoveryEnabled)
+            {
+                return Task.CompletedTask;
+            }
+
+            _logger.LogWarning(
+                "[RABBIT-FLOW]: Broker cancelled the consumer for {Consumer} on queue '{Queue}' (consumer tag(s): {Tags}) without closing the channel — " +
+                "the queue was deleted, its node went away, or a delivery exceeded the broker's consumer timeout. Rebuilding the channel and re-subscribing.",
+                _consumerType.Name, _queueName, string.Join(",", args.ConsumerTags ?? Array.Empty<string>()));
+
+            RabbitFlowDiagnostics.ConsumerCancellations.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+
+            _ = Task.Run(() =>
+            {
+                DisposeChannel();
+
+                return TriggerRecoveryAsync();
+            });
+
+            return Task.CompletedTask;
+        }
+
         private Task OnConnectionShutdownAsync(object sender, ShutdownEventArgs args)
         {
             _logger.LogWarning("[RABBIT-FLOW]: Connection shutdown for {Consumer}. ReplyCode: {Code}, ReplyText: {Text}", _consumerType.Name, args.ReplyCode, args.ReplyText);
@@ -1233,6 +1272,15 @@ namespace EasyRabbitFlow.Services
             var ch = _channel;
 
             _channel = null;
+
+            var consumer = _consumer;
+
+            _consumer = null;
+
+            if (consumer != null)
+            {
+                try { consumer.UnregisteredAsync -= OnConsumerUnregisteredAsync; } catch { }
+            }
 
             if (ch == null)
             {

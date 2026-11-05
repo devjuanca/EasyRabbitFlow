@@ -776,4 +776,97 @@ public class ConsumerTests
 
         await hostedService.StopAsync(CancellationToken.None);
     }
+
+    [Fact]
+    public async Task Consumer_ResubscribesAfterBrokerCancelsConsumer()
+    {
+        // The broker cancels a consumer (basic.cancel) without closing its channel when the queue is deleted,
+        // when the node hosting the queue goes away, or — on RabbitMQ 4.3+ quorum queues — when a delivery
+        // exceeds the consumer acknowledgement timeout. The channel and connection stay open, so neither
+        // ChannelShutdownAsync nor ConnectionShutdownAsync fires: a consumer that only listens to those is left
+        // attached to a live channel that delivers nothing, until the process restarts. Deleting the queue is the
+        // deterministic way to trigger that notification on every broker version.
+        TestConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-cancel-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = true;
+                    ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.DurableExchange = false;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+
+        // Sanity: a message flows before the cancel.
+        await publisher.PublishAsync(new TestEvent { Id = "before", Message = "before-cancel" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+        Assert.Single(TestConsumer.ReceivedMessages);
+
+        // Act - delete the queue from another connection. The broker sends basic.cancel to our consumer; its
+        // channel and connection remain open.
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeleteAsync(queueName);
+        }
+
+        // Give the library time to notice the cancel and re-declare + re-consume.
+        await Task.Delay(3000);
+
+        // Assert - the queue exists again with exactly one consumer and a message published after the cancel
+        // is consumed. Without cancel handling the queue is simply gone (404 on the passive declare) or, if
+        // something else recreated it, it has no consumer.
+        uint consumers = 0;
+        string probeOutcome;
+        try
+        {
+            using var probeConn = await _fixture.CreateDirectConnectionAsync();
+            using var probeCh = await probeConn.CreateChannelAsync();
+            var ok = await probeCh.QueueDeclarePassiveAsync(queueName);
+            consumers = ok.ConsumerCount;
+            probeOutcome = $"exists, consumers={consumers}";
+        }
+        catch (RabbitMQ.Client.Exceptions.OperationInterruptedException ex)
+        {
+            probeOutcome = $"passive declare failed: {ex.ShutdownReason?.ReplyCode} {ex.ShutdownReason?.ReplyText}";
+        }
+
+        var afterResult = await publisher.PublishAsync(new TestEvent { Id = "after", Message = "after-cancel" }, queueName);
+
+        deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (TestConsumer.ReceivedMessages.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.True(
+            consumers == 1 && TestConsumer.ReceivedMessages.Any(m => m.Id == "after"),
+            $"Consumer did not re-subscribe after basic.cancel. Queue: {probeOutcome}. Received={TestConsumer.ReceivedMessages.Count}, afterPublishSuccess={afterResult.Success}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
 }

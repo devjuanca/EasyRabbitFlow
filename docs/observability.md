@@ -41,6 +41,7 @@ Notes:
 | `easyrabbitflow.messages.reprocessed` | Counter | `queue` | Messages re-enqueued from the DLQ by the reprocessor |
 | `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Messages moved to the parking queue (`exhausted` / `permanent` / `malformed`) |
 | `easyrabbitflow.messages.discarded` | Counter | `queue`, `reason` | Messages dropped by the reprocessor instead of parked when `FinalAction = Discard` (`exhausted` / `permanent`) |
+| `easyrabbitflow.consumer.cancellations` | Counter | `queue` | Broker-initiated consumer cancellations (`basic.cancel` with the channel still open: queue deleted, node gone, or a quorum-queue consumer timeout on RabbitMQ 4.3+) that triggered a re-subscribe |
 | `easyrabbitflow.consumer.message.duration` | Histogram (s) | `queue`, `outcome` | End-to-end processing time per delivery, including in-process retries |
 
 A handler abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) shows up as
