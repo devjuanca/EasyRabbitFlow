@@ -18,6 +18,7 @@ namespace EasyRabbitFlow.Settings
             ulong deliveryTag,
             bool redelivered,
             int reprocessAttempts,
+            int? deliveryCount,
             MessageDeliveryMode? deliveryMode,
             string? type,
             string? appId,
@@ -35,6 +36,7 @@ namespace EasyRabbitFlow.Settings
             DeliveryTag = deliveryTag;
             Redelivered = redelivered;
             ReprocessAttempts = reprocessAttempts;
+            DeliveryCount = deliveryCount;
             DeliveryMode = deliveryMode;
             Type = type;
             AppId = appId;
@@ -92,6 +94,16 @@ namespace EasyRabbitFlow.Settings
         /// Sourced from the <c>x-reprocess-attempts</c> AMQP header.
         /// </summary>
         public int ReprocessAttempts { get; }
+
+        /// <summary>
+        /// Number of times the <b>broker</b> returned this delivery to the queue before handing it over again
+        /// (consumer timeout, cancelled consumer, closed channel), from the <c>x-delivery-count</c> header that
+        /// <b>quorum</b> queues set on redeliveries. <c>null</c> on the first delivery and always on classic
+        /// queues, which only expose <see cref="Redelivered"/>. Unrelated to <see cref="ReprocessAttempts"/>, which
+        /// counts re-enqueues by the dead-letter reprocessor. Use it to make side effects idempotent on retries;
+        /// the consumer itself stops invoking the handler once it reaches <c>ConsumerSettings.MaxBrokerDeliveries</c>.
+        /// </summary>
+        public int? DeliveryCount { get; }
 
         /// <summary>
         /// AMQP <c>delivery-mode</c>. <c>null</c> when the publisher did not set it explicitly

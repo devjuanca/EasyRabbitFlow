@@ -401,7 +401,12 @@ namespace EasyRabbitFlow.Services
             var producerFinished = 0;
             var sourceCompleted = false;
 
-            await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, cancellationToken: effectiveCt);
+            // Declared classic explicitly: a temporary queue is exclusive and non-durable, which only a classic queue
+            // can be. Brokers with default_queue_type = quorum already fall back to classic for such declarations,
+            // but stating it keeps the type under the library's control instead of the broker's default.
+            var temporaryQueueArgs = new Dictionary<string, object?> { ["x-queue-type"] = QueueType.Classic.ToArgument() };
+
+            await channel.QueueDeclareAsync(_queue, durable: false, exclusive: true, autoDelete: true, arguments: temporaryQueueArgs, cancellationToken: effectiveCt);
 
             await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: prefetchCount, global: false, cancellationToken: effectiveCt);
 
@@ -452,7 +457,7 @@ namespace EasyRabbitFlow.Services
                 if (!tcs.Task.IsCompleted && Interlocked.Exchange(ref connectionLost, 1) == 0)
                 {
                     shutdownReason = ea.ReplyText;
-                    _logger.LogError("[RabbitFlowTemporary] Connection or channel shut down while the run was in progress: {reason}. CorrelationId: {correlationId}", ea.ReplyText, correlationId);
+                    _logger.LogError("[RABBIT-FLOW]: Connection or channel shut down while the run was in progress: {reason}. CorrelationId: {correlationId}", ea.ReplyText, correlationId);
                     stopCts.Cancel();
                     TryComplete();
                 }
@@ -503,7 +508,7 @@ namespace EasyRabbitFlow.Services
                 catch (Exception ex)
                 {
                     // Best-effort: the queue is exclusive and auto-delete, so a missed ack cannot leave a stuck message behind.
-                    _logger.LogDebug(ex, "[RabbitFlowTemporary] Could not acknowledge message. DeliveryTag: {deliveryTag}, CorrelationId: {correlationId}", deliveryTag, correlationId);
+                    _logger.LogDebug(ex, "[RABBIT-FLOW]: Could not acknowledge message. DeliveryTag: {deliveryTag}, CorrelationId: {correlationId}", deliveryTag, correlationId);
                 }
             }
 
@@ -529,7 +534,7 @@ namespace EasyRabbitFlow.Services
                     catch (Exception ex)
                     {
                         runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Deserialize, ex, _queue, ea.DeliveryTag));
-                        _logger.LogError(ex, "[RabbitFlowTemporary] Error deserializing message. CorrelationId: {correlationId}", correlationId);
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Error deserializing message. CorrelationId: {correlationId}", correlationId);
                         await SafeAckAsync(ea.DeliveryTag).ConfigureAwait(false);
                         CompleteProcessed(false);
                         return;
@@ -538,7 +543,7 @@ namespace EasyRabbitFlow.Services
                     if (message is null)
                     {
                         runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Deserialize, "Deserialization returned null.", _queue, ea.DeliveryTag));
-                        _logger.LogWarning("[RabbitFlowTemporary] Message is null. CorrelationId: {correlationId}", correlationId);
+                        _logger.LogWarning("[RABBIT-FLOW]: Message is null. CorrelationId: {correlationId}", correlationId);
                         await SafeAckAsync(ea.DeliveryTag).ConfigureAwait(false);
                         CompleteProcessed(false);
                         return;
@@ -570,35 +575,37 @@ namespace EasyRabbitFlow.Services
                             catch (TaskCanceledException) when (timeoutCts != null && timeoutCts.Token.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Timeout, $"Message processing timed out after {timeout}.", _queue, ea.DeliveryTag));
-                                _logger.LogError("[RabbitFlowTemporary] Message processing timed out after {Timeout}. CorrelationId: {correlationId}", timeout, correlationId);
+                                // Per-message outcomes of a run are Warnings: the run's result reports them; an Error is
+                                // reserved for a handler that throws.
+                                _logger.LogWarning("[RABBIT-FLOW]: Message processing timed out after {Timeout}. CorrelationId: {correlationId}", timeout, correlationId);
                                 await InvokeOnErrorAsync(onError, message, cancellationToken, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
                             catch (OperationCanceledException) when (runTimeoutCts != null && runTimeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Timeout, $"Message processing was canceled because the run timed out after {options.RunTimeout}.", _queue, ea.DeliveryTag));
-                                _logger.LogError("[RabbitFlowTemporary] Message processing was canceled because the run timed out after {RunTimeout}. CorrelationId: {correlationId}", options.RunTimeout, correlationId);
+                                _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled because the run timed out after {RunTimeout}. CorrelationId: {correlationId}", options.RunTimeout, correlationId);
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
                             catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Cancellation, "Message processing was canceled by main Cancellation Token.", _queue, ea.DeliveryTag));
-                                _logger.LogError("[RabbitFlowTemporary] Message processing was canceled by main Cancellation Token. CorrelationId: {correlationId}", correlationId);
+                                _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled by main Cancellation Token. CorrelationId: {correlationId}", correlationId);
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
                             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Cancellation, "Message processing was canceled.", _queue, ea.DeliveryTag));
-                                _logger.LogError("[RabbitFlowTemporary] Message processing was canceled. CorrelationId: {correlationId}", correlationId);
+                                _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled. CorrelationId: {correlationId}", correlationId);
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
                             catch (Exception ex)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Process, ex, _queue, ea.DeliveryTag));
-                                _logger.LogError(ex, "[RabbitFlowTemporary] Error while processing the message. CorrelationId: {correlationId}", correlationId);
+                                _logger.LogError(ex, "[RABBIT-FLOW]: Error while processing the message. CorrelationId: {correlationId}", correlationId);
                                 await InvokeOnErrorAsync(onError, message, cancellationToken, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
@@ -606,7 +613,7 @@ namespace EasyRabbitFlow.Services
                         catch (Exception ex)
                         {
                             runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Process, ex, _queue, ea.DeliveryTag));
-                            _logger.LogError(ex, "[RabbitFlowTemporary] Unhandled exception in processing task. CorrelationId: {correlationId}", correlationId);
+                            _logger.LogError(ex, "[RABBIT-FLOW]: Unhandled exception in processing task. CorrelationId: {correlationId}", correlationId);
                             CompleteProcessed(false);
                         }
                         finally
@@ -629,7 +636,7 @@ namespace EasyRabbitFlow.Services
                 catch (Exception ex)
                 {
                     runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Process, ex, _queue, ea.DeliveryTag));
-                    _logger.LogError(ex, "[RabbitFlowTemporary] Error while preparing message processing. CorrelationId: {correlationId}", correlationId);
+                    _logger.LogError(ex, "[RABBIT-FLOW]: Error while preparing message processing. CorrelationId: {correlationId}", correlationId);
                     CompleteProcessed(false);
                 }
                 finally
@@ -690,7 +697,7 @@ namespace EasyRabbitFlow.Services
                         // Never published, so no handler will ever release this element's permit: do it here.
                         inFlight?.Release();
                         runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Publish, ex, _queue, messageIndex: index));
-                        _logger.LogError(ex, "[RabbitFlowTemporary] Error publishing message at index {index}. CorrelationId: {correlationId}", index, correlationId);
+                        _logger.LogError(ex, "[RABBIT-FLOW]: Error publishing message at index {index}. CorrelationId: {correlationId}", index, correlationId);
                         await InvokeOnErrorAsync(onError, msg, cancellationToken, _logger, correlationId);
                     }
                     index++;
@@ -730,11 +737,11 @@ namespace EasyRabbitFlow.Services
             }
             catch (TaskCanceledException)
             {
-                _logger.LogError("[RabbitFlowTemporary] Run was canceled before completion (caller cancellation or run timeout). CorrelationId: {correlationId}", correlationId);
+                _logger.LogError("[RABBIT-FLOW]: Run was canceled before completion (caller cancellation or run timeout). CorrelationId: {correlationId}", correlationId);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[RabbitFlowTemporary] Error while waiting for messages to be processed. CorrelationId: {correlationId}", correlationId);
+                _logger.LogError(ex, "[RABBIT-FLOW]: Error while waiting for messages to be processed. CorrelationId: {correlationId}", correlationId);
             }
             finally
             {
@@ -771,7 +778,7 @@ namespace EasyRabbitFlow.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[RabbitFlowTemporary] Error canceling consumer. CorrelationId: {correlationId}", correlationId);
+                    _logger.LogError(ex, "[RABBIT-FLOW]: Error canceling consumer. CorrelationId: {correlationId}", correlationId);
                 }
 
                 // Messages that never reached a terminal state (lost connection, run timeout, cancellation)
@@ -807,7 +814,7 @@ namespace EasyRabbitFlow.Services
                 // Always run the completion callback
                 try
                 {
-                    _logger.LogDebug("[RabbitFlowTemporary] Executing completion callback. Processed: {processed}, Failed: {failed}, Results: {results}, CorrelationId: {correlationId}",
+                    _logger.LogDebug("[RABBIT-FLOW]: Executing completion callback. Processed: {processed}, Failed: {failed}, Results: {results}, CorrelationId: {correlationId}",
                         processed, failed, resultsQueue.Count, correlationId);
 
                     await onCompletedAsync(finalResult, cancellationToken).ConfigureAwait(false);
@@ -815,7 +822,7 @@ namespace EasyRabbitFlow.Services
                 catch (Exception ex)
                 {
                     runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Completion, ex, _queue));
-                    _logger.LogError(ex, "[RabbitFlowTemporary] Error in completion callback. CorrelationId: {correlationId}", correlationId);
+                    _logger.LogError(ex, "[RABBIT-FLOW]: Error in completion callback. CorrelationId: {correlationId}", correlationId);
 
                     // The callback couldn't see its own failure, but the returned result should: re-snapshot with the completion error.
                     finalResult = new TemporaryRunResult<TResult>(
@@ -861,7 +868,7 @@ namespace EasyRabbitFlow.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[RabbitFlowTemporary] Error in progress callback. CorrelationId: {correlationId}", correlationId);
+                    _logger.LogWarning(ex, "[RABBIT-FLOW]: Error in progress callback. CorrelationId: {correlationId}", correlationId);
                 }
             }
         }
@@ -935,9 +942,9 @@ namespace EasyRabbitFlow.Services
         private async Task DisposeSourceAfterMoveAsync<T>(IAsyncEnumerator<T> enumerator, Task pendingMove)
         {
             try { await pendingMove.ConfigureAwait(false); }
-            catch (Exception ex) { _logger.LogDebug(ex, "[RabbitFlowTemporary] Abandoned source operation ended."); }
+            catch (Exception ex) { _logger.LogDebug(ex, "[RABBIT-FLOW]: Abandoned source operation ended."); }
             try { await enumerator.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception ex) { _logger.LogWarning(ex, "[RabbitFlowTemporary] Deferred source disposal failed."); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[RABBIT-FLOW]: Deferred source disposal failed."); }
         }
 
         private static async Task InvokeOnErrorAsync<T>(Func<T, CancellationToken, Task>? onError, T message, CancellationToken cancellationToken, ILogger logger, string? correlationId)
@@ -953,7 +960,7 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "[RabbitFlowTemporary] Error in onError callback. CorrelationId: {correlationId}", correlationId);
+                logger.LogError(ex, "[RABBIT-FLOW]: Error in onError callback. CorrelationId: {correlationId}", correlationId);
             }
         }
 

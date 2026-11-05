@@ -59,6 +59,33 @@ namespace EasyRabbitFlow.Settings
         public IDictionary<string, object?>? Args { get; set; } = null;
 
         /// <summary>
+        /// Type of the auto-generated main queue, sent as the <c>x-queue-type</c> argument on declare.
+        /// <para>
+        /// Default is <c>null</c>: the argument is not sent and the <b>broker</b> decides the type from its
+        /// <c>default_queue_type</c> (classic unless the cluster or vhost says otherwise). Set it explicitly on
+        /// business queues so the type is part of the application's contract: a broker whose default changes to
+        /// quorum can no longer silently change the queue type under the consumer, and a mismatch with an existing
+        /// queue surfaces as the usual "already exists with different arguments" warning instead of going unnoticed.
+        /// </para>
+        /// <para>
+        /// <see cref="QueueType.Quorum"/> requires <see cref="DurableQueue"/> = <c>true</c> and
+        /// <see cref="ExclusiveQueue"/> = <c>false</c> (quorum queues are replicated and always durable); the
+        /// consumer fails fast at registration otherwise. An existing queue is never converted: RabbitMQ fixes the
+        /// type at creation, so a queue created with another type is adopted as-is with a warning. If
+        /// <see cref="Args"/> also carries <c>x-queue-type</c>, both must agree.
+        /// </para>
+        /// </summary>
+        public QueueType? QueueType { get; set; } = null;
+
+        /// <summary>
+        /// Type of the auto-generated dead-letter queue and of the reprocessor's parking queue, sent as
+        /// <c>x-queue-type</c> when they are created. Default is <c>null</c>: same as <see cref="QueueType"/>
+        /// (and, when that is <c>null</c> too, the broker's default). Lets a classic main queue keep a quorum DLQ,
+        /// or the reverse.
+        /// </summary>
+        public QueueType? DeadLetterQueueType { get; set; } = null;
+
+        /// <summary>
         /// When set, declares the auto-generated queue as a priority queue with the given maximum priority,
         /// emitting the <c>x-max-priority</c> queue argument. Required for the broker to honor the
         /// <c>Priority</c> field set via <see cref="PublishOptions.Priority"/> — messages published with a
@@ -123,6 +150,53 @@ namespace EasyRabbitFlow.Settings
         /// Optional queue arguments (e.g. <c>x-message-ttl</c>, <c>x-max-length</c>). Default is null.
         /// </summary>
         public IDictionary<string, object?>? Arguments { get; set; } = null;
+    }
+
+    /// <summary>
+    /// RabbitMQ queue type, declared through the <c>x-queue-type</c> queue argument.
+    /// </summary>
+    public enum QueueType
+    {
+        /// <summary>
+        /// Classic queue: single-node, supports exclusive and non-durable queues, priorities and TTLs.
+        /// RabbitMQ 4.x rejects the per-queue <c>x-consumer-timeout</c> argument on classic queues (the library
+        /// re-declares without it); from 4.3 the broker does not enforce consumer timeouts on classic queues at all.
+        /// </summary>
+        Classic,
+
+        /// <summary>
+        /// Quorum queue: replicated (Raft) and always durable; cannot be exclusive. Every message is written to
+        /// disk regardless of its delivery mode. On RabbitMQ 4.x it enforces a delivery limit (20 by default, then
+        /// dead-letter or drop) and, from 4.3, the consumer acknowledgement timeout — which cancels the consumer
+        /// without closing the channel; the library re-subscribes automatically.
+        /// </summary>
+        Quorum
+    }
+
+    internal static class QueueTypeExtensions
+    {
+        // The literal values RabbitMQ expects in x-queue-type.
+        internal static string ToArgument(this QueueType type)
+            => type == QueueType.Quorum ? "quorum" : "classic";
+
+        // The reverse mapping for a raw Args["x-queue-type"] value; null for anything the library does not model
+        // (absent, "stream", unknown).
+        internal static QueueType? FromArgument(object? raw)
+        {
+            var text = raw?.ToString();
+
+            if (string.Equals(text, "quorum", System.StringComparison.OrdinalIgnoreCase))
+            {
+                return QueueType.Quorum;
+            }
+
+            if (string.Equals(text, "classic", System.StringComparison.OrdinalIgnoreCase))
+            {
+                return QueueType.Classic;
+            }
+
+            return null;
+        }
     }
 
     /// <summary>

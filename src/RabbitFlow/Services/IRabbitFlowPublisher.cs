@@ -272,7 +272,7 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                RabbitFlowDiagnostics.RecordFailure(activity, ex);
 
                 RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
 
@@ -448,7 +448,7 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                RabbitFlowDiagnostics.RecordFailure(activity, ex);
 
                 RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
 
