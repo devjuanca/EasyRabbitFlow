@@ -902,9 +902,11 @@ namespace EasyRabbitFlow.Services
                     RabbitFlowDiagnostics.ConsumeDuration.Record(elapsedSeconds, queueTag, outcomeTag);
                 }
 
-                // A delivery the broker keeps taking back (quorum queues count it in x-delivery-count) returns to the
-                // head of the queue each time and blocks it; give up on it before the broker's delivery-limit drops it
-                // raw. Dead-lettered with the envelope as a permanent failure, so the reprocessor parks it.
+                // A delivery the broker keeps taking back returns to the head of the queue each time and blocks it;
+                // give up on it before the broker's delivery-limit drops it raw. Quorum queues count the returns in
+                // x-delivery-count: all of them on RabbitMQ 4.0-4.2, only failed deliveries (crash, dropped
+                // connection) from 4.3, where consumer timeouts and requeues no longer count.
+                // Dead-lettered with the envelope as a permanent failure, so the reprocessor parks it.
                 if (ConsumerPoisonGuard.ShouldGiveUp(_maxBrokerDeliveries, deliveryCount, args.Redelivered, _autoAckOnError, !string.IsNullOrEmpty(_deadLetterQueueName)))
                 {
                     _logger.LogWarning(

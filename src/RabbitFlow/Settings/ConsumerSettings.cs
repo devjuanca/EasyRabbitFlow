@@ -145,33 +145,45 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Gets or sets the timeout duration for processing a single message.
-        /// Default is 30 seconds.
+        /// Gets or sets how long a single handler attempt may run before its <c>CancellationToken</c> is cancelled;
+        /// each in-process retry gets its own <see cref="Timeout"/>. Default is 30 seconds. A value <c>&lt;= 0</c>
+        /// (e.g. <c>Timeout.InfiniteTimeSpan</c>) disables both the handler timeout and the stuck-handler watchdog.
         /// </summary>
         /// <remarks>
         /// When <see cref="AutoGenerate"/> is <c>true</c>, this value (together with the retry policy) drives the
-        /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't kill the consumer while it retries in
-        /// process. That argument only takes effect when the queue is first created: RabbitMQ silently ignores a
-        /// changed <c>x-consumer-timeout</c> when an existing queue is redeclared (no error, no warning), so changing
-        /// <see cref="Timeout"/>, <c>MaxRetryCount</c>, or <c>RetryInterval</c> on a queue that already exists does
-        /// not update it — delete and recreate the queue (or apply a <c>consumer-timeout</c> policy) to change it.
+        /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't take the delivery back while it is
+        /// retried in process. An <c>x-consumer-timeout</c> in <c>AutoGenerateSettings.Args</c> replaces the derived
+        /// value, so keep it at or above it; with <see cref="AutoGenerate"/> <c>false</c> nothing is declared and the
+        /// queue needs the argument (or a <c>consumer-timeout</c> policy) set by whoever declares it.
+        /// The argument only takes effect when the queue is first created: changing <see cref="Timeout"/>,
+        /// <c>MaxRetryCount</c>, or <c>RetryInterval</c> on a queue that already exists does not update it (classic
+        /// queues on 3.x ignore the new value; quorum queues on 4.x reject it and the consumer adopts the existing
+        /// queue with a warning) — delete and recreate the queue (or apply a <c>consumer-timeout</c> policy) to change it.
         /// The per-queue <c>x-consumer-timeout</c> override requires RabbitMQ 3.12+; on older brokers raise
         /// <c>consumer_timeout</c> at the broker level instead.
         /// </remarks>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 
         /// <summary>
-        /// Maximum number of times the <b>broker</b> may return the same delivery to the queue before the consumer
-        /// gives up on it: when a message arrives with <c>x-delivery-count</c> at or above this value, the handler is
-        /// not invoked and the message is dead-lettered as a permanent failure (<c>RabbitFlowPoisonMessageException</c>;
-        /// the reprocessor parks it). Default is 5.
+        /// Maximum number of times the <b>broker</b> may count a returned delivery of the same message before the
+        /// consumer gives up on it: when a message arrives with <c>x-delivery-count</c> at or above this value, the
+        /// handler is not invoked and the message is dead-lettered as a permanent failure
+        /// (<c>RabbitFlowPoisonMessageException</c>; the reprocessor parks it). Default is 5.
         /// </summary>
         /// <remarks>
-        /// A delivery the broker takes back (consumer acknowledgement timeout, cancelled consumer, closed channel) goes
-        /// back to the <i>head</i> of its queue and is delivered again first, so a message that always outlives the
-        /// broker timeout blocks the queue until the broker's own <c>delivery-limit</c> (20 on RabbitMQ 4.x quorum
-        /// queues) drops it — raw, without the library's envelope. Giving up earlier keeps the queue flowing and lands
-        /// the message in the dead-letter queue with its envelope. Only <b>quorum</b> queues carry the header; on
+        /// What the broker counts depends on its version. On RabbitMQ 4.0–4.2 every return counts: consumer
+        /// acknowledgement timeout, closed channel or connection, requeue. From 4.3 only failed deliveries count — the
+        /// consumer's channel or connection ends with the delivery unacknowledged (a crash, a dropped connection) —
+        /// while consumer timeouts, cluster partitions and requeues (<c>basic.nack</c>) no longer do: they only raise
+        /// <c>x-acquired-count</c>, which this setting does not read. So on 4.3+ the guard stops crash loops, not a
+        /// message that keeps exceeding the broker's consumer timeout; that case is bounded by <see cref="Timeout"/>,
+        /// whose watchdog dead-letters a stuck handler before the derived broker timeout fires (not when
+        /// <see cref="Timeout"/> is <c>&lt;= 0</c>).
+        /// A delivery the broker takes back goes to the <i>head</i> of its queue and is delivered again first, so a
+        /// message that keeps failing blocks the queue until the broker's own <c>delivery-limit</c> (20 on RabbitMQ 4.x
+        /// quorum queues, computed from the same count) drops it — raw, without the library's envelope. Giving up
+        /// earlier keeps the queue flowing and lands the message in the dead-letter queue with its envelope. Only
+        /// <b>quorum</b> queues carry the header; on
         /// classic queues there is no count, this setting has no effect, and the handler only sees
         /// <c>RabbitFlowMessageContext.Redelivered</c>. The library's own in-process retries never requeue, so they
         /// do not increase the count. <c>null</c> disables the check.

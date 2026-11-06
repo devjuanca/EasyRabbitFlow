@@ -96,9 +96,11 @@ namespace EasyRabbitFlow.Settings
         public int ReprocessAttempts { get; }
 
         /// <summary>
-        /// Number of times the <b>broker</b> returned this delivery to the queue before handing it over again
-        /// (consumer timeout, cancelled consumer, closed channel), from the <c>x-delivery-count</c> header that
-        /// <b>quorum</b> queues set on redeliveries. <c>null</c> on the first delivery and always on classic
+        /// Number of returns of this delivery the <b>broker</b> counted before handing it over again, from the
+        /// <c>x-delivery-count</c> header that <b>quorum</b> queues set on redeliveries. On RabbitMQ 4.0–4.2 every
+        /// return counts (consumer timeout, closed channel or connection, requeue); from 4.3 only failed deliveries
+        /// do (a crash, a dropped connection), so a redelivery after a consumer timeout or a requeue arrives with
+        /// <see cref="Redelivered"/> set and the count unchanged. <c>null</c> on the first delivery and always on classic
         /// queues, which only expose <see cref="Redelivered"/>. Unrelated to <see cref="ReprocessAttempts"/>, which
         /// counts re-enqueues by the dead-letter reprocessor. Use it to make side effects idempotent on retries;
         /// the consumer itself stops invoking the handler once it reaches <c>ConsumerSettings.MaxBrokerDeliveries</c>.
