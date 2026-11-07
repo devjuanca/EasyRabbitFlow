@@ -263,6 +263,129 @@ public class PublisherTests
         Assert.IsType<ObjectDisposedException>(afterDispose.Error);
     }
 
+    [Theory]
+    [InlineData("single", false, 0)]
+    [InlineData("single", false, 1)]
+    [InlineData("single", false, 2)]
+    [InlineData("single", false, 3)]
+    [InlineData("single", true, 0)]
+    [InlineData("single", true, 1)]
+    [InlineData("single", true, 2)]
+    [InlineData("single", true, 3)]
+    [InlineData("confirm", false, 0)]
+    [InlineData("confirm", false, 1)]
+    [InlineData("confirm", false, 2)]
+    [InlineData("confirm", false, 3)]
+    [InlineData("confirm", true, 0)]
+    [InlineData("confirm", true, 1)]
+    [InlineData("confirm", true, 2)]
+    [InlineData("confirm", true, 3)]
+    [InlineData("transactional", false, 0)]
+    [InlineData("transactional", false, 1)]
+    [InlineData("transactional", false, 2)]
+    [InlineData("transactional", false, 3)]
+    [InlineData("transactional", true, 0)]
+    [InlineData("transactional", true, 1)]
+    [InlineData("transactional", true, 2)]
+    [InlineData("transactional", true, 3)]
+    public async Task Mandatory_ControlsUnroutableResult_AndAllowsLaterDelivery(string mode, bool toExchange, int optionKind)
+    {
+        var name = $"test-mandatory-{Guid.NewGuid():N}";
+        var queue = $"{name}-queue";
+        var options = optionKind switch
+        {
+            0 => null,
+            1 => new EasyRabbitFlow.Settings.PublishOptions(),
+            _ => new EasyRabbitFlow.Settings.PublishOptions { Mandatory = optionKind == 3 }
+        };
+        await using var sp = (ServiceProvider)_fixture.BuildServiceProvider();
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        if (toExchange) await ch.ExchangeDeclareAsync(name, "direct", durable: true);
+
+        async Task<(bool Success, Exception? Error)> Publish()
+        {
+            var message = new TestEvent { Id = "mandatory", Message = "payload" };
+            if (mode == "single")
+            {
+                var result = toExchange
+                    ? await publisher.PublishAsync(message, name, routingKey: "route", options: options, cancellationToken: timeout.Token)
+                    : await publisher.PublishAsync(message, queueName: queue, options: options, cancellationToken: timeout.Token);
+                return (result.Success, result.Error);
+            }
+            var channelMode = mode == "confirm" ? EasyRabbitFlow.Settings.ChannelMode.Confirm : EasyRabbitFlow.Settings.ChannelMode.Transactional;
+            var batch = toExchange
+                ? await publisher.PublishBatchAsync(new[] { message, message }, name, routingKey: "route", channelMode: channelMode, options: options, cancellationToken: timeout.Token)
+                : await publisher.PublishBatchAsync(new[] { message, message }, queueName: queue, channelMode: channelMode, options: options, cancellationToken: timeout.Token);
+            return (batch.Success, batch.Error);
+        }
+
+        try
+        {
+            var missing = await Publish();
+            Assert.Equal(optionKind != 3, missing.Success);
+            if (optionKind == 3)
+            {
+                var error = Assert.IsType<EasyRabbitFlow.Exceptions.RabbitFlowUnroutableMessageException>(missing.Error);
+                Assert.Equal((ushort)312, error.ReplyCode);
+                Assert.Equal(toExchange ? name : "", error.Exchange);
+                Assert.Equal(toExchange ? "route" : queue, error.RoutingKey);
+            }
+            else Assert.Null(missing.Error);
+
+            await ch.QueueDeclareAsync(queue, durable: true, exclusive: false, autoDelete: false);
+            if (toExchange) await ch.QueueBindAsync(queue, name, "route");
+            var routed = await Publish();
+            Assert.True(routed.Success, routed.Error?.ToString());
+            Assert.Null(routed.Error);
+            Assert.Equal(mode == "single" ? 1u : 2u, await ch.MessageCountAsync(queue));
+        }
+        finally
+        {
+            await ch.QueueDeleteAsync(queue);
+            if (toExchange) await ch.ExchangeDeleteAsync(name);
+        }
+    }
+
+    [Theory]
+    [InlineData(EasyRabbitFlow.Settings.ChannelMode.Transactional, 2)]
+    [InlineData(EasyRabbitFlow.Settings.ChannelMode.Confirm, 1)]
+    public async Task Mandatory_MixedRoutingBatch_ReportsFailureWithoutUndoingRoutedMessages(
+        EasyRabbitFlow.Settings.ChannelMode mode, int deliveredCount)
+    {
+        var name = $"test-mixed-routing-{Guid.NewGuid():N}";
+        await using var sp = (ServiceProvider)_fixture.BuildServiceProvider();
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+        await ch.ExchangeDeclareAsync(name, "headers", durable: true);
+        await ch.QueueDeclareAsync(name, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueBindAsync(name, name, "", new Dictionary<string, object?> { ["route"] = "keep" });
+        var options = new EasyRabbitFlow.Settings.PublishOptions { Mandatory = true };
+        try
+        {
+            var messages = new[] { "first", "unroutable", "last" }.Select(id => new TestEvent { Id = id }).ToArray();
+            var result = await publisher.PublishBatchAsync(messages, name, routingKey: "", channelMode: mode,
+                messageIdSelector: message =>
+                {
+                    options.Headers = new Dictionary<string, object?> { ["route"] = message.Id == "unroutable" ? "drop" : "keep" };
+                    return message.Id;
+                }, options: options);
+            Assert.False(result.Success);
+            Assert.IsType<EasyRabbitFlow.Exceptions.RabbitFlowUnroutableMessageException>(result.Error);
+            Assert.Equal((uint)deliveredCount, await ch.MessageCountAsync(name));
+            Assert.Equal(mode == EasyRabbitFlow.Settings.ChannelMode.Transactional
+                ? new[] { "first", "unroutable", "last" } : new[] { "first" }, result.MessageIds);
+        }
+        finally
+        {
+            await ch.QueueDeleteAsync(name);
+            await ch.ExchangeDeleteAsync(name);
+        }
+    }
+
     private static int GetPooledChannelCount(RabbitFlowPublisher publisher)
     {
         var field = typeof(RabbitFlowPublisher).GetField("pooledChannelCount", BindingFlags.Instance | BindingFlags.NonPublic);

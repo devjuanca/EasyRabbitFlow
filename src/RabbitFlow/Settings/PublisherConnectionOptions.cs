@@ -46,8 +46,9 @@
     public enum ChannelMode
     {
         /// <summary>
-        /// All messages in the batch are published atomically within a single AMQP transaction.
-        /// If any message fails, the entire batch is rolled back and no messages are delivered.
+        /// Publish the batch within one AMQP transaction. Failures before commit attempt rollback.
+        /// Mandatory returns detected at commit cannot undo routed messages; a failed commit may have
+        /// an unknown outcome. This is not an unconditional all-or-nothing delivery guarantee.
         /// </summary>
         Transactional,
 

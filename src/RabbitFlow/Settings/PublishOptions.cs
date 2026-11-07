@@ -6,7 +6,7 @@ namespace EasyRabbitFlow.Settings
 {
     /// <summary>
     /// Optional AMQP metadata applied to messages published through <see cref="Services.IRabbitFlowPublisher"/>.
-    /// All typed fields except <see cref="DeliveryMode"/> are <c>null</c> by default — when left unset they are
+    /// All typed fields except <see cref="DeliveryMode"/> and <see cref="Mandatory"/> are <c>null</c> by default — when left unset they are
     /// not written to the message. Use <see cref="Headers"/> as an escape hatch for any custom header
     /// or AMQP property not yet exposed as a typed field.
     /// </summary>
@@ -16,6 +16,15 @@ namespace EasyRabbitFlow.Settings
     /// </remarks>
     public sealed class PublishOptions
     {
+        /// <summary>
+        /// Require routing to at least one queue. Defaults to false, allowing publishes with no subscribers.
+        /// A broker return produces a failed result with <see cref="Exceptions.RabbitFlowUnroutableMessageException"/>
+        /// in Error. Applies to single messages and batches, for queues and exchanges.
+        /// Does not guarantee consumer processing or persistence. Transactional returns are detected at commit:
+        /// routed messages may already be delivered and cannot be rolled back.
+        /// </summary>
+        public bool Mandatory { get; set; } = false;
+
         /// <summary>
         /// AMQP <c>type</c> property. Often used to carry a logical event name independent
         /// from the .NET CLR type (e.g. <c>"OrderCreated"</c>).
