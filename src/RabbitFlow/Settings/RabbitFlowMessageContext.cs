@@ -132,9 +132,9 @@ namespace EasyRabbitFlow.Settings
         public TimeSpan? Expiration { get; }
 
         /// <summary>
-        /// AMQP <c>priority</c> property (0–9). <c>null</c> when not set on the wire.
-        /// Only meaningful on priority queues — declare the queue via
-        /// <see cref="AutoGenerateSettings{TConsumer}.MaxPriority"/> for the broker to honor it.
+        /// AMQP <c>priority</c> property; supported levels depend on queue type and broker version. <c>null</c> when not set on the wire.
+        /// Classic queues require declaration via
+        /// <see cref="AutoGenerateSettings{TConsumer}.MaxPriority"/> for the broker to honor it. Quorum queues use built-in priority behavior.
         /// </summary>
         public byte? Priority { get; }
 

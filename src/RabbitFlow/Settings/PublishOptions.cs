@@ -5,10 +5,10 @@ using System.Text.Json;
 namespace EasyRabbitFlow.Settings
 {
     /// <summary>
-    /// Optional AMQP metadata applied to messages published through <see cref="Services.IRabbitFlowPublisher"/>.
+    /// Optional AMQP metadata, routing requirement and JSON settings for <see cref="Services.IRabbitFlowPublisher"/>.
     /// All typed fields except <see cref="DeliveryMode"/> and <see cref="Mandatory"/> are <c>null</c> by default — when left unset they are
-    /// not written to the message. Use <see cref="Headers"/> as an escape hatch for any custom header
-    /// or AMQP property not yet exposed as a typed field.
+    /// not written to the message. Use <see cref="Headers"/> for custom header values;
+    /// headers do not replace AMQP properties or publication flags such as Mandatory.
     /// </summary>
     /// <remarks>
     /// <see cref="Services.IRabbitFlowPublisher"/> intentionally does not expose <c>MessageId</c> or <c>CorrelationId</c>
@@ -44,7 +44,7 @@ namespace EasyRabbitFlow.Settings
         public TimeSpan? Expiration { get; set; }
 
         /// <summary>
-        /// AMQP <c>priority</c> property (0–9). Only effective on priority queues.
+        /// AMQP <c>priority</c> property. Classic queues require x-max-priority; quorum support depends on broker version.
         /// </summary>
         public byte? Priority { get; set; }
 
@@ -95,8 +95,8 @@ namespace EasyRabbitFlow.Settings
     public enum MessageDeliveryMode : byte
     {
         /// <summary>
-        /// Non-persistent. The broker may keep the message in memory only — it is lost on broker restart,
-        /// even when the destination queue is durable.
+        /// Does not request persistence. Classic queues discard transient messages on restart even if durable;
+        /// quorum queues persist messages regardless of this flag.
         /// </summary>
         Transient = 1,
 

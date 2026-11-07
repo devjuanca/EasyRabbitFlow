@@ -172,13 +172,13 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 | `ExchangeName` | string? | `null` | Custom name (defaults to `{queue}-exchange`) |
 | `RoutingKey` | string? | `null` | Custom routing key (defaults to `{queue}-routing-key`) |
 | `DurableExchange` | bool | `true` | Exchange survives broker restart |
-| `DurableQueue` | bool | `true` | Queue survives broker restart. **Keep `true` on RabbitMQ 4.x:** the broker denies non-durable, non-exclusive queues by default (`transient_nonexcl_queues` deprecated), so `DurableQueue = false` on a non-exclusive consumer queue is rejected. See [RabbitMQ 4.x compatibility](../README.md#rabbitmq-4x-compatibility). |
+| `DurableQueue` | bool | `true` | Queue survives broker restart. **Keep `true` for durability:** RabbitMQ 4.3+ denies non-durable, non-exclusive queues by default (`transient_nonexcl_queues` deprecated), so `DurableQueue = false` on a non-exclusive consumer queue is rejected. See [RabbitMQ 4.x compatibility](../README.md#rabbitmq-4x-compatibility). |
 | `ExclusiveQueue` | bool | `false` | Queue limited to declaring connection |
 | `AutoDeleteQueue` | bool | `false` | Delete queue when last consumer disconnects |
 | `Args` | IDictionary? | `null` | Additional RabbitMQ arguments |
 | `QueueType` | QueueType? | `null` | Type of the main queue (`Classic` / `Quorum`), sent as `x-queue-type` (v8.4.0). `null` sends nothing and the **broker's** `default_queue_type` decides — which is how a cluster switched to `default_queue_type = quorum` silently turns every auto-generated queue into a quorum queue. Set it explicitly on business queues. `Quorum` requires `DurableQueue = true` and `ExclusiveQueue = false` (validated at registration); an existing queue of another type is adopted as-is with a warning, never converted. Must agree with `Args["x-queue-type"]` if both are set. See [Queue types](#queue-types). |
 | `DeadLetterQueueType` | QueueType? | `null` | Type of the auto-generated dead-letter queue **and** of the reprocessor's parking queue. `null` = same as `QueueType` (or the broker default when that is `null` too). |
-| `MaxPriority` | byte? | `null` | Declares the queue as a priority queue with this max priority via `x-max-priority`. Required for the broker to honor messages published with [`PublishOptions.Priority`](publishing.md#per-call-amqp-options-publishoptions); without it, priority is silently ignored and messages flow FIFO. Keep small (1–10). If `Args` already contains `x-max-priority`, that explicit entry wins. |
+| `MaxPriority` | byte? | `null` | Declares the queue as a priority queue with this max priority via `x-max-priority`. Required for priorities on **classic** queues; quorum queues use version-specific built-in priorities and ignore `x-max-priority`. Keep small (1–10). If `Args` already contains `x-max-priority`, that explicit entry wins. |
 | `DeadLetterReplicas` | List&lt;DeadLetterReplica&gt; | empty | Extra queues to bind to the dead-letter exchange. See [Dead-Letter Replicas](dead-letter.md#dead-letter-replicas). |
 
 ### Retry Policies
@@ -186,7 +186,7 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 > **Deprecated in v8.4.0.** `ConfigureRetryPolicy` is marked `[Obsolete]` and will be removed in the next major
 > version. It still works exactly as described below, but prefer the
 > [dead-letter reprocessor](dead-letter.md#dead-letter-reprocessor): it retries from the DLQ with a persistent
-> counter (`x-reprocess-attempts`), on its own cadence, and never holds a delivery unacknowledged — so it does not
+> counter (`x-reprocess-attempts`), on its own cadence, without holding the original delivery unacknowledged between cycles — so it does not
 > stretch the broker's [consumer timeout](#consumer-timeout) either. In-process retries are what the
 > `x-consumer-timeout` formula accounts for; without them it is simply `max(60s, Timeout + 30s + 10s)`.
 
@@ -345,7 +345,7 @@ When `Timeout <= 0` (e.g. `Timeout.InfiniteTimeSpan`, "no handler timeout") the 
 
 > **⚠️ `x-consumer-timeout` only applies when the queue is first created**
 >
-> Changing `Timeout`, `MaxRetryCount`, or `RetryInterval` on a queue that already exists does **not** update its `x-consumer-timeout`: the queue keeps its original value. What the broker does with the new value depends on the queue type: **classic queues on 3.x silently ignore it** (no `PRECONDITION_FAILED`, no warning), whereas **quorum queues on 4.x compare it** like any other argument (`PRECONDITION_FAILED - inequivalent arg 'x-consumer-timeout'`) and the consumer adopts the existing queue with a warning (see the **Queue arguments are immutable in RabbitMQ** note below). **To make the change take effect, delete and recreate the queue** (safe since v8.4.0: the consumer re-subscribes by itself) or apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) on the broker, which *can* be changed in place.
+> Changing `Timeout`, `MaxRetryCount`, or `RetryInterval` on a queue that already exists does **not** update its `x-consumer-timeout`: the queue keeps its original value. What the broker does with the new value depends on the queue type: **classic queues on 3.x silently ignore it** (no `PRECONDITION_FAILED`, no warning), whereas **quorum queues on 4.x compare it** like any other argument (`PRECONDITION_FAILED - inequivalent arg 'x-consumer-timeout'`) and the consumer adopts the existing queue with a warning (see the **Queue arguments are immutable in RabbitMQ** note below). **To make the change take effect, delete and recreate the queue** (drain or migrate retained messages first; since v8.4.0 the consumer re-subscribes automatically) or apply a [`consumer-timeout` policy](https://www.rabbitmq.com/docs/consumers#per-queue-delivery-timeout) on the broker, which *can* be changed in place.
 
 #### Channel & connection recovery
 
@@ -353,9 +353,9 @@ EasyRabbitFlow manages consumer recovery itself rather than relying on the Rabbi
 
 Recovery after a connection the broker force-closed used to take an extra 20s: disposing the dead channel waited for the client's `ContinuationTimeout`. Since v8.4.0 the old channel is disposed off the recovery path, so the consumer is typically back within the first backoff interval.
 
-**Broker-initiated consumer cancellation (`basic.cancel`, v8.4.0).** The broker can also cancel just the consumer and leave its channel open: when the queue is deleted, when the node hosting the queue goes away, or — on RabbitMQ 4.3+ **quorum queues** — when a delivery exceeds the consumer acknowledgement timeout (4.3 sends `basic.cancel` instead of closing the channel; see [Server-side timeout](#consumer-timeout)). No channel or connection event fires in that case, so until v8.4.0 the consumer silently stopped receiving until the process restarted. The consumer now listens for the cancellation, logs a warning naming the queue and consumer tag, increments `easyrabbitflow.consumer.cancellations`, drops the channel and runs the same recovery as above (re-declare topology, re-subscribe), serialized with any recovery already in flight so there are never two consumers on the queue. Deleting an auto-generated queue from the management UI is therefore safe: it is recreated with the current arguments and consumption resumes within a few seconds.
+**Broker-initiated consumer cancellation (`basic.cancel`, v8.4.0).** The broker can also cancel just the consumer and leave its channel open: when the queue is deleted, when the node hosting the queue goes away, or — on RabbitMQ 4.3+ **quorum queues** — when a delivery exceeds the consumer acknowledgement timeout (4.3 sends `basic.cancel` instead of closing the channel; see [Server-side timeout](#consumer-timeout)). No channel or connection event fires in that case, so until v8.4.0 the consumer silently stopped receiving until the process restarted. The consumer now listens for the cancellation, logs a warning naming the queue and consumer tag, increments `easyrabbitflow.consumer.cancellations`, drops the channel and runs the same recovery as above (re-declare topology, re-subscribe), serialized with any recovery already in flight so there are never two consumers on the queue. After deletion of an auto-generated queue, recovery recreates it and resumes consumption. Deletion still removes its messages; drain or migrate retained data before replacing a queue. Recovery time depends on broker availability and backoff.
 
-**At-least-once, spelled out.** Whenever the broker takes deliveries back — a cancel, a dropped connection, a channel closed by the broker, or a shutdown that outlasts the 30s drain — the handlers that were running keep running to completion, but their acknowledgements can no longer succeed and the same messages are delivered again, possibly while the first handler is still at work. The library never acknowledges a message it did not process, so nothing is lost; the price is duplicates. Handlers must therefore be idempotent by `MessageId` (a unique constraint or a lock, not a check-then-act), and `RabbitFlowMessageContext.Redelivered` / `DeliveryCount` tell a handler that a copy may have run before.
+**At-least-once, spelled out.** Whenever the broker takes deliveries back — a cancel, a dropped connection, a channel closed by the broker, or a shutdown that outlasts the 30s drain — the handlers that were running keep running to completion, but their acknowledgements can no longer succeed and the same messages are delivered again, possibly while the first handler is still at work. Unacknowledged deliveries can be redelivered; this does not protect against queue deletion, retention limits or intentional discard settings such as `AutoAckOnError`. Handlers must therefore be idempotent by `MessageId` (a unique constraint or a lock, not a check-then-act), and `RabbitFlowMessageContext.Redelivered` / `DeliveryCount` tell a handler that a copy may have run before.
 
 The same mechanism protects **startup**: if the broker is unreachable or the initial setup (declare, bind,
 subscribe) fails when the host starts, the host still starts — the failure is logged and the consumer keeps
@@ -404,12 +404,9 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 {
     public async Task HandleAsync(OrderCreatedEvent message, RabbitFlowMessageContext context, CancellationToken ct)
     {
-        // Idempotency check using MessageId
-        if (context.MessageId != null && await _db.ExistsAsync(context.MessageId))
-        {
-            _logger.LogWarning("Duplicate message {Id}, skipping", context.MessageId);
-            return;
-        }
+        // Use MessageId for atomic deduplication with the business update.
+        // A separate ExistsAsync check is not sufficient under concurrent redelivery.
+        // See Publishing > Idempotency for the transaction pattern.
 
         // Trace correlation across services
         _logger.LogInformation("Processing order. CorrelationId={CorrelationId}", context.CorrelationId);
@@ -442,7 +439,7 @@ public class OrderConsumer : IRabbitFlowConsumer<OrderCreatedEvent>
 | `Headers` | IDictionary? | Custom AMQP headers from `BasicProperties.Headers` |
 | `DeliveryTag` | ulong | Broker-assigned delivery tag for this message |
 | `Redelivered` | bool | Whether the broker redelivered this message (any queue type). A single redelivery is normal after a deploy or a dropped connection. |
-| `DeliveryCount` | int? | How many returns of this delivery the **broker** counted before handing it over again, from the `x-delivery-count` header that **quorum queues** set on redeliveries: every return on RabbitMQ 4.0–4.2 (consumer timeout, closed channel or connection, requeue); from 4.3 only failed deliveries (crash, dropped connection), so a redelivery after a consumer timeout arrives with `Redelivered = true` and the count unchanged. `null` on the first delivery and always on classic queues. Use it to make side effects idempotent on retries; the consumer stops invoking the handler at `MaxBrokerDeliveries` (default 5). Unrelated to `ReprocessAttempts`. |
+| `DeliveryCount` | int? | How many returns of this delivery the **broker** counted before handing it over again, from the `x-delivery-count` header that **quorum queues** set on redeliveries: every return on RabbitMQ 4.0–4.2 (consumer timeout, closed channel or connection, requeue); from 4.3 only failed deliveries (crash, dropped connection), so a redelivery after a consumer timeout arrives with `Redelivered = true` and the count unchanged. `null` on the first delivery and always on classic queues. Use it for diagnostics; deduplicate side effects using a stable `MessageId`, not the delivery count; the consumer stops invoking the handler at `MaxBrokerDeliveries` (default 5). Unrelated to `ReprocessAttempts`. |
 | `ReprocessAttempts` | int | Number of times this message was re-enqueued from the DLQ by the [Dead-Letter Reprocessor](dead-letter.md#dead-letter-reprocessor). `0` for messages that have never been reprocessed. |
 | `DeliveryMode` | MessageDeliveryMode? | AMQP `delivery-mode`. `null` when the publisher did not set it explicitly (the broker treats absent as `Transient`). |
 | `Type` | string? | AMQP `type` — typically a logical event name independent of the .NET CLR type. `null` when not set on the wire. |

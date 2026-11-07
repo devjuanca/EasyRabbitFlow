@@ -6,7 +6,7 @@ Illustrates **`DeclareExchange`** (v8.1): a service that declares the exchange i
 
 - **Ownership split** — the producer owns the exchange; each consumer owns its queue and bindings. This module registers no consumers and never calls `AddConsumer`.
 - **Startup declaration without consumers** — the `integration-events` topic exchange is created at application startup by the library's topology hosted service; `UseRabbitFlowConsumers()` is not required for it.
-- **Publish-safety** — publishing never fails with 404 `NOT_FOUND` because the exchange always exists, even before any subscriber binds. Events with no matching binding are dropped by the broker (normal topic semantics).
+- **Startup topology** — the library declares the exchange independently of subscribers. Publication can still fail before declaration succeeds or after administrative deletion. With the default `Mandatory = false`, events with no route may be dropped; opt into `PublishOptions.Mandatory` when a route is required.
 - **External subscribers** — `POST /integration-events/subscriptions` simulates the *subscriber's* side (own queue + own binding pattern) with raw `RabbitMQ.Client` code, standing in for another service or an operator in the management UI.
 
 ## Topology

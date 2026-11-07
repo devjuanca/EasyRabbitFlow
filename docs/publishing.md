@@ -114,7 +114,7 @@ Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
 
 ### Batch Publishing
 
-Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter controls atomicity:
+Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter selects transactions or individual confirmations:
 
 - **`Transactional`** (default): Publishes within one AMQP transaction. Failures before commit trigger an attempted rollback. Uses AMQP transactions, **not** publisher confirms: success requires a completed `tx.commit` and, when `Mandatory = true`, no returned messages. Returns detected at commit cannot undo messages already routed.
 - **`Confirm`**: Each message is individually confirmed by the broker — a mid-batch failure does not roll back previous messages.
@@ -129,7 +129,7 @@ Batches always open their own dedicated channel; they never use the single-messa
 > plus idempotent consumers. See [RabbitMQ semantics](https://www.rabbitmq.com/docs/semantics).
 
 ```csharp
-// Atomic batch (Transactional — default)
+// Transactional batch (default); see commit and partial-delivery limits above
 var result = await publisher.PublishBatchAsync(
     orders,
     exchangeName: "orders-exchange",
@@ -137,7 +137,7 @@ var result = await publisher.PublishBatchAsync(
 
 Console.WriteLine($"Batch: {result.MessageCount} messages, success={result.Success}");
 
-// Non-atomic batch (Confirm mode — higher throughput)
+// Individually confirmed batch; prior successful publications are not rolled back
 var result = await publisher.PublishBatchAsync(
     orders,
     queueName: "orders-queue",
@@ -180,6 +180,8 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 | `Error` | Exception? | The exception if `Success` is `false` |
 
 ### Idempotency
+
+**An uncertain confirmation is not proof of non-delivery.** Connection loss, cancellation or a timeout while awaiting confirmation can produce `Success = false` after the broker accepted the message. This affects single publishes and both batch modes. `Mandatory` detects returns; it does not remove this ambiguity. Retrying with the same `MessageId` enables application-level deduplication but RabbitMQ does not deduplicate ordinary queue publications by that property alone. See [RabbitMQ reliability](https://www.rabbitmq.com/docs/reliability).
 
 Every published message carries a `MessageId` set on `BasicProperties.MessageId` and returned in `PublishResult.MessageId` (or `BatchPublishResult.MessageIds`). There is no opt-out — identification is foundational, not optional.
 
@@ -323,11 +325,11 @@ await publisher.PublishAsync(
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `Mandatory` | bool | `false` | Require routing to at least one queue. A return produces a failed result; see [Mandatory routing](#mandatory-routing) for batch semantics. |
-| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` is in-memory only. |
+| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` does not request persistence; quorum queues persist it anyway. |
 | `Type` | string? | `null` | AMQP `type` — typically a logical event name independent of the .NET CLR type. |
 | `AppId` | string? | `null` | AMQP `app-id` — identifies the publishing application. |
 | `Expiration` | TimeSpan? | `null` | Per-message TTL. Broker discards or dead-letters after this window. Serialized as a millisecond string. |
-| `Priority` | byte? | `null` | AMQP `priority`. Written to the wire as-is (the 0–9 range is RabbitMQ convention, not validated by the library). **Requires the destination queue to be declared with [`MaxPriority`](consumers.md#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
+| `Priority` | byte? | `null` | AMQP `priority`, sent as-is. Classic queues require [`MaxPriority`](consumers.md#auto-generate-topology); quorum queues use version-specific built-in priorities. Supported levels depend on broker version and queue type. |
 | `Timestamp` | DateTimeOffset? | `null` | AMQP `timestamp` — serialized as Unix seconds. |
 | `ReplyTo` | string? | `null` | AMQP `reply-to` — names the queue/exchange a consumer should reply on (RPC-style flows). |
 | `ContentType` | string? | `null` | AMQP `content-type`. Not set by default to preserve historical wire format; set to `"application/json"` if your consumers need it. |
@@ -336,7 +338,7 @@ await publisher.PublishAsync(
 
 Consumers read message metadata via [`RabbitFlowMessageContext`](consumers.md#message-context). `JsonOptions` and `Mandatory` control publishing and are not consumer metadata.
 
-> **Priority footgun:** setting `options.Priority` on a queue that was **not** declared with `x-max-priority` is silently ignored by the broker — messages are delivered in FIFO order regardless. For auto-generated queues, configure [`AutoGenerateSettings.MaxPriority`](consumers.md#auto-generate-topology); for queues declared externally, add `x-max-priority` to the queue arguments yourself.
+> **Priority depends on queue type:** classic queues need `x-max-priority` (via `AutoGenerateSettings.MaxPriority`). Quorum queues ignore that argument: RabbitMQ 4.0–4.2 uses two priority groups, while 4.3+ supports strict priorities from 0 to 31. Prefetched messages are not preempted. See [RabbitMQ priorities](https://www.rabbitmq.com/docs/priority).
 
 ### Durability: three different guarantees
 

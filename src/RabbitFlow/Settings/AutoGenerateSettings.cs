@@ -87,9 +87,10 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         /// When set, declares the auto-generated queue as a priority queue with the given maximum priority,
-        /// emitting the <c>x-max-priority</c> queue argument. Required for the broker to honor the
+        /// emitting the <c>x-max-priority</c> queue argument. Required on classic queues for the broker to honor the
         /// <c>Priority</c> field set via <see cref="PublishOptions.Priority"/> — messages published with a
-        /// priority to a non-priority queue are delivered in FIFO order regardless.
+        /// priority to a classic queue without this argument are not prioritized. Quorum queues ignore this
+        /// argument and use their broker version's built-in priority behavior.
         /// <para>
         /// RabbitMQ recommends a small value (1–10) since each priority level allocates internal resources.
         /// If <see cref="Args"/> already contains <c>x-max-priority</c>, that explicit entry wins and this

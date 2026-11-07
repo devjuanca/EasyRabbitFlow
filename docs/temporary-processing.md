@@ -213,8 +213,12 @@ TemporaryRunResult run = await _temporary.RunAsync(
         // Store the failed message for later retry or manual review
         await _failedMessageStore.SaveAsync(failedInvoice, ct);
 
-        // Or republish to a dead-letter queue
-        await _publisher.PublishAsync(failedInvoice, "invoices-failed-queue");
+        // Alternatively, publish to a pre-declared failure queue and inspect the result.
+        var published = await _publisher.PublishAsync(failedInvoice, "invoices-failed-queue",
+            options: new PublishOptions { Mandatory = true, DeliveryMode = MessageDeliveryMode.Persistent },
+            cancellationToken: ct);
+        if (!published.Success)
+            _logger.LogError(published.Error, "Could not forward failed invoice");
     },
     options: new RunTemporaryOptions
     {
@@ -244,7 +248,12 @@ TemporaryRunResult run = await _temporary.RunAsync(
     onCompletedAsync: async (result, ct) =>
     {
         await _metrics.RecordBatchAsync(result.ProcessedMessages, result.FailedMessages, ct);
-        await _publisher.PublishAsync(new BatchCompleted { Total = result.ProcessedMessages, Errors = result.FailedMessages });
+        var published = await _publisher.PublishAsync(
+            new BatchCompleted { Total = result.ProcessedMessages, Errors = result.FailedMessages },
+            queueName: "batch-completed-queue",
+            options: new PublishOptions { Mandatory = true }, cancellationToken: ct);
+        if (!published.Success)
+            throw new InvalidOperationException("Could not publish completion notification", published.Error);
     });
 ```
 
@@ -295,13 +304,12 @@ The temporary queue is declared **exclusive, non-durable and auto-delete**, expl
 | 4.x, classic default | Classic queue. Exclusive queues are not affected by the `transient_nonexcl_queues` deprecation (only *non-exclusive* non-durable queues are). Classic queues on 4.3+ have no consumer timeout at all. |
 | 4.x with `default_queue_type = quorum` | Classic queue, because the declare says so. (Before v8.4.0 the library relied on the broker falling back to classic for exclusive/non-durable declarations, which 4.3.7 and 4.4.0 do; now the type no longer depends on it. Guarded by a test.) `QueueType` / `MaxBrokerDeliveries` do not apply to temporary runs. |
 
-Each delivery is **acknowledged right after deserialization, before the handler runs**, so a long handler never
-holds an unacknowledged delivery. The only unacknowledged window is a delivery waiting for a processing slot while
-the previous handlers of that slot are still running (the broker refills the prefetch window as soon as deliveries
-are acked), which is bounded by `Timeout`. A broker ack timeout can therefore only interfere on 3.13 when handlers run
-for longer than its 30-minute default; it then closes the channel and the run ends early with a partial result, like
-any connection loss. Broker-initiated consumer cancellation (`basic.cancel`) cannot target an exclusive queue from
-elsewhere: the only way to lose the queue is to lose the connection, which the run already handles.
+Each delivery is **acknowledged after deserialization, before the handler runs**. Other deliveries can remain
+unacknowledged while waiting for processing slots. `Timeout` bounds that wait only when handlers honor cancellation;
+temporary handlers have no stuck-handler watchdog. On RabbitMQ 3.13 and 4.0–4.2, the broker acknowledgement timeout
+can close the channel during a prolonged wait. Classic queues on 4.3+ do not enforce that timeout.
+Exclusivity prevents access from other AMQP connections; it does not protect against administrative deletion.
+Temporary runs remain best-effort processing, not durable job storage.
 
 ### Progress Reporting (`OnProgress`)
 
@@ -408,9 +416,11 @@ sealed record RunSnapshot(
 
 Notes on the example:
 
-- **No late overwrite.** No progress call starts once the run begins to close, so the final snapshot written by
-  `onCompletedAsync` is never replaced by a late `Running` one.
-- **Setup failures are swallowed by `_ =`.** If `RunAsync` cannot even start (for example, the broker is
+- **Protect the final snapshot.** Closing stops new progress calls, but waits only five seconds for an already
+  running callback. A callback that ignores cancellation can finish after `onCompletedAsync`. The simple Redis
+  writes above need an atomic terminal-state check (for example, a Lua script) for production use so a late
+  progress write cannot replace `Completed`. The runnable in-memory sample includes this guard.
+- **Setup failures are unobserved when the task is discarded with `_ =`.** If `RunAsync` cannot even start (for example, the broker is
   unreachable), no progress ever replaces the `Starting` snapshot: it expires after `ProgressTtl` and the status
   endpoint answers `404`. Await the task in a `Task.Run` with a
   `try/catch` if you need to store that failure too, as the [RunMonitoring sample](sample-project.md) does.
@@ -426,13 +436,13 @@ How it is called:
 
 - **Every `ProgressInterval`** (default 5 s), measured from the end of the previous call, **even when nothing changed**.
   That makes it a heartbeat: store it with a short TTL, and a `TimestampUtc` that stops advancing (or a key that
-  expires) means the run — or the process running it — is gone.
+  expires) signals missing progress: the run may have stopped, or reporting/storage may be delayed or failing.
 - **One call at a time.** A slow callback delays the next one; calls never overlap or pile up.
 - **Beside the run, not inside it.** It never blocks message processing, and an exception it throws is logged as a
   warning without affecting the run or its result.
-- **Stops when the run closes.** No call starts once the run begins to close, so it never runs after the completion
-  callback, which carries the final figures. The token passed in is the run's own: honor it — a call still running
-  when the run closes is waited for at most 5 seconds.
+- **Stops scheduling when the run closes.** The completion callback carries the final figures. Honor the progress
+  token: a call already running is waited for at most five seconds and can finish later if it ignores cancellation.
+  Stored terminal states should reject subsequent progress updates.
 - Reporting starts with the run (before publishing), so a long asynchronous source is observable while it is still
   being read. A `null` or empty collection returns immediately and reports nothing.
 

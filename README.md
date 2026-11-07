@@ -24,7 +24,7 @@
 - **Explicit queue type** — `ConfigureAutoGenerate` gains `QueueType` (`Classic` / `Quorum`, sent as `x-queue-type` for the main queue) and `DeadLetterQueueType` (dead-letter and parking queues). `null`, the default, keeps the previous behavior where the broker's `default_queue_type` decides — set it explicitly on business queues so a broker whose default changes to quorum cannot change the queue type under the consumer. Quorum is validated at registration (durable, not exclusive, not auto-delete). An existing queue of another type — main or dead-letter — is adopted with a warning, never converted. See [Queue types](docs/consumers.md#queue-types).
 - **No broker timeout for unbounded handlers** — `Timeout <= 0` (e.g. `Timeout.InfiniteTimeSpan`) no longer derives a 60s `x-consumer-timeout`; the argument is simply not sent. See [Consumer Timeout](docs/consumers.md#consumer-timeout).
 - **Poison-message guard on quorum queues** — `ConsumerSettings.MaxBrokerDeliveries` (default 5): a redelivered message the broker has already counted that many returns of (`x-delivery-count`: every return on RabbitMQ 4.0–4.2; from 4.3 only failed deliveries such as crashes and dropped connections, not consumer timeouts or requeues) is dead-lettered with its envelope without invoking the handler and parked by the reprocessor (never discarded), instead of going back to the head of the queue until the broker's `delivery-limit` drops it raw. Only acts when the auto-generated dead-letter queue exists and `AutoAckOnError` is off, so it can never drop a message. `RabbitFlowMessageContext.DeliveryCount` exposes the broker's count to handlers (`null` on classic queues, which only flag `Redelivered`). See [Message Context](docs/consumers.md#message-context).
-- **In-process retries deprecated** — `ConfigureRetryPolicy` is marked `[Obsolete]` (still functional, removed in the next major): retry from the dead-letter queue with `ConfigureDeadLetterReprocess`, which keeps a persistent counter and never holds a delivery unacknowledged. See [Retry Policies](docs/consumers.md#retry-policies).
+- **In-process retries deprecated** — `ConfigureRetryPolicy` is marked `[Obsolete]` (still functional, removed in the next major): retry from the dead-letter queue with `ConfigureDeadLetterReprocess`, which keeps a persistent counter without holding the original delivery open between cycles. See [Retry Policies](docs/consumers.md#retry-policies).
 - **Failures are visible in logs and traces** — a dead-lettered delivery now logs one `Error` line with the message id, correlation id, consumer, attempts, reason (`handler_error` / `timeout` / `abandoned` / `poison` / `deserialize`) and the exception; every delivery runs inside a log scope (`Queue`, `Consumer`, `MessageId`, `CorrelationId`, `DeliveryTag`) that log providers attach to the handler's own lines; failed spans carry `error.type` and an `exception` event; `messages.consumed{outcome=failure}` gains a `reason` tag. Retry attempts and the first recovery attempts log at `Warning` instead of `Error`; temporary-run log lines use the same `[RABBIT-FLOW]:` prefix as the rest. An abandoned handler surfaces as `RabbitFlowHandlerAbandonedException` (a `RabbitFlowException`). See [Observability](docs/observability.md).
 - **Dependencies** — RabbitMQ.Client 7.1.2 → 7.2.2; the explicit `Microsoft.SourceLink.GitHub` reference is gone (Source Link ships with the .NET 8+ SDK), which also drops a transitive `Microsoft.Build.Tasks.Git` with a moderate advisory.
 - **Temporary queues declared classic explicitly** — `IRabbitFlowTemporary` now sends `x-queue-type = classic` (the only type that can be exclusive and non-durable), so the temporary queue's type no longer depends on the broker's `default_queue_type`.
@@ -79,12 +79,12 @@ builder.Services.AddRabbitFlow(cfg =>
 
 - **OpenTelemetry-ready observability** — `ActivitySource` spans with W3C trace-context propagation across the broker, a `Meter` with message counters and a processing-duration histogram, and a native health check. See [Observability](docs/observability.md).
 - **Richer temporary batch processing** — `RunAsync` now returns a `TemporaryRunResult` with full counters and per-error detail, supports a whole-run `RunTimeout`, and ends early (instead of hanging) when the broker connection drops. See [Temporary Batch Processing](docs/temporary-processing.md).
-- **Hardened dead-letter path** — failed messages are written with **publisher confirms** (never silently lost), the envelope captures and restores the original AMQP properties on replay, and the reprocessor parks non-reprocessable messages instead of churning the DLQ. See [Dead-Letter Handling](docs/dead-letter.md).
+- **Hardened dead-letter path** — failed messages are written with **publisher confirms** before acknowledging the original (see the documented fallback and durability limits), the envelope captures and restores the original AMQP properties on replay, and the reprocessor parks non-reprocessable messages instead of churning the DLQ. See [Dead-Letter Handling](docs/dead-letter.md).
 - **Fixed-interval, transient-only retry** — the in-handler `RetryPolicy` is now a constant `RetryInterval` scoped to short transient failures (exponential backoff removed); long recovery windows belong to the reprocessor. See [Retry Policies](docs/consumers.md#retry-policies) and [Transient Exceptions](docs/transient-exceptions.md).
 - **Queue state inspection & health check** — a single-round-trip `QueueState` snapshot API and an `AddHealthChecks().AddRabbitFlow()` probe. See [Queue Operations](docs/queue-operations.md).
 - **Multi-targeting** — `netstandard2.1` (works on .NET 6/7+) and `net8.0`.
 
-See the [Breaking Changes](#️-breaking-changes-v800) section below before upgrading.
+See the [Breaking Changes](#breaking-changes-v800) section below before upgrading.
 
 ---
 
@@ -99,7 +99,7 @@ EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced
 
 - **Brokers with `default_queue_type = quorum`.** A cluster or vhost configured that way turns every queue declared without `x-queue-type` — all auto-generated queues before v8.4.0 — into a quorum queue. Set `QueueType` explicitly to keep the type under the application's control. See [Queue types](docs/consumers.md#queue-types).
 
-- **Transient non-exclusive queues are denied by default (`transient_nonexcl_queues`).** RabbitMQ 4.x rejects queues that are **both non-durable and non-exclusive** (`INTERNAL_ERROR - Feature 'transient_nonexcl_queues' is deprecated`). The library's default is `DurableQueue = true`, so the default configuration is safe. **Only if you explicitly set `DurableQueue = false`** on a consumer will 4.x reject it — keep the queue durable (recommended) or enable `deprecated_features.permit.transient_nonexcl_queues = true` on the broker. Temporary queues created via `IRabbitFlowTemporary` are **exclusive**, so they are unaffected — and since v8.4.0 they are declared explicitly **classic** (`x-queue-type = classic`), so a broker with `default_queue_type = quorum` cannot change their type (quorum queues cannot be exclusive anyway). See [Queue type and broker versions](docs/temporary-processing.md#queue-type-and-broker-versions).
+- **Transient non-exclusive queues are denied by default (`transient_nonexcl_queues`).** RabbitMQ 4.3+ rejects queues that are **both non-durable and non-exclusive** by default (`INTERNAL_ERROR - Feature 'transient_nonexcl_queues' is deprecated`). The library's default is `DurableQueue = true`, so the default configuration is safe. **Only if you explicitly set `DurableQueue = false`** on a consumer will 4.3+ reject it by default — keep the queue durable (recommended) or enable `deprecated_features.permit.transient_nonexcl_queues = true` on the broker. Temporary queues created via `IRabbitFlowTemporary` are **exclusive**, so they are unaffected — and since v8.4.0 they are declared explicitly **classic** (`x-queue-type = classic`), so a broker with `default_queue_type = quorum` cannot change their type (quorum queues cannot be exclusive anyway). See [Queue type and broker versions](docs/temporary-processing.md#queue-type-and-broker-versions).
 
 - **Not affected:** the library uses per-consumer QoS (`global: false`), so the deprecation of global QoS does not apply, and it never sets the removed CQv1 arguments (`x-queue-mode`, `x-queue-version = 1`).
 
@@ -157,7 +157,7 @@ EasyRabbitFlow registers a small set of services through `AddRabbitFlow(...)`. I
 
 | Service | Lifetime | What it does |
 |---------|----------|--------------|
-| [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (atomic transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
+| [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
 | [`IRabbitFlowConsumer<TEvent>`](docs/consumers.md) | Transient | The interface **you** implement. Each consumer's `HandleAsync` receives the deserialized event, a `RabbitFlowMessageContext` (metadata), and a `CancellationToken`. Registered with `AddConsumer<TConsumer>(...)`, resolved per message from a fresh DI scope, and run by the hosted service. |
 | [`IRabbitFlowTemporary`](docs/temporary-processing.md) | Singleton | Collection or asynchronous-source processing over an automatically managed temporary queue. `RunAsync` returns counters, per-error detail and asynchronous source completion state. |
 | [`IRabbitFlowState`](docs/queue-operations.md) | Singleton | Single-round-trip queue inspection — message and consumer counts, existence — for one queue (`GetQueueStateAsync`) or many (`GetQueuesStateAsync`). |
@@ -260,6 +260,8 @@ app.MapPost("/orders", async (OrderCreatedEvent order, IRabbitFlowPublisher publ
 That's it — **four steps** from zero to a working publish/consume pipeline.
 
 ---
+
+<a id="breaking-changes-v800"></a>
 
 ## ⚠️ Breaking Changes (v8.0.0)
 
@@ -504,7 +506,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 - `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
 
 - `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
-- `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
+- `PublishBatchAsync` is new — publish multiple messages in a transaction (`Transactional`) or individually confirmed (`Confirm`).
 - `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
 - `PublisherOptions.IdempotencyEnabled` introduced (later removed in v6.0.0; `MessageId` is now always assigned).
 

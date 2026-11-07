@@ -45,7 +45,7 @@ Run the sample API and use [WebhookIngest.http](WebhookIngest.http) or Swagger.
 ## Guarantees and limits
 
 - The temporary queue is exclusive, non-durable and auto-delete, and messages are acknowledged
-  before the handler runs. Events already published when the connection drops are lost, and an
+  before the handler runs. Undelivered events remaining in the temporary queue are lost on connection loss; handlers already running may complete. An
   event whose handler fails is not retried: `onError` is the last place to persist or alert on it.
   This sample is not durable webhook storage. For business events that cannot be lost, persist
   them first (or use a durable queue with a regular consumer) and use this pattern for the

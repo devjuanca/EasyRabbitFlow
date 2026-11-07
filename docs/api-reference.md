@@ -66,7 +66,8 @@ Notable properties: `Timeout` (per-attempt handler timeout, `<= 0` = none), `Pre
 | `RabbitFlowTransientException` | Base type a handler throws to mark a failure as transient (retried by the reprocessor); derived types inherit the classification |
 | `RabbitFlowHandlerAbandonedException` | Written to the dead-letter envelope when a handler ignored its cancellation token and was abandoned by the watchdog (permanent) |
 | `RabbitFlowPoisonMessageException` | Written to the dead-letter envelope when the broker had returned a delivery `MaxBrokerDeliveries` times and the handler was not invoked (permanent, always parked) |
-| `RabbitFlowOverRetriesException` | Legacy: in-process retries exhausted |
+| `RabbitFlowOverRetriesException` | Legacy compatibility type; no longer thrown by the retry path |
+| `RabbitFlowUnroutableMessageException` | Returned in publish result `Error` when `Mandatory = true` and the broker returns a message; includes exchange, routing key and broker reply details |
 
 ---
 
@@ -93,7 +94,7 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
     {
         r.Enabled = true;
         r.MaxReprocessAttempts = 3;
-        r.Interval = TimeSpan.FromMinutes(5);
+        r.Interval = TimeSpan.FromMinutes(10);       // Minimum allowed interval
     });
 });
 

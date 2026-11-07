@@ -196,7 +196,7 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         /// <remarks>
         /// Deprecated: prefer <see cref="ConfigureDeadLetterReprocess"/>, which retries from the dead-letter queue on
-        /// a persistent counter without holding the delivery unacknowledged (and therefore without stretching the
+        /// a persistent counter without holding the original delivery open between cycles (without stretching the
         /// broker's consumer timeout). Still fully functional; scheduled for removal in the next major version.
         /// </remarks>
         /// <param name="settings">An action to configure the retry policy.</param>

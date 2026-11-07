@@ -29,9 +29,10 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         /// <remarks>
         /// This counts <b>re-enqueues</b>, not total handler executions. The original delivery is not a reprocess,
-        /// so a value of <c>N</c> means the handler runs up to <c>N + 1</c> times before the message is parked
+        /// so a value of <c>N</c> allows <c>N + 1</c> normal processing deliveries before the message is parked
         /// (1 original delivery + <c>N</c> reprocesses). For example, <c>MaxReprocessAttempts = 1</c> ⇒ the message
-        /// is delivered, fails, re-enqueued once, fails again, and is then parked: 2 executions in total.
+        /// is delivered, fails, re-enqueued once, fails again, and is then parked. In-process retries and broker
+        /// redeliveries can cause additional handler executions.
         /// The minimum is <c>1</c> (an enabled reprocessor always grants at least one retry).
         /// </remarks>
         public int MaxReprocessAttempts
@@ -70,9 +71,9 @@ namespace EasyRabbitFlow.Settings
         /// only if you need an explicit safety ceiling.
         /// </summary>
         /// <remarks>
-        /// The cycle always takes a snapshot of the DLQ length at the start and never reprocesses messages it has
-        /// just re-published within the same cycle, so this property is purely an additional safety cap — not
-        /// required for correctness. Default is <see cref="int.MaxValue"/>.
+        /// The cycle limits fetches to the initial DLQ length and this cap. This bounds work, but concurrent
+        /// consumers/reprocessors can change which messages are fetched; it is not a snapshot of message identities.
+        /// Default is <see cref="int.MaxValue"/>.
         /// </remarks>
         public int MaxMessagesPerCycle
         {

@@ -1,6 +1,6 @@
 ## Observability
 
-EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Everything is zero-cost until a listener subscribes. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
+EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Activity creation depends on listeners and their sampling decisions; logging, header propagation and instrumentation checks still have a cost. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
 
 ```csharp
 builder.Services.AddOpenTelemetry()
@@ -61,13 +61,13 @@ the attempt count, `Redelivered`, `DeliveryCount` and `ReprocessAttempts`, and c
 
 | Instrument | Type | Tags | Description |
 |------------|------|------|-------------|
-| `easyrabbitflow.messages.published` | Counter | `destination` | Messages successfully published (batches count each message) |
-| `easyrabbitflow.messages.publish_failures` | Counter | `destination` | Failed publish operations |
+| `easyrabbitflow.messages.published` | Counter | `destination` | Messages in operations reported successful under the selected routing policy. A failed batch contributes zero even if some messages were delivered |
+| `easyrabbitflow.messages.publish_failures` | Counter | `destination` | Failed publish operations (including mandatory returns); not a count of messages lost |
 | `easyrabbitflow.messages.consumed` | Counter | `queue`, `outcome`, `reason` | Messages reaching a terminal consume state (`success` / `failure`). On failures, `reason` says why: `handler_error`, `timeout` (cooperative handler timeout), `abandoned` (stuck-handler watchdog), `poison` (`MaxBrokerDeliveries` reached), `deserialize` (v8.4.0) |
 | `easyrabbitflow.messages.retried` | Counter | `queue` | In-process retry attempts (transient failures / per-attempt timeouts) |
-| `easyrabbitflow.messages.dead_lettered` | Counter | `queue` | Messages routed to a dead-letter queue |
+| `easyrabbitflow.messages.dead_lettered` | Counter | `queue` | Confirmed envelope publications or native dead-letter requests; native requests do not confirm arrival at the DLQ |
 | `easyrabbitflow.messages.reprocessed` | Counter | `queue` | Messages re-enqueued from the DLQ by the reprocessor |
-| `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Messages moved to the parking queue (`exhausted` / `permanent` / `malformed`) |
+| `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Parking events (`exhausted` / `permanent` / `malformed`): exhausted counts after transfer; permanent/malformed counts before the attempt and can include failures |
 | `easyrabbitflow.messages.discarded` | Counter | `queue`, `reason` | Messages dropped by the reprocessor instead of parked when `FinalAction = Discard` (`exhausted` / `permanent`) |
 | `easyrabbitflow.messages.poisoned` | Counter | `queue` | Deliveries dead-lettered without invoking the handler because the broker had already returned them `MaxBrokerDeliveries` times (`x-delivery-count`, quorum queues) |
 | `easyrabbitflow.consumer.cancellations` | Counter | `queue` | Broker-initiated consumer cancellations (`basic.cancel` with the channel still open: queue deleted, node gone, or a quorum-queue consumer timeout on RabbitMQ 4.3+) that triggered a re-subscribe |
