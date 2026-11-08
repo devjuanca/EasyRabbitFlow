@@ -77,6 +77,23 @@ namespace EasyRabbitFlow.Services
                 var finalAction = (DeadLetterFinalAction)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.FinalAction))!.GetValue(reprocessObj)!;
                 var parkingMessageTtl = (TimeSpan?)rpType.GetProperty(nameof(DeadLetterReprocessSettings<object>.ParkingMessageTtl))!.GetValue(reprocessObj);
 
+                // The parking queue follows the dead-letter queue's type (DeadLetterQueueType, else QueueType, else the
+                // broker default) so parked messages get the same durability guarantees as the DLQ they came from.
+                var autoGenObj = _root.GetService(typeof(AutoGenerateSettings<>).MakeGenericType(marker.ConsumerType));
+
+                QueueType? parkingQueueType = null;
+
+                if (autoGenObj != null)
+                {
+                    var agType = autoGenObj.GetType();
+
+                    var args = agType.GetProperty(nameof(AutoGenerateSettings<object>.Args))?.GetValue(autoGenObj) as IDictionary<string, object?>;
+
+                    parkingQueueType = (agType.GetProperty(nameof(AutoGenerateSettings<object>.DeadLetterQueueType))?.GetValue(autoGenObj) as QueueType?)
+                        ?? (agType.GetProperty(nameof(AutoGenerateSettings<object>.QueueType))?.GetValue(autoGenObj) as QueueType?)
+                        ?? QueueTypeExtensions.FromArgument(args != null && args.TryGetValue("x-queue-type", out var rawQueueType) ? rawQueueType : null);
+                }
+
                 var worker = new DeadLetterReprocessWorker(
                     _logger,
                     connectionFactory,
@@ -87,7 +104,8 @@ namespace EasyRabbitFlow.Services
                     interval: interval,
                     maxMessagesPerCycle: maxMessagesPerCycle,
                     finalAction: finalAction,
-                    parkingMessageTtl: parkingMessageTtl);
+                    parkingMessageTtl: parkingMessageTtl,
+                    parkingQueueType: parkingQueueType);
 
                 _workers.Add(worker);
 
@@ -132,15 +150,17 @@ namespace EasyRabbitFlow.Services
         private readonly int _maxMessagesPerCycle;
         private readonly DeadLetterFinalAction _finalAction;
         private readonly TimeSpan? _parkingMessageTtl;
+        private readonly QueueType? _parkingQueueType;
 
         private Task? _runTask;
 
         private bool _parkingQueueExistsLogged;
 
         // Publisher confirms for the working channel: every re-enqueue/park is a publish-then-ack pair, and we must
-        // know the publish reached the broker before acking it off the DLQ. With tracking enabled BasicPublishAsync
-        // awaits the broker ack and throws on failure, so an unconfirmed publish aborts before the ack and the
-        // message stays safely in the DLQ instead of being lost.
+        // know the destination accepted the publish before acking it off the DLQ. Every publish must also be
+        // mandatory: confirms alone can acknowledge an unroutable message. With tracking enabled a basic.return
+        // throws PublishException (IsReturn), skipping the DLQ ack. Channel disposal requeues unacked originals
+        // for a later cycle, including when the parking queue disappears after its existence check.
         private static readonly CreateChannelOptions ConfirmChannelOptions =
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true);
 
@@ -154,9 +174,11 @@ namespace EasyRabbitFlow.Services
             TimeSpan interval,
             int maxMessagesPerCycle,
             DeadLetterFinalAction finalAction,
-            TimeSpan? parkingMessageTtl)
+            TimeSpan? parkingMessageTtl,
+            QueueType? parkingQueueType = null)
         {
             _logger = logger;
+            _parkingQueueType = parkingQueueType;
             _connectionFactory = connectionFactory;
             _serializerOptions = serializerOptions;
             _consumerName = consumerName;
@@ -308,7 +330,12 @@ namespace EasyRabbitFlow.Services
                 {
                     permanent++;
 
-                    if (_finalAction == DeadLetterFinalAction.Discard)
+                    // A poisoned message (given up on because the broker kept returning it) was never handled, so
+                    // it is parked for inspection even under FinalAction.Discard: discarding it would lose a message
+                    // whose only fault may have been a run of restarts.
+                    var poisoned = envelope.ExceptionType == nameof(RabbitFlowPoisonMessageException);
+
+                    if (_finalAction == DeadLetterFinalAction.Discard && !poisoned)
                     {
                         _logger.LogDebug("[RABBIT-FLOW]: Reprocessor for {Consumer} discarding permanent failure ({ExceptionType}) from {Dlq} (FinalAction=Discard).",
                             _consumerName, envelope.ExceptionType ?? "(unknown)", _deadLetterQueueName);
@@ -341,13 +368,18 @@ namespace EasyRabbitFlow.Services
 
                     try
                     {
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _queueName, mandatory: false, basicProperties: props, body: payload, cancellationToken: ct).ConfigureAwait(false);
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _queueName, mandatory: true, basicProperties: props, body: payload, cancellationToken: ct).ConfigureAwait(false);
 
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
 
                         reenqueued++;
 
                         RabbitFlowDiagnostics.ReprocessedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName));
+                    }
+                    catch (PublishException ex) when (ex.IsReturn)
+                    {
+                        _logger.LogWarning(ex, "[RABBIT-FLOW]: Destination {Queue} could not route the message; leaving original in {Dlq} for a later cycle.", _queueName, _deadLetterQueueName);
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -382,13 +414,18 @@ namespace EasyRabbitFlow.Services
 
                         await EnsureParkingOnceAsync().ConfigureAwait(false);
 
-                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: bytes, cancellationToken: ct).ConfigureAwait(false);
+                        await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: true, basicProperties: parkProps, body: bytes, cancellationToken: ct).ConfigureAwait(false);
 
                         await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
 
                         exhausted++;
 
                         RabbitFlowDiagnostics.ParkedMessages.Add(1, new KeyValuePair<string, object?>("queue", _queueName), new KeyValuePair<string, object?>("reason", "exhausted"));
+                    }
+                    catch (PublishException ex) when (ex.IsReturn)
+                    {
+                        _logger.LogWarning(ex, "[RABBIT-FLOW]: Destination {Parking} could not route the exhausted message; leaving original in {Dlq} for a later cycle.", _parkingQueueName, _deadLetterQueueName);
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -447,16 +484,20 @@ namespace EasyRabbitFlow.Services
                 };
             }
 
+            // Same type as the dead-letter queue it drains; without it the broker's default_queue_type decides.
+            if (_parkingQueueType.HasValue)
+            {
+                arguments ??= new Dictionary<string, object?>();
+
+                arguments["x-queue-type"] = _parkingQueueType.Value.ToArgument();
+            }
+
             await create.QueueDeclareAsync(_parkingQueueName, durable: true, exclusive: false, autoDelete: false, arguments: arguments, cancellationToken: ct).ConfigureAwait(false);
 
-            if (_parkingMessageTtl.HasValue)
-            {
-                _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}' with message TTL {Ttl}.", _parkingQueueName, _parkingMessageTtl.Value);
-            }
-            else
-            {
-                _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}'.", _parkingQueueName);
-            }
+            _logger.LogInformation("[RABBIT-FLOW]: Created parking queue '{Parking}'. Type={Type}, MessageTtl={Ttl}.",
+                _parkingQueueName,
+                _parkingQueueType.HasValue ? _parkingQueueType.Value.ToArgument() : "broker default",
+                _parkingMessageTtl.HasValue ? _parkingMessageTtl.Value.ToString() : "none");
         }
 
         // Discard a message by acking it off the DLQ without re-publishing it anywhere. Returns true on success.
@@ -538,8 +579,12 @@ namespace EasyRabbitFlow.Services
                     ? new BasicProperties(result.BasicProperties) { DeliveryMode = DeliveryModes.Persistent }
                     : new BasicProperties { DeliveryMode = DeliveryModes.Persistent };
 
-                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: false, basicProperties: parkProps, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
+                await channel.BasicPublishAsync(exchange: "", routingKey: _parkingQueueName, mandatory: true, basicProperties: parkProps, body: result.Body, cancellationToken: ct).ConfigureAwait(false);
                 await channel.BasicAckAsync(result.DeliveryTag, false, ct).ConfigureAwait(false);
+            }
+            catch (PublishException ex) when (ex.IsReturn)
+            {
+                _logger.LogWarning(ex, "[RABBIT-FLOW]: Destination {Parking} could not route the message; leaving original in {Dlq} for a later cycle.", _parkingQueueName, _deadLetterQueueName);
             }
             catch (Exception ex)
             {

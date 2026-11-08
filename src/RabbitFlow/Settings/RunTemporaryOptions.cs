@@ -105,11 +105,13 @@ namespace EasyRabbitFlow.Settings
         /// by <see cref="CorrelationId"/> lets any instance of the service find it.
         /// <br/>
         /// It is called on every interval even when nothing changed, which makes it a heartbeat: a stored
-        /// <see cref="TemporaryRunProgress.TimestampUtc"/> that stops advancing means the run or its process is gone.
+        /// <see cref="TemporaryRunProgress.TimestampUtc"/> that stops advancing signals missing reports;
+        /// the run may have stopped, or reporting/storage may be delayed or failing.
         /// Calls never overlap (a slow callback delays the next one instead of piling up), never block message
         /// processing, and an exception is logged without affecting the run. No new call starts once the run begins
         /// to close; the final figures come from the completion callback. The token is the run's own and is canceled
         /// when the run ends: honor it, a call still running when the run closes is waited for at most 5 seconds.
+        /// A non-cooperative callback may finish after completion; stored terminal states should reject late updates.
         /// Null (default) disables progress reporting and adds no overhead.
         /// </summary>
         public Func<TemporaryRunProgress, CancellationToken, Task>? OnProgress { get; set; }

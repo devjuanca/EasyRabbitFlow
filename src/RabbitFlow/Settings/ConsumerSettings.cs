@@ -1,4 +1,5 @@
-﻿using EasyRabbitFlow.Services;
+﻿using EasyRabbitFlow.Exceptions;
+using EasyRabbitFlow.Services;
 using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Linq;
@@ -32,6 +33,8 @@ namespace EasyRabbitFlow.Settings
         ushort PrefetchCount { get; set; }
 
         TimeSpan Timeout { get; set; }
+
+        int? MaxBrokerDeliveries { get; set; }
 
     }
 
@@ -142,26 +145,62 @@ namespace EasyRabbitFlow.Settings
 
 
         /// <summary>
-        /// Gets or sets the timeout duration for processing a single message.
-        /// Default is 30 seconds.
+        /// Gets or sets how long a single handler attempt may run before its <c>CancellationToken</c> is cancelled;
+        /// each in-process retry gets its own <see cref="Timeout"/>. Default is 30 seconds. A value <c>&lt;= 0</c>
+        /// (e.g. <c>Timeout.InfiniteTimeSpan</c>) disables both the handler timeout and the stuck-handler watchdog.
         /// </summary>
         /// <remarks>
         /// When <see cref="AutoGenerate"/> is <c>true</c>, this value (together with the retry policy) drives the
-        /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't kill the consumer while it retries in
-        /// process. That argument only takes effect when the queue is first created: RabbitMQ silently ignores a
-        /// changed <c>x-consumer-timeout</c> when an existing queue is redeclared (no error, no warning), so changing
-        /// <see cref="Timeout"/>, <c>MaxRetryCount</c>, or <c>RetryInterval</c> on a queue that already exists does
-        /// not update it — delete and recreate the queue (or apply a <c>consumer-timeout</c> policy) to change it.
+        /// queue's <c>x-consumer-timeout</c> argument, so the broker doesn't take the delivery back while it is
+        /// retried in process. An <c>x-consumer-timeout</c> in <c>AutoGenerateSettings.Args</c> replaces the derived
+        /// value, so keep it at or above it; with <see cref="AutoGenerate"/> <c>false</c> nothing is declared and the
+        /// queue needs the argument (or a <c>consumer-timeout</c> policy) set by whoever declares it.
+        /// The argument only takes effect when the queue is first created: changing <see cref="Timeout"/>,
+        /// <c>MaxRetryCount</c>, or <c>RetryInterval</c> on a queue that already exists does not update it (classic
+        /// queues on 3.x ignore the new value; quorum queues on 4.x reject it and the consumer adopts the existing
+        /// queue with a warning) — delete and recreate the queue (or apply a <c>consumer-timeout</c> policy) to change it.
         /// The per-queue <c>x-consumer-timeout</c> override requires RabbitMQ 3.12+; on older brokers raise
         /// <c>consumer_timeout</c> at the broker level instead.
         /// </remarks>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 
         /// <summary>
-        /// Configures the retry policy for the consumer.
-        /// The retry policy dictates how the system should handle message consumption failures.
+        /// Maximum number of times the <b>broker</b> may count a returned delivery of the same message before the
+        /// consumer gives up on it: when a message arrives with <c>x-delivery-count</c> at or above this value, the
+        /// handler is not invoked and the message is dead-lettered as a permanent failure
+        /// (<c>RabbitFlowPoisonMessageException</c>; the reprocessor parks it). Default is 5.
         /// </summary>
+        /// <remarks>
+        /// What the broker counts depends on its version. On RabbitMQ 4.0–4.2 every return counts: consumer
+        /// acknowledgement timeout, closed channel or connection, requeue. From 4.3 only failed deliveries count — the
+        /// consumer's channel or connection ends with the delivery unacknowledged (a crash, a dropped connection) —
+        /// while consumer timeouts, cluster partitions and requeues (<c>basic.nack</c>) no longer do: they only raise
+        /// <c>x-acquired-count</c>, which this setting does not read. So on 4.3+ the guard stops crash loops, not a
+        /// message that keeps exceeding the broker's consumer timeout; that case is bounded by <see cref="Timeout"/>,
+        /// whose watchdog dead-letters a stuck handler before the derived broker timeout fires (not when
+        /// <see cref="Timeout"/> is <c>&lt;= 0</c>).
+        /// A delivery the broker takes back goes to the <i>head</i> of its queue and is delivered again first, so a
+        /// message that keeps failing blocks the queue until the broker's own <c>delivery-limit</c> (20 on RabbitMQ 4.x
+        /// quorum queues, computed from the same count) drops it — raw, without the library's envelope. Giving up
+        /// earlier keeps the queue flowing and lands the message in the dead-letter queue with its envelope. Only
+        /// <b>quorum</b> queues carry the header; on
+        /// classic queues there is no count, this setting has no effect, and the handler only sees
+        /// <c>RabbitFlowMessageContext.Redelivered</c>. The library's own in-process retries never requeue, so they
+        /// do not increase the count. <c>null</c> disables the check.
+        /// </remarks>
+        public int? MaxBrokerDeliveries { get; set; } = 5;
+
+        /// <summary>
+        /// Configures the in-process retry policy for the consumer: the handler is invoked again, in the same
+        /// delivery and while it stays unacknowledged, for transient failures.
+        /// </summary>
+        /// <remarks>
+        /// Deprecated: prefer <see cref="ConfigureDeadLetterReprocess"/>, which retries from the dead-letter queue on
+        /// a persistent counter without holding the original delivery open between cycles (without stretching the
+        /// broker's consumer timeout). Still fully functional; scheduled for removal in the next major version.
+        /// </remarks>
         /// <param name="settings">An action to configure the retry policy.</param>
+        [Obsolete("In-process retries are deprecated in favour of the dead-letter reprocessor (ConfigureDeadLetterReprocess); they will be removed in the next major version.")]
         public void ConfigureRetryPolicy(Action<RetryPolicy<TConsumer>> settings)
         {
             var retryPolicy = new RetryPolicy<TConsumer>();
@@ -193,6 +232,11 @@ namespace EasyRabbitFlow.Settings
         // owns the topology and reserved-substring suffixes the framework would append never apply).
         internal void Validate()
         {
+            if (_autoGenerateSettings != null)
+            {
+                ValidateQueueType(_autoGenerateSettings);
+            }
+
             if (DisableNameValidation && !AutoGenerate)
             {
                 return;
@@ -204,6 +248,56 @@ namespace EasyRabbitFlow.Settings
             {
                 RabbitFlowNameRules.ValidateBindingName(_autoGenerateSettings.ExchangeName, nameof(AutoGenerateSettings<TConsumer>.ExchangeName));
                 RabbitFlowNameRules.ValidateBindingName(_autoGenerateSettings.RoutingKey, nameof(AutoGenerateSettings<TConsumer>.RoutingKey));
+            }
+        }
+
+        // Rejects at registration what the broker would reject at declare time, with the reason spelled out: a
+        // quorum queue cannot be exclusive or non-durable, and an explicit QueueType must agree with any
+        // x-queue-type the caller also put in Args (the broker would otherwise get two opinions).
+        private void ValidateQueueType(AutoGenerateSettings<TConsumer> autoGenerate)
+        {
+            object? rawArg = null;
+
+            var hasArg = autoGenerate.Args != null && autoGenerate.Args.TryGetValue("x-queue-type", out rawArg);
+
+            if (autoGenerate.QueueType.HasValue && hasArg)
+            {
+                var argType = rawArg?.ToString();
+
+                if (!string.Equals(argType, autoGenerate.QueueType.Value.ToArgument(), StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new RabbitFlowException(
+                        $"[RABBIT-FLOW]: Consumer for queue '{QueueName}' sets QueueType = {autoGenerate.QueueType.Value} but Args[\"x-queue-type\"] = '{argType}'. " +
+                        "Use one or make them agree.");
+                }
+            }
+
+            // The type given through Args counts the same as the typed property.
+            var mainType = autoGenerate.QueueType ?? (hasArg ? QueueTypeExtensions.FromArgument(rawArg) : null);
+
+            var deadLetterType = autoGenerate.GenerateDeadletterQueue ? (autoGenerate.DeadLetterQueueType ?? mainType) : null;
+
+            var anyQuorum = mainType == Settings.QueueType.Quorum || deadLetterType == Settings.QueueType.Quorum;
+
+            if (mainType == Settings.QueueType.Quorum && autoGenerate.ExclusiveQueue)
+            {
+                throw new RabbitFlowException(
+                    $"[RABBIT-FLOW]: Consumer for queue '{QueueName}' sets QueueType = Quorum with ExclusiveQueue = true. " +
+                    "Quorum queues are replicated and cannot be exclusive to one connection; use QueueType = Classic for exclusive queues.");
+            }
+
+            if (anyQuorum && !autoGenerate.DurableQueue)
+            {
+                throw new RabbitFlowException(
+                    $"[RABBIT-FLOW]: Consumer for queue '{QueueName}' requests a quorum queue with DurableQueue = false. " +
+                    "Quorum queues are always durable; set DurableQueue = true or use QueueType = Classic.");
+            }
+
+            if (anyQuorum && autoGenerate.AutoDeleteQueue)
+            {
+                throw new RabbitFlowException(
+                    $"[RABBIT-FLOW]: Consumer for queue '{QueueName}' requests a quorum queue with AutoDeleteQueue = true. " +
+                    "Quorum queues cannot be auto-delete; set AutoDeleteQueue = false or use QueueType = Classic.");
             }
         }
 

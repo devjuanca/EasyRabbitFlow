@@ -22,7 +22,7 @@ States:
 |-------|---------|
 | `Starting` | Accepted; the first progress report (after one interval) has not arrived yet |
 | `Running` | Last report is recent |
-| `Stale` | Still `Running`, but no report for three intervals: progress is a heartbeat, so the run or its process is gone. Only reachable with a shared store: here the dictionary dies with the process, so this demo never shows it |
+| `Stale` | Still `Running`, but no report for three intervals: progress may have stopped or been delayed. A shared store retains this evidence across process failure; a stalled run or reporter can also become stale within the same process |
 | `Completed` | Final result stored by the completion callback. Stopping the broker mid-run also ends here: `success: false`, with the unprocessed messages counted as failed under a `ConnectionLost` error |
 | `FailedToStart` | `RunAsync` threw before processing anything (e.g. the broker is unreachable) |
 

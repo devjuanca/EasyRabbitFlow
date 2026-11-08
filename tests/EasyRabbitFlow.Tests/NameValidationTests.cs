@@ -15,6 +15,138 @@ public class NameValidationTests
         configurator.AddConsumer<TestConsumer>(queueName, cfg => configure?.Invoke(cfg));
     }
 
+    [Fact]
+    public void ConsumerSettings_QuorumQueueType_WithExclusiveQueue_Throws()
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.QueueType = QueueType.Quorum;
+                ag.ExclusiveQueue = true;
+            });
+        }));
+
+        Assert.Contains("exclusive", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(QueueType.Quorum, null)]
+    [InlineData(null, QueueType.Quorum)]
+    public void ConsumerSettings_QuorumQueueType_WithNonDurableQueue_Throws(QueueType? queueType, QueueType? deadLetterQueueType)
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.QueueType = queueType;
+                ag.DeadLetterQueueType = deadLetterQueueType;
+                ag.DurableQueue = false;
+            });
+        }));
+
+        Assert.Contains("durable", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(QueueType.Quorum, null)]
+    [InlineData(null, QueueType.Quorum)]
+    public void ConsumerSettings_QuorumQueueType_WithAutoDeleteQueue_Throws(QueueType? queueType, QueueType? deadLetterQueueType)
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.QueueType = queueType;
+                ag.DeadLetterQueueType = deadLetterQueueType;
+                ag.AutoDeleteQueue = true;
+            });
+        }));
+
+        Assert.Contains("auto-delete", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ConsumerSettings_QuorumThroughArgsOnly_IsValidatedLikeTheTypedProperty()
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.Args = new Dictionary<string, object?> { ["x-queue-type"] = "quorum" };
+                ag.ExclusiveQueue = true;
+            });
+        }));
+
+        Assert.Contains("exclusive", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ConsumerSettings_QuorumDeadLetter_WithoutDeadLetterQueue_IsNotValidated()
+    {
+        // DeadLetterQueueType only matters when a dead-letter queue is generated.
+        AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.GenerateDeadletterQueue = false;
+                ag.DeadLetterQueueType = QueueType.Quorum;
+                ag.DurableQueue = false;
+                ag.ExclusiveQueue = true;
+            });
+        });
+    }
+
+    [Fact]
+    public void ConsumerSettings_QueueType_ContradictingArgs_Throws()
+    {
+        var ex = Assert.Throws<RabbitFlowException>(() => AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.QueueType = QueueType.Classic;
+                ag.Args = new Dictionary<string, object?> { ["x-queue-type"] = "quorum" };
+            });
+        }));
+
+        Assert.Contains("x-queue-type", ex.Message);
+    }
+
+    [Fact]
+    public void ConsumerSettings_QueueType_AgreeingWithArgs_IsAccepted()
+    {
+        AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.QueueType = QueueType.Quorum;
+                ag.Args = new Dictionary<string, object?> { ["x-queue-type"] = "quorum" };
+            });
+        });
+    }
+
+    [Fact]
+    public void ConsumerSettings_NoQueueType_LeavesBrokerDefaultsAlone()
+    {
+        // null is the backward-compatible default: nothing to validate, nothing sent.
+        AddTestConsumer("orders", cfg =>
+        {
+            cfg.AutoGenerate = true;
+            cfg.ConfigureAutoGenerate(ag =>
+            {
+                ag.ExclusiveQueue = true;
+                ag.DurableQueue = false;
+            });
+        });
+    }
+
     [Theory]
     [InlineData("orders-deadletter")]
     [InlineData("orders-deadletter-extra")]

@@ -1,6 +1,6 @@
 ## Observability
 
-EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Everything is zero-cost until a listener subscribes. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
+EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Activity creation depends on listeners and their sampling decisions; logging, header propagation and instrumentation checks still have a cost. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
 
 ```csharp
 builder.Services.AddOpenTelemetry()
@@ -29,23 +29,53 @@ Notes:
 - Messages replayed by the [Dead-Letter Reprocessor](dead-letter.md#dead-letter-reprocessor) keep their original `traceparent` (captured in the envelope), so the replay links back to the original trace.
 - This complements (does not replace) `CorrelationId`, which remains a first-class AMQP property.
 
+Span attributes follow the OpenTelemetry messaging conventions: `messaging.system`, `messaging.operation.type`
+(`send` / `process`) and `messaging.operation.name` (plus the legacy `messaging.operation`), `messaging.destination.name`,
+`messaging.rabbitmq.destination.routing_key`, `messaging.message.id`, `messaging.message.conversation_id`,
+`messaging.batch.message_count`, and on the consumer side `messaging.rabbitmq.message.delivery_tag`,
+`messaging.rabbitmq.message.redelivered` and `messaging.rabbitmq.message.delivery_count` (quorum queues).
+A failed publish or delivery sets the span status to error, the `error.type` attribute (the exception's full type name)
+and an `exception` event with `exception.type`, `exception.message` and `exception.stacktrace`, so the failure shows up
+with its stack in the tracing backend (v8.4.0).
+
+### Logging
+
+All library log lines start with `[RABBIT-FLOW]:` and use structured templates (`{Queue}`, `{Consumer}`, `{MessageId}`, …),
+so a log platform can filter on the prefix and facet on the fields. Levels:
+
+| Level | What |
+|---|---|
+| `Error` | A delivery that is dead-lettered (handler exception after the last attempt, deserialization failure, abandoned handler), a dead-letter envelope that could not be written or that stays unroutable after the dead-letter topology was re-declared (the message goes back to the queue), a failed re-declare of that topology, a recovery that keeps failing (third attempt onwards), a temporary-run handler that throws, broker callback exceptions |
+| `Warning` | A retried attempt (transient failure or cooperative timeout), a poison message given up on, a broker-initiated consumer cancel, channel/connection shutdown, the first recovery attempts, a dead-letter envelope returned by the broker as unroutable (before the re-declare), a shutdown that could not get hold of a running recovery in time, topology adopted with different arguments, per-message timeouts and cancellations inside a temporary run |
+| `Information` | Startup facts (reprocessor enabled, parking queue created), a successful recovery, reprocessor cycle summaries |
+| `Debug` | Each publish, reprocessor details |
+
+**Every delivery is processed inside a log scope** carrying `Queue`, `Consumer`, `MessageId`, `CorrelationId` and
+`DeliveryTag` (v8.4.0). Logging providers that render scopes (Serilog with `IncludeScopes`, the Datadog and OpenTelemetry
+log enrichers, the console logger with `IncludeScopes = true`) attach those fields to **the handler's own log lines** as well
+as the library's, so a handler's `logger.LogWarning("payment declined")` can be tied back to its queue and message without
+a tracer. The terminal failure line names the reason (`handler_error`, `timeout`, `abandoned`, `poison`, `deserialize`),
+the attempt count, `Redelivered`, `DeliveryCount` and `ReprocessAttempts`, and carries the exception.
+
 ### Metrics
 
 | Instrument | Type | Tags | Description |
 |------------|------|------|-------------|
-| `easyrabbitflow.messages.published` | Counter | `destination` | Messages successfully published (batches count each message) |
-| `easyrabbitflow.messages.publish_failures` | Counter | `destination` | Failed publish operations |
-| `easyrabbitflow.messages.consumed` | Counter | `queue`, `outcome` | Messages reaching a terminal consume state (`success` / `failure`) |
+| `easyrabbitflow.messages.published` | Counter | `destination` | Messages in operations reported successful under the selected routing policy. A failed batch contributes zero even if some messages were delivered |
+| `easyrabbitflow.messages.publish_failures` | Counter | `destination` | Failed publish operations (including mandatory returns); not a count of messages lost |
+| `easyrabbitflow.messages.consumed` | Counter | `queue`, `outcome`, `reason` | Messages reaching a terminal consume state (`success` / `failure`). On failures, `reason` says why: `handler_error`, `timeout` (cooperative handler timeout), `abandoned` (stuck-handler watchdog), `poison` (`MaxBrokerDeliveries` reached), `deserialize` (v8.4.0) |
 | `easyrabbitflow.messages.retried` | Counter | `queue` | In-process retry attempts (transient failures / per-attempt timeouts) |
-| `easyrabbitflow.messages.dead_lettered` | Counter | `queue` | Messages routed to a dead-letter queue |
+| `easyrabbitflow.messages.dead_lettered` | Counter | `queue` | Confirmed envelope publications or native dead-letter requests; native requests do not confirm arrival at the DLQ |
 | `easyrabbitflow.messages.reprocessed` | Counter | `queue` | Messages re-enqueued from the DLQ by the reprocessor |
-| `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Messages moved to the parking queue (`exhausted` / `permanent` / `malformed`) |
+| `easyrabbitflow.messages.parked` | Counter | `queue`, `reason` | Parking events (`exhausted` / `permanent` / `malformed`): exhausted counts after transfer; permanent/malformed counts before the attempt and can include failures |
 | `easyrabbitflow.messages.discarded` | Counter | `queue`, `reason` | Messages dropped by the reprocessor instead of parked when `FinalAction = Discard` (`exhausted` / `permanent`) |
+| `easyrabbitflow.messages.poisoned` | Counter | `queue` | Deliveries dead-lettered without invoking the handler because the broker had already returned them `MaxBrokerDeliveries` times (`x-delivery-count`, quorum queues) |
+| `easyrabbitflow.consumer.cancellations` | Counter | `queue` | Broker-initiated consumer cancellations (`basic.cancel` with the channel still open: queue deleted, node gone, or a quorum-queue consumer timeout on RabbitMQ 4.3+) that triggered a re-subscribe |
 | `easyrabbitflow.consumer.message.duration` | Histogram (s) | `queue`, `outcome` | End-to-end processing time per delivery, including in-process retries |
 
 A handler abandoned by the [stuck-handler watchdog](consumers.md#consumer-timeout) shows up as
-`messages.consumed{outcome=failure}` plus `messages.dead_lettered` — there is no dedicated watchdog metric,
-but the accompanying error log identifies the abandonment.
+`messages.consumed{outcome=failure, reason=abandoned}` plus `messages.dead_lettered`, with an `Error` log line and a
+`RabbitFlowHandlerAbandonedException` in the dead-letter envelope.
 
 ### Health Check
 

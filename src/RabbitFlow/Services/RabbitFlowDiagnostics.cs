@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
@@ -59,6 +60,12 @@ namespace EasyRabbitFlow.Services
         internal static readonly Counter<long> DiscardedMessages = Meter.CreateCounter<long>(
             "easyrabbitflow.messages.discarded", "{message}", "Messages permanently dropped by the reprocessor instead of being parked (tag 'reason' = exhausted | permanent).");
 
+        internal static readonly Counter<long> PoisonedMessages = Meter.CreateCounter<long>(
+            "easyrabbitflow.messages.poisoned", "{message}", "Deliveries dead-lettered without invoking the handler because the broker had already returned them MaxBrokerDeliveries times (x-delivery-count).");
+
+        internal static readonly Counter<long> ConsumerCancellations = Meter.CreateCounter<long>(
+            "easyrabbitflow.consumer.cancellations", "{cancellation}", "Broker-initiated consumer cancellations (basic.cancel with the channel still open) that triggered a re-subscribe.");
+
         internal static readonly Histogram<double> ConsumeDuration = Meter.CreateHistogram<double>(
             "easyrabbitflow.consumer.message.duration", "s", "End-to-end processing time per delivered message, including in-process retries.");
 
@@ -75,7 +82,10 @@ namespace EasyRabbitFlow.Services
             if (activity != null)
             {
                 activity.SetTag("messaging.system", "rabbitmq");
+                // Both the legacy attribute and the current OpenTelemetry messaging convention names.
                 activity.SetTag("messaging.operation", "publish");
+                activity.SetTag("messaging.operation.type", "send");
+                activity.SetTag("messaging.operation.name", "publish");
                 activity.SetTag("messaging.destination.name", destination);
 
                 if (!string.IsNullOrEmpty(routingKey))
@@ -102,7 +112,7 @@ namespace EasyRabbitFlow.Services
             return activity;
         }
 
-        internal static Activity? StartProcess(string queueName, IDictionary<string, object?>? headers, string? messageId, string? correlationId, bool redelivered)
+        internal static Activity? StartProcess(string queueName, IDictionary<string, object?>? headers, string? messageId, string? correlationId, bool redelivered, ulong deliveryTag, int? deliveryCount)
         {
             var parentContext = ExtractContext(headers);
 
@@ -112,7 +122,10 @@ namespace EasyRabbitFlow.Services
             {
                 activity.SetTag("messaging.system", "rabbitmq");
                 activity.SetTag("messaging.operation", "process");
+                activity.SetTag("messaging.operation.type", "process");
+                activity.SetTag("messaging.operation.name", "process");
                 activity.SetTag("messaging.destination.name", queueName);
+                activity.SetTag("messaging.rabbitmq.message.delivery_tag", deliveryTag);
 
                 if (messageId != null)
                 {
@@ -128,9 +141,40 @@ namespace EasyRabbitFlow.Services
                 {
                     activity.SetTag("messaging.rabbitmq.message.redelivered", true);
                 }
+
+                if (deliveryCount.HasValue)
+                {
+                    activity.SetTag("messaging.rabbitmq.message.delivery_count", deliveryCount.Value);
+                }
             }
 
             return activity;
+        }
+
+        /// <summary>
+        /// Marks the activity as failed the way tracing backends expect: error status, the <c>error.type</c>
+        /// attribute and an <c>exception</c> event carrying type, message and stack trace. Uses
+        /// <see cref="ActivityEvent"/> rather than newer helpers so it behaves identically on netstandard2.1 and net8.0.
+        /// </summary>
+        internal static void RecordFailure(Activity? activity, Exception exception)
+        {
+            if (activity == null)
+            {
+                return;
+            }
+
+            var type = exception.GetType().FullName ?? exception.GetType().Name;
+
+            activity.SetStatus(ActivityStatusCode.Error, exception.Message);
+
+            activity.SetTag("error.type", type);
+
+            activity.AddEvent(new ActivityEvent("exception", tags: new ActivityTagsCollection
+            {
+                ["exception.type"] = type,
+                ["exception.message"] = exception.Message,
+                ["exception.stacktrace"] = exception.ToString()
+            }));
         }
 
         /// <summary>

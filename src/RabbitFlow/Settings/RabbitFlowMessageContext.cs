@@ -18,6 +18,7 @@ namespace EasyRabbitFlow.Settings
             ulong deliveryTag,
             bool redelivered,
             int reprocessAttempts,
+            int? deliveryCount,
             MessageDeliveryMode? deliveryMode,
             string? type,
             string? appId,
@@ -35,6 +36,7 @@ namespace EasyRabbitFlow.Settings
             DeliveryTag = deliveryTag;
             Redelivered = redelivered;
             ReprocessAttempts = reprocessAttempts;
+            DeliveryCount = deliveryCount;
             DeliveryMode = deliveryMode;
             Type = type;
             AppId = appId;
@@ -94,6 +96,18 @@ namespace EasyRabbitFlow.Settings
         public int ReprocessAttempts { get; }
 
         /// <summary>
+        /// Number of returns of this delivery the <b>broker</b> counted before handing it over again, from the
+        /// <c>x-delivery-count</c> header that <b>quorum</b> queues set on redeliveries. On RabbitMQ 4.0–4.2 every
+        /// return counts (consumer timeout, closed channel or connection, requeue); from 4.3 only failed deliveries
+        /// do (a crash, a dropped connection), so a redelivery after a consumer timeout or a requeue arrives with
+        /// <see cref="Redelivered"/> set and the count unchanged. <c>null</c> on the first delivery and always on classic
+        /// queues, which only expose <see cref="Redelivered"/>. Unrelated to <see cref="ReprocessAttempts"/>, which
+        /// counts re-enqueues by the dead-letter reprocessor. Use it to make side effects idempotent on retries;
+        /// the consumer itself stops invoking the handler once it reaches <c>ConsumerSettings.MaxBrokerDeliveries</c>.
+        /// </summary>
+        public int? DeliveryCount { get; }
+
+        /// <summary>
         /// AMQP <c>delivery-mode</c>. <c>null</c> when the publisher did not set it explicitly
         /// (the broker treats absent as <see cref="MessageDeliveryMode.Transient"/>).
         /// </summary>
@@ -118,9 +132,9 @@ namespace EasyRabbitFlow.Settings
         public TimeSpan? Expiration { get; }
 
         /// <summary>
-        /// AMQP <c>priority</c> property (0–9). <c>null</c> when not set on the wire.
-        /// Only meaningful on priority queues — declare the queue via
-        /// <see cref="AutoGenerateSettings{TConsumer}.MaxPriority"/> for the broker to honor it.
+        /// AMQP <c>priority</c> property; supported levels depend on queue type and broker version. <c>null</c> when not set on the wire.
+        /// Classic queues require declaration via
+        /// <see cref="AutoGenerateSettings{TConsumer}.MaxPriority"/> for the broker to honor it. Quorum queues use built-in priority behavior.
         /// </summary>
         public byte? Priority { get; }
 

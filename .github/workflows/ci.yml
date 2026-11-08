@@ -5,6 +5,14 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  # Manual run: the same matrix, optionally with the broker-dependent consumer timeout test, which stays out
+  # of the push/PR runs because whether a quorum queue fires its consumer timeout is not deterministic.
+  workflow_dispatch:
+    inputs:
+      broker_timeout_tests:
+        description: "Also run the broker-dependent consumer timeout test (RABBITFLOW_BROKER_TIMEOUT_TESTS=1; minutes long, may need a retry)"
+        type: boolean
+        default: true
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
@@ -17,11 +25,23 @@ jobs:
       fail-fast: false
       matrix:
         # Run the integration suite against a 3.x and a 4.x RabbitMQ image
-        # to cover both major versions still in use.
+        # to cover both major versions still in use, plus a 4.x broker whose
+        # default queue type is quorum (default_queue_type = quorum): every
+        # auto-generated queue becomes a quorum queue there, which is where
+        # 4.3+ enforces consumer timeouts and delivery limits.
+        # 4.3.7 rather than an earlier 4.3.x: the quorum-queue consumer timeout
+        # fired unreliably on 4.3.2 in our slow test and 4.3.7 also ships
+        # consumer_timeout_response; 4.4.0 adds a second quorum-default leg.
         rabbitmq:
           - rabbitmq:3.13.7-management
-          - rabbitmq:4.3.2-management
-    name: build_and_test (${{ matrix.rabbitmq }})
+          - rabbitmq:4.3.7-management
+        default_queue_type: [classic]
+        include:
+          - rabbitmq: rabbitmq:4.3.7-management
+            default_queue_type: quorum
+          - rabbitmq: rabbitmq:4.4.0-management
+            default_queue_type: quorum
+    name: build_and_test (${{ matrix.rabbitmq }}, default ${{ matrix.default_queue_type }})
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +57,18 @@ jobs:
 
       # Integration tests run against a real RabbitMQ broker via Testcontainers
       # (Docker is preinstalled on ubuntu-latest runners). RABBITMQ_IMAGE selects
-      # the broker version the RabbitMqFixture spins up for this matrix leg.
+      # the broker version the RabbitMqFixture spins up for this matrix leg;
+      # RABBITMQ_DEFAULT_QUEUE_TYPE=quorum makes the fixture configure the broker
+      # with default_queue_type = quorum. RABBITFLOW_SLOW_TESTS enables the
+      # slow (tens of seconds) but deterministic tests, such as the bounded
+      # shutdown with a stuck handler. The broker-dependent consumer timeout
+      # test (RABBITFLOW_BROKER_TIMEOUT_TESTS) only runs on a manual dispatch
+      # that asks for it: whether a quorum queue fires its consumer timeout
+      # proved non-deterministic across runs.
       - name: Test
         env:
           RABBITMQ_IMAGE: ${{ matrix.rabbitmq }}
+          RABBITMQ_DEFAULT_QUEUE_TYPE: ${{ matrix.default_queue_type }}
+          RABBITFLOW_SLOW_TESTS: ${{ matrix.default_queue_type == 'quorum' && '1' || '' }}
+          RABBITFLOW_BROKER_TIMEOUT_TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.broker_timeout_tests && '1' || '' }}
         run: dotnet test tests/EasyRabbitFlow.Tests --configuration Release --no-build --logger "console;verbosity=normal"

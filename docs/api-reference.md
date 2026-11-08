@@ -48,6 +48,27 @@ IHealthChecksBuilder AddRabbitFlow(this IHealthChecksBuilder builder,
 | `DeclareExchange(string exchangeName, ExchangeType exchangeType = ExchangeType.Direct, Action<ExchangeDeclaration>? configure = null)` | Declare an application-owned exchange at startup, no consumer required. Throws `RabbitFlowException` on an empty name, a name containing `deadletter`, or a duplicate declaration — see [Configuration](configuration.md#application-owned-exchanges) |
 | `AddConsumer<TConsumer>(string queueName, Action<ConsumerSettings<TConsumer>>)` | Register a consumer |
 
+### ConsumerSettings Methods
+
+| Method | Description |
+|--------|-------------|
+| `ConfigureAutoGenerate(Action<AutoGenerateSettings<TConsumer>>)` | Topology to declare: exchange, dead-letter queue, [queue types](consumers.md#queue-types), replicas |
+| `ConfigureDeadLetterReprocess(Action<DeadLetterReprocessSettings<TConsumer>>)` | Retry failed messages from the dead-letter queue — see [Dead-Letter Reprocessor](dead-letter.md#dead-letter-reprocessor) |
+| `ConfigureRetryPolicy(Action<RetryPolicy<TConsumer>>)` | **Obsolete since v8.4.0** (removed in the next major): in-process retries. Prefer the reprocessor |
+
+Notable properties: `Timeout` (per-attempt handler timeout, `<= 0` = none), `PrefetchCount`, `AutoAckOnError`, `ExtendDeadletterMessage`, `UnwrapDeadLetterEnvelopes`, `MaxBrokerDeliveries` (poison guard on quorum queues, default 5). See [Registering Consumers](consumers.md#registering-consumers).
+
+### Exceptions
+
+| Type | Thrown / used when |
+|------|--------------------|
+| `RabbitFlowException` | Configuration errors at registration (reserved names, invalid queue-type combinations), broker rejections surfaced by the library |
+| `RabbitFlowTransientException` | Base type a handler throws to mark a failure as transient (retried by the reprocessor); derived types inherit the classification |
+| `RabbitFlowHandlerAbandonedException` | Written to the dead-letter envelope when a handler ignored its cancellation token and was abandoned by the watchdog (permanent) |
+| `RabbitFlowPoisonMessageException` | Written to the dead-letter envelope when the broker had returned a delivery `MaxBrokerDeliveries` times and the handler was not invoked (permanent, always parked) |
+| `RabbitFlowOverRetriesException` | Legacy compatibility type; no longer thrown by the retry path |
+| `RabbitFlowUnroutableMessageException` | Returned in publish result `Error` when `Mandatory = true` and the broker returns a message; includes exchange, routing key and broker reply details |
+
 ---
 
 ## Performance Notes
@@ -68,10 +89,12 @@ cfg.AddConsumer<MyConsumer>("high-volume-queue", c =>
 {
     c.PrefetchCount = 50;                          // Process 50 messages concurrently
     c.Timeout = TimeSpan.FromSeconds(60);          // Generous timeout for heavy processing
-    c.ConfigureRetryPolicy(r =>
+    c.AutoGenerate = true;
+    c.ConfigureDeadLetterReprocess(r =>            // Retries come from the DLQ, never in-process
     {
-        r.MaxRetryCount = 3;
-        r.RetryInterval = 500;                     // Fixed, ephemeral delay between retries
+        r.Enabled = true;
+        r.MaxReprocessAttempts = 3;
+        r.Interval = TimeSpan.FromMinutes(10);       // Minimum allowed interval
     });
 });
 

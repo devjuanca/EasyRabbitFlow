@@ -17,6 +17,26 @@
 
 ---
 
+## What's New in v8.4
+
+- **Opt-in mandatory publishing** — `PublishOptions.Mandatory` defaults to `false`, preserving broadcasts with no subscribers. Set it to `true` for single messages or batches to report unroutable publications through a failed result with `RabbitFlowUnroutableMessageException`. Transactional returns detected at commit cannot undo messages already routed. See [Mandatory routing](docs/publishing.md#mandatory-routing).
+- **Consumers survive a broker-initiated cancel** — when the broker cancels a consumer without closing its channel (queue deleted, hosting node gone, or a RabbitMQ 4.3+ quorum queue hitting its consumer acknowledgement timeout), the consumer now rebuilds its channel, re-declares its topology and re-subscribes by itself, serialized with the existing recovery so there is never a second consumer on the queue. Previously the consumer silently stopped receiving until the process restarted. New metric `easyrabbitflow.consumer.cancellations`. See [Channel & connection recovery](docs/consumers.md#channel--connection-recovery).
+- **Explicit queue type** — `ConfigureAutoGenerate` gains `QueueType` (`Classic` / `Quorum`, sent as `x-queue-type` for the main queue) and `DeadLetterQueueType` (dead-letter and parking queues). `null`, the default, keeps the previous behavior where the broker's `default_queue_type` decides — set it explicitly on business queues so a broker whose default changes to quorum cannot change the queue type under the consumer. Quorum is validated at registration (durable, not exclusive, not auto-delete). An existing queue of another type — main or dead-letter — is adopted with a warning, never converted. See [Queue types](docs/consumers.md#queue-types).
+- **No broker timeout for unbounded handlers** — `Timeout <= 0` (e.g. `Timeout.InfiniteTimeSpan`) no longer derives a 60s `x-consumer-timeout`; the argument is simply not sent. See [Consumer Timeout](docs/consumers.md#consumer-timeout).
+- **Poison-message guard on quorum queues** — `ConsumerSettings.MaxBrokerDeliveries` (default 5): a redelivered message the broker has already counted that many returns of (`x-delivery-count`: every return on RabbitMQ 4.0–4.2; from 4.3 only failed deliveries such as crashes and dropped connections, not consumer timeouts or requeues) is dead-lettered with its envelope without invoking the handler and parked by the reprocessor (never discarded), instead of going back to the head of the queue until the broker's `delivery-limit` drops it raw. Only acts when the auto-generated dead-letter queue exists and `AutoAckOnError` is off, so it can never drop a message. `RabbitFlowMessageContext.DeliveryCount` exposes the broker's count to handlers (`null` on classic queues, which only flag `Redelivered`). See [Message Context](docs/consumers.md#message-context).
+- **In-process retries deprecated** — `ConfigureRetryPolicy` is marked `[Obsolete]` (still functional, removed in the next major): retry from the dead-letter queue with `ConfigureDeadLetterReprocess`, which keeps a persistent counter without holding the original delivery open between cycles. See [Retry Policies](docs/consumers.md#retry-policies).
+- **Failures are visible in logs and traces** — a dead-lettered delivery now logs one `Error` line with the message id, correlation id, consumer, attempts, reason (`handler_error` / `timeout` / `abandoned` / `poison` / `deserialize`) and the exception; every delivery runs inside a log scope (`Queue`, `Consumer`, `MessageId`, `CorrelationId`, `DeliveryTag`) that log providers attach to the handler's own lines; failed spans carry `error.type` and an `exception` event; `messages.consumed{outcome=failure}` gains a `reason` tag. Retry attempts and the first recovery attempts log at `Warning` instead of `Error`; temporary-run log lines use the same `[RABBIT-FLOW]:` prefix as the rest. An abandoned handler surfaces as `RabbitFlowHandlerAbandonedException` (a `RabbitFlowException`). See [Observability](docs/observability.md).
+- **Dependencies** — RabbitMQ.Client 7.1.2 → 7.2.2; the explicit `Microsoft.SourceLink.GitHub` reference is gone (Source Link ships with the .NET 8+ SDK), which also drops a transitive `Microsoft.Build.Tasks.Git` with a moderate advisory.
+- **Temporary queues declared classic explicitly** — `IRabbitFlowTemporary` now sends `x-queue-type = classic` (the only type that can be exclusive and non-durable), so the temporary queue's type no longer depends on the broker's `default_queue_type`.
+- **Faster recovery after a forced disconnect** — the dead channel is now disposed off the recovery path, removing the 20s `ContinuationTimeout` wait that every broker-forced close added before the consumer came back.
+- **Bounded shutdown with stuck handlers** — a delivery waiting for a prefetch slot no longer keeps the channel from closing when the slot is held by a handler that ignores cancellation; `StopAsync` completes after its 30s drain instead of waiting for the watchdog. A recovery pass running at shutdown (backoff while the broker is down) is cancelled by the stop and waited for at most 10s, or until the host's shutdown token fires, instead of indefinitely.
+- **A deleted dead-letter queue no longer loses failed messages** — the dead-letter envelope is published mandatory; when the broker returns it as unroutable (the DLQ or its binding is gone), the consumer re-declares the dead-letter topology and publishes again, and returns the message to the queue if the envelope still has no route. Before, the publisher confirm of the dropped envelope was taken as success and the original acked. See [Dead-Letter Handling](docs/dead-letter.md).
+- **Recovery requests are never lost** — a `basic.cancel` or a channel shutdown that arrives while another recovery pass is finishing used to be recorded and then forgotten if the running pass had already made its last check, leaving the consumer unsubscribed until the next broker event; the pass now hands such a request to a new one on its way out.
+- **Broker timeout covers every attempt's grace** — the derived `x-consumer-timeout` budgets the 30s watchdog grace once per attempt, not once per delivery (a handler that honours cancellation slowly can take `Timeout + 30s` on each retried attempt), plus 10s for dead-lettering after the last one. See [Consumer Timeout](docs/consumers.md#consumer-timeout).
+- **Tested against quorum-by-default brokers** — the integration suite also runs on RabbitMQ 4.3.7 and 4.4.0 with `default_queue_type = quorum` (slow deterministic tests behind `RABBITFLOW_SLOW_TESTS=1`), plus a broker-dependent test that waits for a real quorum-queue consumer timeout (`RABBITFLOW_BROKER_TIMEOUT_TESTS=1`; minutes long and not deterministic, so it is left out of push/PR runs and only runs on a manual dispatch of the CI workflow with the `broker_timeout_tests` input enabled, or locally).
+
+---
+
 ## What's New in v8.3
 
 - **Temporary runs over asynchronous sources** — `IRabbitFlowTemporary.RunAsync` accepts an `IAsyncEnumerable<T>` (three new overloads, mirroring the collection ones): elements are published and processed as the source yields them, without materializing it, and the run completes once the source ends and the observed messages finish. Cancellation, `RunTimeout` or a broker connection loss interrupt the source and return a partial result. See [Asynchronous Sources](docs/temporary-processing.md#asynchronous-sources-iasyncenumerablet).
@@ -59,12 +79,12 @@ builder.Services.AddRabbitFlow(cfg =>
 
 - **OpenTelemetry-ready observability** — `ActivitySource` spans with W3C trace-context propagation across the broker, a `Meter` with message counters and a processing-duration histogram, and a native health check. See [Observability](docs/observability.md).
 - **Richer temporary batch processing** — `RunAsync` now returns a `TemporaryRunResult` with full counters and per-error detail, supports a whole-run `RunTimeout`, and ends early (instead of hanging) when the broker connection drops. See [Temporary Batch Processing](docs/temporary-processing.md).
-- **Hardened dead-letter path** — failed messages are written with **publisher confirms** (never silently lost), the envelope captures and restores the original AMQP properties on replay, and the reprocessor parks non-reprocessable messages instead of churning the DLQ. See [Dead-Letter Handling](docs/dead-letter.md).
+- **Hardened dead-letter path** — failed messages are written with **publisher confirms** before acknowledging the original (see the documented fallback and durability limits), the envelope captures and restores the original AMQP properties on replay, and the reprocessor parks non-reprocessable messages instead of churning the DLQ. See [Dead-Letter Handling](docs/dead-letter.md).
 - **Fixed-interval, transient-only retry** — the in-handler `RetryPolicy` is now a constant `RetryInterval` scoped to short transient failures (exponential backoff removed); long recovery windows belong to the reprocessor. See [Retry Policies](docs/consumers.md#retry-policies) and [Transient Exceptions](docs/transient-exceptions.md).
 - **Queue state inspection & health check** — a single-round-trip `QueueState` snapshot API and an `AddHealthChecks().AddRabbitFlow()` probe. See [Queue Operations](docs/queue-operations.md).
 - **Multi-targeting** — `netstandard2.1` (works on .NET 6/7+) and `net8.0`.
 
-See the [Breaking Changes](#️-breaking-changes-v800) section below before upgrading.
+See the [Breaking Changes](#breaking-changes-v800) section below before upgrading.
 
 ---
 
@@ -72,10 +92,14 @@ See the [Breaking Changes](#️-breaking-changes-v800) section below before upgr
 
 EasyRabbitFlow works against **RabbitMQ 3.13+ and 4.x**. RabbitMQ 4.x introduced a few server-side changes that affect queue declaration; here's how the library handles them:
 
-- **`x-consumer-timeout` on classic queues (4.x rejects it).** In 4.x, *classic queues no longer evaluate consumer timeouts* — the `x-consumer-timeout` argument is only valid for quorum queues/streams, and declaring a classic queue with it fails (`PRECONDITION_FAILED - invalid arg 'x-consumer-timeout' ... of queue type rabbit_classic_queue`). Older releases of this library always set that argument on the auto-generated queue, so on RabbitMQ 4.x the main queue could not be created. **Fixed in v8.0.0-rc.2:** when the broker rejects the argument, the consumer logs a warning, **re-declares the queue without `x-consumer-timeout`, and continues** — so `AutoGenerate` works on both 3.x and 4.x with no code change.
-  - Your per-message handler timeout (`ConsumerSettings.Timeout`) is **unaffected**: it is enforced by the library itself (a `CancellationToken`), not by the broker. On 4.x classic queues the broker no longer kills a consumer for a slow ack at all; if you need a broker-side per-queue timeout, use a quorum queue with a `consumer_timeout` policy.
+- **`x-consumer-timeout` on classic queues (4.x rejects it).** RabbitMQ 4.x only accepts the `x-consumer-timeout` queue argument on quorum queues; declaring a classic queue with it fails (`PRECONDITION_FAILED - invalid arg 'x-consumer-timeout' ... of queue type rabbit_classic_queue`). Older releases of this library always set that argument on the auto-generated queue, so on RabbitMQ 4.x the main queue could not be created. **Fixed in v8.0.0-rc.3** (first stable release with the fix: 8.0.0): when the broker rejects the argument, the consumer logs a warning, **re-declares the queue without `x-consumer-timeout`, and continues** — so `AutoGenerate` works on both 3.x and 4.x with no code change.
+  - Your per-message handler timeout (`ConsumerSettings.Timeout`) is **unaffected**: it is enforced by the library itself (a `CancellationToken`), not by the broker. On classic queues the broker-wide `consumer_timeout` still applies on 4.0–4.2, and from 4.3 classic queues have no consumer timeout at all. If you need a broker-side per-queue timeout, use a quorum queue (`QueueType = QueueType.Quorum`), where the derived `x-consumer-timeout` is accepted.
 
-- **Transient non-exclusive queues are denied by default (`transient_nonexcl_queues`).** RabbitMQ 4.x rejects queues that are **both non-durable and non-exclusive** (`INTERNAL_ERROR - Feature 'transient_nonexcl_queues' is deprecated`). The library's default is `DurableQueue = true`, so the default configuration is safe. **Only if you explicitly set `DurableQueue = false`** on a consumer will 4.x reject it — keep the queue durable (recommended) or enable `deprecated_features.permit.transient_nonexcl_queues = true` on the broker. Temporary queues created via `IRabbitFlowTemporary` are **exclusive**, so they are unaffected.
+- **Quorum queues and consumer timeouts (4.3+).** On RabbitMQ 4.3+ a quorum queue that hits its consumer acknowledgement timeout **cancels the consumer** (`basic.cancel`) instead of closing the channel. Since v8.4.0 the consumer re-subscribes on its own; earlier versions stayed attached to a channel that delivered nothing until the process restarted. The broker setting `consumer_timeout_response = close_channel` (4.3.7+) restores the pre-4.3 behavior if you must stay on an older library version. See [Consumer Timeout](docs/consumers.md#consumer-timeout).
+
+- **Brokers with `default_queue_type = quorum`.** A cluster or vhost configured that way turns every queue declared without `x-queue-type` — all auto-generated queues before v8.4.0 — into a quorum queue. Set `QueueType` explicitly to keep the type under the application's control. See [Queue types](docs/consumers.md#queue-types).
+
+- **Transient non-exclusive queues are denied by default (`transient_nonexcl_queues`).** RabbitMQ 4.3+ rejects queues that are **both non-durable and non-exclusive** by default (`INTERNAL_ERROR - Feature 'transient_nonexcl_queues' is deprecated`). The library's default is `DurableQueue = true`, so the default configuration is safe. **Only if you explicitly set `DurableQueue = false`** on a consumer will 4.3+ reject it by default — keep the queue durable (recommended) or enable `deprecated_features.permit.transient_nonexcl_queues = true` on the broker. Temporary queues created via `IRabbitFlowTemporary` are **exclusive**, so they are unaffected — and since v8.4.0 they are declared explicitly **classic** (`x-queue-type = classic`), so a broker with `default_queue_type = quorum` cannot change their type (quorum queues cannot be exclusive anyway). See [Queue type and broker versions](docs/temporary-processing.md#queue-type-and-broker-versions).
 
 - **Not affected:** the library uses per-consumer QoS (`global: false`), so the deprecation of global QoS does not apply, and it never sets the removed CQv1 arguments (`x-queue-mode`, `x-queue-version = 1`).
 
@@ -133,7 +157,7 @@ EasyRabbitFlow registers a small set of services through `AddRabbitFlow(...)`. I
 
 | Service | Lifetime | What it does |
 |---------|----------|--------------|
-| [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (atomic transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
+| [`IRabbitFlowPublisher`](docs/publishing.md) | Singleton | Publishes single messages (with publisher confirms) or batches (transactional / individually confirmed). Returns a rich `PublishResult` / `BatchPublishResult`, and supports `MessageId`, `CorrelationId`, and per-call AMQP options. |
 | [`IRabbitFlowConsumer<TEvent>`](docs/consumers.md) | Transient | The interface **you** implement. Each consumer's `HandleAsync` receives the deserialized event, a `RabbitFlowMessageContext` (metadata), and a `CancellationToken`. Registered with `AddConsumer<TConsumer>(...)`, resolved per message from a fresh DI scope, and run by the hosted service. |
 | [`IRabbitFlowTemporary`](docs/temporary-processing.md) | Singleton | Collection or asynchronous-source processing over an automatically managed temporary queue. `RunAsync` returns counters, per-error detail and asynchronous source completion state. |
 | [`IRabbitFlowState`](docs/queue-operations.md) | Singleton | Single-round-trip queue inspection — message and consumer counts, existence — for one queue (`GetQueueStateAsync`) or many (`GetQueuesStateAsync`). |
@@ -209,10 +233,12 @@ builder.Services
             c.AutoGenerate = true;
             c.PrefetchCount = 10;
             c.Timeout = TimeSpan.FromSeconds(30);
-            c.ConfigureRetryPolicy(r =>
+            c.ConfigureAutoGenerate(ag => ag.QueueType = QueueType.Classic); // state the type; don't rely on the broker default
+            c.ConfigureDeadLetterReprocess(r =>                               // failed messages retried from the DLQ
             {
-                r.MaxRetryCount = 3;
-                r.RetryInterval = 1000;
+                r.Enabled = true;
+                r.MaxReprocessAttempts = 3;
+                r.Interval = TimeSpan.FromMinutes(15);
             });
         });
     })
@@ -234,6 +260,8 @@ app.MapPost("/orders", async (OrderCreatedEvent order, IRabbitFlowPublisher publ
 That's it — **four steps** from zero to a working publish/consume pipeline.
 
 ---
+
+<a id="breaking-changes-v800"></a>
 
 ## ⚠️ Breaking Changes (v8.0.0)
 
@@ -443,7 +471,7 @@ Previously `MaxRetryCount = N` meant "process at most N times" (so `1` was the w
 - `1` — one retry after the first failure (2 attempts total).
 - `3` — three retries after the first failure (4 attempts total).
 
-**Migration:** any consumer that explicitly set `MaxRetryCount = N` will now perform one extra attempt. To preserve the old behavior, change `MaxRetryCount = N` to `MaxRetryCount = N - 1`. Consumers relying on the default get a behavior change too — the previous default `1` (one attempt, no retry) and the new default `0` are equivalent, so no action needed there. The auto-generated queue's `x-consumer-timeout` follows the new formula `max(60s, Timeout × (MaxRetryCount + 1) + Σ RetryIntervals + 30s grace)` — floored at 60s because RabbitMQ rejects consumer timeouts below one minute.
+**Migration:** any consumer that explicitly set `MaxRetryCount = N` will now perform one extra attempt. To preserve the old behavior, change `MaxRetryCount = N` to `MaxRetryCount = N - 1`. Consumers relying on the default get a behavior change too — the previous default `1` (one attempt, no retry) and the new default `0` are equivalent, so no action needed there. The auto-generated queue's `x-consumer-timeout` follows the new formula `max(60s, (Timeout + 30s grace) × (MaxRetryCount + 1) + Σ RetryIntervals + 10s)` — floored at 60s because RabbitMQ rejects consumer timeouts below one minute (since 8.4.0 the grace counts once per attempt and 10s are added for dead-lettering; 8.3 budgeted the grace once in total).
 
 **`ConsumerSettings.ExtendDeadletterMessage` default changed from `false` to `true`**
 
@@ -478,7 +506,7 @@ public Task HandleAsync(MyEvent message, RabbitFlowMessageContext context, Cance
 - `PublishAsync` / `PublishBatchAsync` now accept an optional `correlationId` parameter.
 
 - `PublishAsync` returns `PublishResult` (instead of `bool`). Use `result.Success` instead of the raw return value.
-- `PublishBatchAsync` is new — publish multiple messages atomically (`Transactional`) or individually confirmed (`Confirm`).
+- `PublishBatchAsync` is new — publish multiple messages in a transaction (`Transactional`) or individually confirmed (`Confirm`).
 - `ChannelMode` was removed from `PublisherOptions` — it is now a per-call parameter on `PublishBatchAsync` (defaults to `Transactional`). Single-message publishes always use publisher confirms.
 - `PublisherOptions.IdempotencyEnabled` introduced (later removed in v6.0.0; `MessageId` is now always assigned).
 

@@ -33,14 +33,17 @@ public static class PaymentsModule
             c.AutoGenerate = true;
             c.ExtendDeadletterMessage = true;   // dead-letter copies carry the full DeadLetterEnvelope
 
-            c.ConfigureRetryPolicy(r =>
-            {
-                r.MaxRetryCount = 1;            // one retry after the initial attempt
-                r.RetryInterval = 500;
-            });
+            // Poison guard demo (quorum queues only): a delivery the broker has already returned twice
+            // (x-delivery-count >= 2) is dead-lettered without running the handler. The library default is 5;
+            // it is lowered here so the behaviour can be reproduced by hand (see README).
+            c.MaxBrokerDeliveries = 2;
 
             c.ConfigureAutoGenerate(ag =>
             {
+                // Quorum main queue and dead-letter queue: replicated, durable, and the type the
+                // broker counts deliveries on. Replicas below keep their own explicit arguments.
+                ag.QueueType = QueueType.Quorum;
+
                 ag.GenerateDeadletterQueue = true;   // required for replicas to bind
 
                 // Long-retention replica. Nothing consumes this — operators inspect it via the management UI.

@@ -10,7 +10,8 @@ namespace EasyRabbitFlow.Settings
     public sealed class PublishResult
     {
         /// <summary>
-        /// Gets a value indicating whether the publish operation completed successfully.
+        /// Gets whether the broker confirmed the publication and, when Mandatory is enabled, did not return it.
+        /// This does not indicate consumer processing; by default it does not require routing to a queue.
         /// </summary>
         public bool Success { get; }
 
@@ -63,7 +64,8 @@ namespace EasyRabbitFlow.Settings
     /// <summary>
     /// Represents the outcome of a batch publish operation to RabbitMQ.
     /// When <see cref="ChannelMode.Transactional"/> is used,
-    /// all messages in the batch are published atomically within a single AMQP transaction.
+    /// messages are published within one AMQP transaction. A failed result can still include delivered messages,
+    /// notably when mandatory returns are detected at commit or the commit outcome is unknown.
     /// </summary>
     public sealed class BatchPublishResult
     {
@@ -90,8 +92,9 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         /// Gets the identifiers assigned to each message in the batch, in the same order as the input list.
-        /// Always populated with one entry per published message — either the value produced by the
-        /// <c>messageIdSelector</c> argument or a unique GUID generated automatically when no selector is supplied.
+        /// Contains IDs for publish calls that completed, using the selector or generated GUIDs.
+        /// Transactional returns detected at commit leave all submitted IDs, including returned messages.
+        /// This list is not a delivery receipt.
         /// </summary>
         public IReadOnlyList<string> MessageIds { get; }
 
@@ -107,8 +110,9 @@ namespace EasyRabbitFlow.Settings
 
         /// <summary>
         /// Gets the exception that caused the batch to fail, if any.
-        /// When <see cref="ChannelMode.Transactional"/>, a failure triggers a transaction rollback
-        /// and no messages from the batch are delivered.
+        /// When <see cref="ChannelMode.Transactional"/>, failures before commit attempt rollback.
+        /// Returns detected at commit cannot undo routed messages. A failed or cancelled commit can have
+        /// an unknown outcome; do not assume that no messages were delivered.
         /// <c>null</c> when <see cref="Success"/> is <c>true</c>.
         /// </summary>
         public Exception? Error { get; }

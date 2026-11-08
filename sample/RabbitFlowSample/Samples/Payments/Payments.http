@@ -29,3 +29,17 @@ Content-Type: application/json
   "currency": "EUR",
   "shouldFail": false
 }
+
+### Slow payment — holds the delivery 20s. While it runs, drop the connection from the broker
+### (docker exec <rabbit> rabbitmqctl close_all_connections demo) and watch the redelivery with
+### DeliveryCount=1; do it again and the third delivery (count 2 = MaxBrokerDeliveries) is dead-lettered
+### by the poison guard without running the handler (quorum queues only).
+POST {{host}}/payments
+Content-Type: application/json
+
+{
+  "amount": 10,
+  "currency": "EUR",
+  "shouldFail": false,
+  "processingDelayMs": 20000
+}

@@ -4,7 +4,49 @@ Inject `IRabbitFlowPublisher` to publish messages. All single-message publishes 
 
 **Exception contract:** publish methods never throw for broker or connection failures — every failure (unreachable broker, closed connection, timeout awaiting the confirm, cancellation) surfaces as a result with `Success = false` and the exception in `Error`. The only exceptions that propagate to the caller are argument validation ones, thrown before any I/O: `ArgumentNullException` when `message` is `null`, and `ArgumentException` when the batch collection is `null` or empty.
 
-> **`Success` means "accepted by the broker", not "routed to a queue".** Publishes are sent with `mandatory: false`, so a message published to an existing exchange whose routing key matches no binding is silently dropped by the broker — and still returns `Success = true`. This is the most common surprise with [application-owned exchanges](configuration.md#application-owned-exchanges): the producer declares the exchange, but until a consumer binds a queue, routed messages go nowhere.
+> **By default, `Success` means "accepted by the broker", not "routed to a queue".** `PublishOptions.Mandatory` defaults to `false`: an unroutable message can be dropped while the result reports success. This includes publishing directly to a missing queue and publishing to an existing exchange with no matching binding. Set `Mandatory = true` to require routing to at least one queue; see [Mandatory routing](#mandatory-routing). Publishing to a nonexistent exchange fails regardless of this option.
+
+### Mandatory routing
+
+`Mandatory` is an opt-in AMQP publication flag, independent of message persistence. It applies to both queue and exchange overloads, for single messages and every message in a batch. Omitting `options`, using `new PublishOptions()`, or explicitly setting `Mandatory = false` preserves the existing behavior, including event broadcasts that legitimately have no subscribers.
+
+```csharp
+using EasyRabbitFlow.Exceptions;
+using EasyRabbitFlow.Settings;
+
+var result = await publisher.PublishAsync(
+    order,
+    queueName: "orders-queue",
+    messageId: $"order-{order.Id}-created",
+    options: new PublishOptions
+    {
+        Mandatory = true,
+        DeliveryMode = MessageDeliveryMode.Persistent
+    });
+
+if (result.Error is RabbitFlowUnroutableMessageException returned)
+{
+    // The caller decides whether to retain for retry, alert, or use another destination.
+    logger.LogWarning("No route: {Code} {Text}, exchange={Exchange}, key={Key}",
+        returned.ReplyCode, returned.ReplyText, returned.Exchange, returned.RoutingKey);
+}
+else if (!result.Success)
+{
+    logger.LogError(result.Error, "Publish failed for {MessageId}", result.MessageId);
+}
+```
+
+The publisher reports a broker return through `Success = false` and `Error = RabbitFlowUnroutableMessageException`, consistently across modes. The exception includes `Exchange`, `RoutingKey`, `ReplyCode` (usually `312`) and `ReplyText` (usually `NO_ROUTE`). It is returned in the result, not thrown to the caller. The library does not automatically create a destination or retry the message.
+
+| Operation | Behavior with `Mandatory = true` |
+|---|---|
+| Single publish | Waits for the confirm; a return produces a failed result. |
+| Batch, `Confirm` | Stops at the first failed publish. Previously confirmed messages remain delivered. `MessageIds` contains only successful prior publishes. |
+| Batch, `Transactional` | Collects returns before `tx.commit-ok`. Any return produces a failed result with the first return's details. Routed messages may already be delivered; no rollback is attempted after commit starts. `MessageIds` contains all submitted message IDs, including returned messages. |
+
+For a batch, pass `options: new PublishOptions { Mandatory = true }` to `PublishBatchAsync`, with either channel mode. **A failed result does not mean that no messages were delivered.** Retrying a whole batch can duplicate messages; use stable IDs and idempotent consumers. Connection loss or cancellation during commit can also leave an unknown outcome.
+
+Mandatory routing proves neither consumer processing nor the presence of every expected subscriber. A queue with no active consumers still counts as a route; a queue reached through an alternate exchange can also satisfy routing. Persistence, durable queues, TTL and retention policies remain separate concerns. See [RabbitMQ publishers](https://www.rabbitmq.com/docs/publishers) and [transaction semantics](https://www.rabbitmq.com/docs/semantics).
 
 ### Single Message
 
@@ -63,7 +105,7 @@ Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `Success` | bool | Whether the broker confirmed the message |
+| `Success` | bool | Whether the broker confirmed the publication and, when `Mandatory = true`, did not return it. Does not indicate consumer processing. |
 | `MessageId` | string | Identifier of the published message — caller-supplied via `messageId` parameter or auto-generated GUID. Always populated. |
 | `Destination` | string | Target exchange or queue name |
 | `RoutingKey` | string | Routing key used (empty for queue publishes) |
@@ -72,15 +114,22 @@ Task<PublishResult> PublishAsync<TEvent>(TEvent message, string queueName,
 
 ### Batch Publishing
 
-Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter controls atomicity:
+Use `PublishBatchAsync` to publish multiple messages in a single operation. The `channelMode` parameter selects transactions or individual confirmations:
 
-- **`Transactional`** (default): All-or-nothing — if any message fails, the entire batch is rolled back. Uses AMQP transactions, **not** publisher confirms: `Success = true` means the `tx.commit` completed, not that each message was individually confirmed.
+- **`Transactional`** (default): Publishes within one AMQP transaction. Failures before commit trigger an attempted rollback. Uses AMQP transactions, **not** publisher confirms: success requires a completed `tx.commit` and, when `Mandatory = true`, no returned messages. Returns detected at commit cannot undo messages already routed.
 - **`Confirm`**: Each message is individually confirmed by the broker — a mid-batch failure does not roll back previous messages.
 
 Batches always open their own dedicated channel; they never use the single-message channel pool.
 
+> **Queue types and broker versions.** Both modes work against classic and quorum queues on RabbitMQ 3.13 and 4.x
+> (covered by the integration suite on every CI leg). Keep in mind what RabbitMQ itself promises for
+> `Transactional`: `tx.commit-ok` means every publish of the batch is visible, but the broker documents **no atomicity
+> guarantee** across queues — a batch routed to several queues can land in some of them if the broker fails
+> mid-commit — and none for a single queue either in failure scenarios. For business-critical fan-out prefer `Confirm`
+> plus idempotent consumers. See [RabbitMQ semantics](https://www.rabbitmq.com/docs/semantics).
+
 ```csharp
-// Atomic batch (Transactional — default)
+// Transactional batch (default); see commit and partial-delivery limits above
 var result = await publisher.PublishBatchAsync(
     orders,
     exchangeName: "orders-exchange",
@@ -88,7 +137,7 @@ var result = await publisher.PublishBatchAsync(
 
 Console.WriteLine($"Batch: {result.MessageCount} messages, success={result.Success}");
 
-// Non-atomic batch (Confirm mode — higher throughput)
+// Individually confirmed batch; prior successful publications are not rolled back
 var result = await publisher.PublishBatchAsync(
     orders,
     queueName: "orders-queue",
@@ -121,9 +170,9 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `Success` | bool | Whether all messages were published |
+| `Success` | bool | Whether the batch completed under the selected mode and mandatory routing policy. Failure does not imply zero deliveries. |
 | `MessageCount` | int | Number of messages in the batch |
-| `MessageIds` | IReadOnlyList\<string\> | Identifiers per message (in input order) — produced by `messageIdSelector` when supplied or auto-generated GUIDs otherwise. On success, one entry per message. On failure, contains only the ids generated before the failing message (while `MessageCount` still reports the full batch size); in `Transactional` mode those messages were rolled back and never delivered. |
+| `MessageIds` | IReadOnlyList\<string\> | IDs in input order for messages whose publish call completed. Before-commit failures can leave a partial list. Transactional returns detected at commit leave the full list, including returned messages; it is not a delivery receipt. |
 | `Destination` | string | Target exchange or queue name |
 | `RoutingKey` | string | Routing key used |
 | `ChannelMode` | ChannelMode | Mode used (`Transactional` or `Confirm`) |
@@ -131,6 +180,8 @@ Task<BatchPublishResult> PublishBatchAsync<TEvent>(IReadOnlyList<TEvent> message
 | `Error` | Exception? | The exception if `Success` is `false` |
 
 ### Idempotency
+
+**An uncertain confirmation is not proof of non-delivery.** Connection loss, cancellation or a timeout while awaiting confirmation can produce `Success = false` after the broker accepted the message. This affects single publishes and both batch modes. `Mandatory` detects returns; it does not remove this ambiguity. Retrying with the same `MessageId` enables application-level deduplication but RabbitMQ does not deduplicate ordinary queue publications by that property alone. See [RabbitMQ reliability](https://www.rabbitmq.com/docs/reliability).
 
 Every published message carries a `MessageId` set on `BasicProperties.MessageId` and returned in `PublishResult.MessageId` (or `BatchPublishResult.MessageIds`). There is no opt-out — identification is foundational, not optional.
 
@@ -244,7 +295,7 @@ The `correlationId` is set on `BasicProperties.CorrelationId` and received by co
 
 ### Per-Call AMQP Options (`PublishOptions`)
 
-`PublishAsync` and `PublishBatchAsync` accept an optional `PublishOptions` parameter that bundles AMQP metadata applied to the published message(s) plus an optional JSON serializer override. All fields are nullable (`null` = not written to the wire) except `DeliveryMode`, which defaults to `Transient`.
+`PublishAsync` and `PublishBatchAsync` accept an optional `PublishOptions` parameter that bundles AMQP metadata, the `Mandatory` publication flag and an optional JSON serializer override. All fields are nullable (`null` = not written to the wire) except `DeliveryMode` (default `Transient`) and `Mandatory` (default `false`).
 
 ```csharp
 await publisher.PublishAsync(
@@ -273,17 +324,32 @@ await publisher.PublishAsync(
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` is in-memory only. |
+| `Mandatory` | bool | `false` | Require routing to at least one queue. A return produces a failed result; see [Mandatory routing](#mandatory-routing) for batch semantics. |
+| `DeliveryMode` | MessageDeliveryMode | `Transient` | `Persistent` survives broker restart (queue must also be durable). `Transient` does not request persistence; quorum queues persist it anyway. |
 | `Type` | string? | `null` | AMQP `type` — typically a logical event name independent of the .NET CLR type. |
 | `AppId` | string? | `null` | AMQP `app-id` — identifies the publishing application. |
 | `Expiration` | TimeSpan? | `null` | Per-message TTL. Broker discards or dead-letters after this window. Serialized as a millisecond string. |
-| `Priority` | byte? | `null` | AMQP `priority`. Written to the wire as-is (the 0–9 range is RabbitMQ convention, not validated by the library). **Requires the destination queue to be declared with [`MaxPriority`](consumers.md#auto-generate-topology)**; without it the broker silently delivers messages FIFO. |
+| `Priority` | byte? | `null` | AMQP `priority`, sent as-is. Classic queues require [`MaxPriority`](consumers.md#auto-generate-topology); quorum queues use version-specific built-in priorities. Supported levels depend on broker version and queue type. |
 | `Timestamp` | DateTimeOffset? | `null` | AMQP `timestamp` — serialized as Unix seconds. |
 | `ReplyTo` | string? | `null` | AMQP `reply-to` — names the queue/exchange a consumer should reply on (RPC-style flows). |
 | `ContentType` | string? | `null` | AMQP `content-type`. Not set by default to preserve historical wire format; set to `"application/json"` if your consumers need it. |
 | `Headers` | IDictionary? | `null` | AMQP headers table. Use for business metadata or routing on headers exchanges. |
 | `JsonOptions` | JsonSerializerOptions? | `null` | Per-call override for the JSON serializer. When `null`, the publisher uses the globally configured serializer. |
 
-Consumers read every field above (except `JsonOptions`, which is publisher-side only) via [`RabbitFlowMessageContext`](consumers.md#message-context).
+Consumers read message metadata via [`RabbitFlowMessageContext`](consumers.md#message-context). `JsonOptions` and `Mandatory` control publishing and are not consumer metadata.
 
-> **Priority footgun:** setting `options.Priority` on a queue that was **not** declared with `x-max-priority` is silently ignored by the broker — messages are delivered in FIFO order regardless. For auto-generated queues, configure [`AutoGenerateSettings.MaxPriority`](consumers.md#auto-generate-topology); for queues declared externally, add `x-max-priority` to the queue arguments yourself.
+> **Priority depends on queue type:** classic queues need `x-max-priority` (via `AutoGenerateSettings.MaxPriority`). Quorum queues ignore that argument: RabbitMQ 4.0–4.2 uses two priority groups, while 4.3+ supports strict priorities from 0 to 31. Prefetched messages are not preempted. See [RabbitMQ priorities](https://www.rabbitmq.com/docs/priority).
+
+### Durability: three different guarantees
+
+"Durable queue", "persistent message" and "publisher confirm" are often conflated. They are independent building blocks for surviving broker restarts. Also require routing where appropriate (`Mandatory = true`), retry uncertain outcomes and deduplicate at the consumer:
+
+| Guarantee | Set where | What it covers | What it does **not** cover |
+|---|---|---|---|
+| **Durable queue** (`DurableQueue = true`, the default) | queue declaration | the queue *definition* survives a broker restart | its messages: transient messages on a durable queue are lost on restart |
+| **Persistent message** (`PublishOptions.DeliveryMode = Persistent`) | each publish | the message is written to disk and survives a restart — **only** on a durable queue | that the broker received it (no confirm), or that a consumer processed it |
+| **Publisher confirm** (always on for `PublishAsync`; see [Publishing](#publishing-messages)) | the publish channel | the broker confirmed the publication; with `Mandatory = true`, returns also fail the result | routing with `Mandatory = false`; processing by a consumer; persistence of transient messages on classic queues |
+
+Every publish path of `IRabbitFlowPublisher` — with or without `messageId`/`correlationId`, with or without `PublishOptions` — sends the message **transient** unless `PublishOptions.DeliveryMode = MessageDeliveryMode.Persistent` is set; the default has never changed. The dead-letter envelope the consumer writes to the DLQ and the messages the reprocessor parks are the exceptions: they are always persistent, since they may wait hours for the next cycle.
+
+**Quorum queues** store every message on disk regardless of `DeliveryMode` (replication requires it), so on a quorum queue a transient publish survives a restart anyway; keep setting `Persistent` for business messages so the guarantee does not depend on the queue type. See [Queue types](consumers.md#queue-types).

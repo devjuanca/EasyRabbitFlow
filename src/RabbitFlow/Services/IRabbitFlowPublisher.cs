@@ -2,6 +2,8 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
+using EasyRabbitFlow.Exceptions;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -21,6 +23,7 @@ namespace EasyRabbitFlow.Services
         /// <summary>
         /// Asynchronously publishes a single message to a RabbitMQ exchange using publisher confirms.
         /// The <c>await</c> completes only after the broker confirms receipt of the message.
+        /// Set PublishOptions.Mandatory to require routing; broker returns produce a failed result.
         /// </summary>
         /// <typeparam name="TEvent">The type of the message to publish.</typeparam>
         /// <param name="message">The message to publish.</param>
@@ -54,6 +57,7 @@ namespace EasyRabbitFlow.Services
         /// <summary>
         /// Asynchronously publishes a single message to a RabbitMQ queue using publisher confirms.
         /// The <c>await</c> completes only after the broker confirms receipt of the message.
+        /// Set PublishOptions.Mandatory to require routing; broker returns produce a failed result.
         /// </summary>
         /// <typeparam name="TEvent">The type of the message to publish.</typeparam>
         /// <param name="message">The message to publish.</param>
@@ -84,8 +88,9 @@ namespace EasyRabbitFlow.Services
         /// <summary>
         /// Asynchronously publishes a batch of messages to a RabbitMQ exchange.
         /// <list type="bullet">
-        /// <item><c>Transactional</c> (default): All messages are published atomically within a single AMQP transaction.
-        /// If any message fails, the entire batch is rolled back and no messages are delivered.</item>
+        /// <item><c>Transactional</c> (default): Messages are published within a single AMQP transaction.
+        /// Failures before commit attempt rollback. Mandatory returns detected at commit fail the result
+        /// but cannot undo messages already routed.</item>
         /// <item><c>Confirm</c>: Each message is individually confirmed by the broker.
         /// A failure mid-batch does not roll back previously confirmed messages.</item>
         /// </list>
@@ -122,8 +127,9 @@ namespace EasyRabbitFlow.Services
         /// <summary>
         /// Asynchronously publishes a batch of messages to a RabbitMQ queue.
         /// <list type="bullet">
-        /// <item><c>Transactional</c> (default): All messages are published atomically within a single AMQP transaction.
-        /// If any message fails, the entire batch is rolled back and no messages are delivered.</item>
+        /// <item><c>Transactional</c> (default): Messages are published within a single AMQP transaction.
+        /// Failures before commit attempt rollback. Mandatory returns detected at commit fail the result
+        /// but cannot undo messages already routed.</item>
         /// <item><c>Confirm</c>: Each message is individually confirmed by the broker.
         /// A failure mid-batch does not roll back previously confirmed messages.</item>
         /// </list>
@@ -272,7 +278,7 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                RabbitFlowDiagnostics.RecordFailure(activity, ex);
 
                 RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
 
@@ -388,6 +394,8 @@ namespace EasyRabbitFlow.Services
             var channelOptions = channelMode == ChannelMode.Transactional ? PlainChannelOptions : ConfirmChannelOptions;
 
             IChannel? channel = null;
+            var commitStarted = false;
+            RabbitFlowUnroutableMessageException? returnedMessage = null;
 
             // Connection and channel acquisition live INSIDE the try: every failure surfaces as
             // BatchPublishResult.Failed, never as a thrown exception. Transactional channels carry
@@ -402,6 +410,18 @@ namespace EasyRabbitFlow.Services
 
                 if (channelMode == ChannelMode.Transactional)
                 {
+                    if (options?.Mandatory == true)
+                    {
+                        // Returns precede commit-ok on this dedicated channel. Capture metadata only;
+                        // channel I/O in the callback would block the incoming command dispatcher.
+                        channel.BasicReturnAsync += (_, returned) =>
+                        {
+                            Interlocked.CompareExchange(ref returnedMessage,
+                                new RabbitFlowUnroutableMessageException(returned.Exchange, returned.RoutingKey,
+                                    returned.ReplyCode, returned.ReplyText), null);
+                            return Task.CompletedTask;
+                        };
+                    }
                     await channel.TxSelectAsync(cancellationToken);
                 }
 
@@ -436,7 +456,10 @@ namespace EasyRabbitFlow.Services
 
                 if (channelMode == ChannelMode.Transactional)
                 {
+                    commitStarted = true;
                     await channel.TxCommitAsync(cancellationToken);
+                    var returnError = Volatile.Read(ref returnedMessage);
+                    if (returnError != null) throw returnError;
                 }
 
                 logger.LogDebug("[RABBIT-FLOW]: Batch of {Count} messages published to {Destination}. Mode={Mode}",
@@ -448,11 +471,12 @@ namespace EasyRabbitFlow.Services
             }
             catch (Exception ex)
             {
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                RabbitFlowDiagnostics.RecordFailure(activity, ex);
 
                 RabbitFlowDiagnostics.PublishFailures.Add(1, new KeyValuePair<string, object?>("destination", destination));
 
-                if (channel != null && channelMode == ChannelMode.Transactional)
+                // A rollback cannot undo a commit, including one whose outcome is unknown.
+                if (channel != null && channelMode == ChannelMode.Transactional && !commitStarted)
                 {
                     try
                     {
@@ -483,7 +507,7 @@ namespace EasyRabbitFlow.Services
         }
 
 
-        private ValueTask PublishToChannelAsync<TEvent>(IChannel channel, TEvent @event, string destination, string routingKey, JsonSerializerOptions serializerOptions, bool isQueue, string? messageId, string? correlationId, PublishOptions? options, CancellationToken cancellationToken = default) where TEvent : class
+        private async ValueTask PublishToChannelAsync<TEvent>(IChannel channel, TEvent @event, string destination, string routingKey, JsonSerializerOptions serializerOptions, bool isQueue, string? messageId, string? correlationId, PublishOptions? options, CancellationToken cancellationToken = default) where TEvent : class
         {
             var body = JsonSerializer.SerializeToUtf8Bytes(@event, serializerOptions);
 
@@ -495,7 +519,8 @@ namespace EasyRabbitFlow.Services
 
             if (messageId == null && correlationId == null && options == null && !hasTraceContext)
             {
-                return channel.BasicPublishAsync(exchange, rk, body, cancellationToken);
+                await channel.BasicPublishAsync(exchange, rk, body, cancellationToken);
+                return;
             }
 
             var properties = new BasicProperties
@@ -551,7 +576,14 @@ namespace EasyRabbitFlow.Services
                 properties.Headers = options.Headers;
             }
 
-            return channel.BasicPublishAsync(exchange, rk, false, properties, body, cancellationToken);
+            try
+            {
+                await channel.BasicPublishAsync(exchange, rk, options?.Mandatory ?? false, properties, body, cancellationToken);
+            }
+            catch (PublishReturnException ex)
+            {
+                throw new RabbitFlowUnroutableMessageException(ex.Exchange, ex.RoutingKey, ex.ReplyCode, ex.ReplyText, ex);
+            }
         }
 
         private async Task<IConnection> ResolveConnection(string connectionId, CancellationToken cancellationToken = default)

@@ -35,7 +35,7 @@ public class HealthCheckService
 | `GetQueueStateAsync(queueName)` | `Task<QueueState>` | Full snapshot in one round trip: `QueueName`, `Exists`, `MessageCount`, `ConsumerCount`, `IsEmpty`, `HasConsumers` |
 | `GetQueuesStateAsync(queueNames)` | `Task<IReadOnlyList<QueueState>>` | Snapshots for several queues over a single connection, in input order |
 | `IsEmptyQueueAsync(queueName)` | `Task<bool>` | Is the queue empty? |
-| `GetQueueLengthAsync(queueName)` | `Task<uint>` | Number of messages in the queue |
+| `GetQueueLengthAsync(queueName)` | `Task<uint>` | Number of ready messages; excludes unacknowledged deliveries |
 | `GetConsumersCountAsync(queueName)` | `Task<uint>` | Number of active consumers |
 | `HasConsumersAsync(queueName)` | `Task<bool>` | Does the queue have any consumers? |
 
@@ -48,11 +48,19 @@ All methods also accept an optional `CancellationToken` as their last parameter.
 > `Exists = false`). The queues created by `IRabbitFlowTemporary` are exclusive: to monitor a temporary run, use
 > [`RunTemporaryOptions.OnProgress`](temporary-processing.md#progress-reporting-onprogress) instead.
 
+> **Queue types and broker versions.** Every method here works the same for classic and quorum queues on RabbitMQ
+> 3.13 and 4.x: they use a passive `queue.declare`, which never compares arguments and reports `MessageCount`
+> (ready messages) and `ConsumerCount` for both types. One change to know about on **RabbitMQ 4.3+**: passive
+> declarations are now subject to the user's **`configure` permission** on the queue name (release notes 4.3.0),
+> so a RabbitMQ user that only has `read`/`write` rights will get `403 ACCESS_REFUSED` from `IRabbitFlowState`, the
+> health check and `IRabbitFlowPurger` where 3.x and 4.0–4.2 answered. Grant `configure` on the inspected queues
+> (most applications use `.*` and are unaffected).
+
 ---
 
 ## Queue Purging
 
-Use `IRabbitFlowPurger` to remove all messages from queues:
+Use `IRabbitFlowPurger` to remove ready messages from queues. Messages already delivered and awaiting acknowledgement are not purged:
 
 ```csharp
 // Purge a single queue

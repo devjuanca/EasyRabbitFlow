@@ -21,4 +21,10 @@ public sealed class PaymentEvent
 
     [JsonPropertyName("shouldFail")]
     public bool ShouldFail { get; set; }
+
+    // How long the handler holds the delivery (unacknowledged) before completing. Lets you drop the
+    // connection while a payment is in flight to watch the broker return it (x-delivery-count) and,
+    // after MaxBrokerDeliveries returns, the poison guard dead-letter it without running the handler.
+    [JsonPropertyName("processingDelayMs")]
+    public int ProcessingDelayMs { get; set; } = 200;
 }

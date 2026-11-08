@@ -2,16 +2,22 @@
 
 ## Dead-Letter Delivery Guarantee
 
-When a message exhausts its retries it is guaranteed to leave the main queue and reach the DLQ — it is never silently dropped. The `DeadLetterEnvelope` is published on a **publisher-confirms** channel, so the `await` only completes once the broker has confirmed receipt; if the publish is not confirmed (or serialization fails), the consumer falls back to broker-native `nack` dead-lettering. The dead-letter reprocessor uses confirms too: a re-enqueue or park only acks the message off the DLQ after the broker confirms the new copy, so an unconfirmed publish leaves the message safely on the DLQ.
+The library protects the envelope publish-before-ack path with **publisher confirms and mandatory routing**. It acknowledges the original only after the new publication is confirmed without a return. This protects against acknowledging an unroutable envelope; it is not an unconditional guarantee against message loss.
 
-The guarantee assumes the dead-letter path exists and is enabled — concretely:
+When the broker returns an envelope, the consumer re-declares the dead-letter queue, exchange, binding and replicas and publishes again. If the second publication is returned or the re-declaration fails, it requeues the original after a pause of `NetworkRecoveryInterval` (at least 1s). Re-declaration uses a separate channel so a rejected declaration cannot close the consumer channel. Mandatory routing requires at least one destination: an existing replica can satisfy it even when the primary DLQ is absent.
+
+For other envelope failures, including serialization errors and unconfirmed publications, the consumer falls back to broker-native `nack(requeue: false)` dead-lettering. That path also applies when envelopes are disabled. Its safety depends on RabbitMQ topology and the queue's dead-letter strategy: native dead-lettering can lose messages when its destination is unavailable. See [RabbitMQ dead-letter safety](https://www.rabbitmq.com/docs/dlx#safety).
+
+The reprocessor uses **confirms plus mandatory routing** for every re-enqueue and park, independently of `PublishOptions.Mandatory`. A missing main queue, or a parking queue deleted after its existence check, causes a return and skips the DLQ ACK. Closing the cycle's channel makes the unacknowledged original available in the DLQ for a later cycle. The reprocessor does not recreate the main queue; the consumer's topology recovery or the operator must restore it.
+
+Enable the library-managed dead-letter path with:
 
 - `AutoGenerate = true` and `GenerateDeadletterQueue = true` (the default), so the DLQ and its exchange exist. Without them, failures fall back to a plain `nack(requeue: false)`; if the queue has no `x-dead-letter-exchange` of its own, the broker **discards** the message.
 - `AutoAckOnError = false` (the default). With `AutoAckOnError = true`, failed messages are acknowledged and dropped by design — nothing reaches the DLQ.
 
-This closes the message-**loss** window. It does **not** provide exactly-once delivery: a confirmed publish whose subsequent ack fails is redelivered, so a message can reach the DLQ — or be reprocessed — more than once. As with any at-least-once broker, make consumers idempotent; see [Idempotency](publishing.md#idempotency).
+Duplicates remain possible: the broker may accept a publication even when its confirmation is lost, or the original may be redelivered if its ACK does not reach the broker. Queue deletion, expiry, retention policies and broker delivery limits remain outside these protections. Make consumers idempotent; see [Idempotency](publishing.md#idempotency).
 
-**Durability end-to-end.** The parking queue is always declared **durable**; the auto-generated DLQ inherits `DurableQueue` and `AutoDeleteQueue` from `AutoGenerateSettings`, so it is durable with the defaults (keep them if you care about the guarantee below). Every envelope the library publishes — onto the DLQ when a message dead-letters, and onto the parking queue when it is exhausted/permanent/malformed — is published **persistent** (`DeliveryMode = 2`). A message therefore survives a broker restart at every resting point, including the (potentially hours-long) wait in the DLQ between reprocessor cycles. This requires the broker's data directory to live on persistent storage (e.g. a `StatefulSet` with a `PersistentVolumeClaim` on `/var/lib/rabbitmq`); on ephemeral storage the whole broker state is lost on pod restart regardless of durability flags.
+**Durability.** New parking queues are declared **durable**; an existing parking queue is adopted as-is. The auto-generated DLQ inherits `DurableQueue` and `AutoDeleteQueue` from `AutoGenerateSettings`. Envelopes and parked messages are published **persistent** (`DeliveryMode = 2`), but broker-native dead-lettering retains the original delivery mode, and replays restore it. For restart protection, verify the actual queues are durable and the broker data directory uses persistent storage (for example a volume at `/var/lib/rabbitmq`). Persistence does not prevent administrative deletion, expiry or retention-policy eviction.
 
 ## Dead-Letter Replicas
 
@@ -102,7 +108,7 @@ The shape is the public type `DeadLetterEnvelope` so dead-letter messages can be
 
 ## Dead-Letter Reprocessor
 
-When in-handler retries are not enough — for example, when the failure is caused by a downstream system that takes hours to recover — you can attach a **dead-letter reprocessor** to a consumer. The reprocessor runs on a fixed cadence, drains the consumer's auto-generated dead-letter queue, and re-publishes each message to the main queue until a maximum attempt count is reached.
+The **dead-letter reprocessor** is the library's retry mechanism: attach it to a consumer and it runs on a fixed cadence, drains the consumer's auto-generated dead-letter queue, and re-publishes each transient failure to the main queue until a maximum attempt count is reached — without holding the original delivery open between cycles. During a cycle, a fetched DLQ message remains unacknowledged until its transfer is confirmed. (In-process retries, `ConfigureRetryPolicy`, are deprecated since v8.4.0.)
 
 ```csharp
 cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
@@ -110,12 +116,10 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
     c.AutoGenerate = true;                       // required
     c.ExtendDeadletterMessage = true;            // forced when reprocessor is enabled
 
-    c.ConfigureRetryPolicy(r => r.MaxRetryCount = 3);
-
     c.ConfigureDeadLetterReprocess(r =>
     {
         r.Enabled = true;
-        r.MaxReprocessAttempts = 5;                      // re-enqueues DLQ → main (⇒ up to 6 handler executions total)
+        r.MaxReprocessAttempts = 5;                      // re-enqueues DLQ → main (⇒ up to 6 deliveries absent redeliveries/in-process retries)
         r.Interval = TimeSpan.FromHours(3);              // run every 3 hours
         // r.MaxMessagesPerCycle = 500;                  // optional safety cap; defaults to int.MaxValue (drain entire snapshot)
         // r.FinalAction = DeadLetterFinalAction.Discard; // drop exhausted/permanent instead of parking (default: Park)
@@ -145,13 +149,16 @@ cfg.AddConsumer<OrderConsumer>("orders-queue", c =>
 
 If a message exhausts its reprocess budget, the reprocessor moves it to the **parking queue** (`{queue}-deadletter-parking`, declared durable by the reprocessor itself) with `reprocessAttempts` reflecting the final count — so it remains visible in any RabbitMQ client and is not silently dropped, and the DLQ stays free for messages that are still actionable. Permanent and malformed messages are parked the same way, once, instead of rotating through the DLQ on every cycle — their body is parked **unchanged** (the counter is not rewritten; only exhausted messages get the final count stamped). Parked messages are published **persistent** (`DeliveryMode = 2`) onto the durable parking queue, so they survive a broker restart; for permanent/malformed messages the original AMQP properties (`MessageId`, `CorrelationId`, headers, …) are preserved as well.
 
-The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, classic, plus `x-message-ttl` if `ParkingMessageTtl` is set).
+The parking queue is created **on demand the first time a cycle actually needs to park a message** (the consumer never declares it; a cycle that re-enqueues or discards everything never creates it), so it never clutters the broker unless it's actually used. The reprocessor probes it with a passive declare: if the queue already exists it is used **as-is**, so deliberate operator settings (a TTL to age out old failures, a quorum queue type, a `max-length`, …) are respected and the reprocessor never fails with `PRECONDITION_FAILED` fighting over arguments. To apply different arguments, delete the queue and let the reprocessor recreate it with defaults (durable, the dead-letter queue's type from [`DeadLetterQueueType` / `QueueType`](consumers.md#queue-types) — or the broker's `default_queue_type` when neither is set — plus `x-message-ttl` if `ParkingMessageTtl` is set).
 
 ### Discarding instead of parking
 
-By default every terminal message is parked. Set `FinalAction = DeadLetterFinalAction.Discard` to instead **drop** exhausted and permanent messages — they are acknowledged off the DLQ without being re-published anywhere. This suits high-volume failures that carry no recovery value and where parking would only accumulate noise. In `Discard` mode the parking queue is only ever created if a **malformed** message appears, because:
+By default every terminal message is parked. Set `FinalAction = DeadLetterFinalAction.Discard` to instead **drop** exhausted and permanent messages — they are acknowledged off the DLQ without being re-published anywhere. This suits high-volume failures that carry no recovery value and where parking would only accumulate noise. In `Discard` mode the parking queue is only ever created if a **malformed** or a **poisoned** message appears, because:
 
-- **Malformed messages are always parked, never discarded** — regardless of `FinalAction`. Their bytes could not be deserialized into an envelope, so dropping them would lose data with no recoverable trace. They are the one terminal category the discard switch does not govern.
+- **Malformed messages are always parked, never discarded** — regardless of `FinalAction`. Their bytes could not be deserialized into an envelope, so dropping them would lose data with no recoverable trace.
+- **Poisoned messages are always parked too** (v8.4.0) — envelopes written with `RabbitFlowPoisonMessageException` by the [poison guard](consumers.md#registering-consumers) (`MaxBrokerDeliveries`). The handler never ran, so their only fault may have been a run of restarts; they are kept for inspection.
+
+These are the two terminal categories the discard switch does not govern.
 
 Discarded messages are not silently invisible to operators: each one increments the `easyrabbitflow.messages.discarded` counter (tagged `reason = exhausted | permanent`) and is logged at debug level.
 
@@ -166,10 +173,10 @@ Note that a parking queue with a TTL and no dead-letter target drops expired mes
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `Enabled` | bool | `true` | Whether the reprocessor is active for this consumer |
-| `MaxReprocessAttempts` | int | `3` | Maximum **re-enqueues** from DLQ back to main queue. Counts reprocesses only — not the original delivery — so `N` allows up to `N + 1` total handler executions before parking (e.g. `1` ⇒ 2 executions). Minimum `1`. |
+| `MaxReprocessAttempts` | int | `3` | Maximum **re-enqueues** from DLQ back to main queue. Counts reprocesses only — not the original delivery — so `N` allows `N + 1` processing deliveries before parking in the normal path. In-process retries and broker redeliveries can cause additional handler executions. Minimum `1`. |
 | `Interval` | TimeSpan | `3h` | Time between reprocessor runs. **Minimum 10 minutes** (hard floor — use the in-handler `RetryPolicy` for tighter retry cadences). The first cycle runs one full `Interval` **after startup** — with the default, nothing is reprocessed during the first 3 hours. |
-| `MaxMessagesPerCycle` | int | `int.MaxValue` | Optional safety cap on messages drained per cycle. By default each cycle drains the whole DLQ snapshot taken at the start of the run; lower this only if you need an explicit ceiling. |
-| `FinalAction` | `DeadLetterFinalAction` | `Park` | What to do with terminal **exhausted**/**permanent** messages: `Park` (move to the parking queue) or `Discard` (ack off the DLQ and drop). Does **not** apply to malformed messages, which are always parked. |
+| `MaxMessagesPerCycle` | int | `int.MaxValue` | Limits fetches to the smaller of this value and the initial ready-message count. This bounds work; concurrent consumers or reprocessors can change which messages are fetched. |
+| `FinalAction` | `DeadLetterFinalAction` | `Park` | What to do with terminal **exhausted**/**permanent** messages: `Park` (move to the parking queue) or `Discard` (ack off the DLQ and drop). Does **not** apply to malformed or poisoned messages, which are always parked. |
 | `ParkingMessageTtl` | TimeSpan? | `null` | When set, the parking queue is created with `x-message-ttl` so parked messages age out after this duration. Applies only on a queue the reprocessor creates; an existing queue is adopted as-is. Must be greater than zero. |
 
 **Constraints:**

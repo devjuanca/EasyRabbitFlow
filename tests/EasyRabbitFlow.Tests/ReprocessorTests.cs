@@ -4,7 +4,9 @@ using EasyRabbitFlow.Services;
 using EasyRabbitFlow.Settings;
 using EasyRabbitFlow.Tests.Fixtures;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 
 namespace EasyRabbitFlow.Tests;
 
@@ -16,6 +18,20 @@ public class ReprocessorTests
     public ReprocessorTests(RabbitMqFixture fixture)
     {
         _fixture = fixture;
+    }
+
+    // The tests publish to the DLQ without publisher confirms and then run a cycle at once. On a quorum queue
+    // the publish is only visible once the Raft log commits it, so a cycle started immediately can find the DLQ
+    // empty and park nothing. Waiting for the depth mirrors reality (the reprocessor runs hours later) and keeps
+    // the assertions about the cycle itself.
+    private static async Task WaitForDepthAsync(IChannel ch, string queue, uint expected)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+
+        while (await ch.MessageCountAsync(queue) < expected && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
     }
 
     [Fact]
@@ -108,6 +124,8 @@ public class ReprocessorTests
                 maxMessagesPerCycle: 100,
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: null);
+
+            await WaitForDepthAsync(ch, dlqName, 3);
 
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
@@ -239,6 +257,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: null);
 
+            await WaitForDepthAsync(ch, dlqName, 2);
+
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -343,6 +363,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Discard,
                 parkingMessageTtl: null);
 
+            await WaitForDepthAsync(ch, dlqName, 3);
+
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -392,6 +414,8 @@ public class ReprocessorTests
                 maxMessagesPerCycle: 100,
                 finalAction: DeadLetterFinalAction.Discard,
                 parkingMessageTtl: null);
+
+            await WaitForDepthAsync(ch, dlqName, 1);
 
             // Act
             await worker.RunCycleAsync(CancellationToken.None);
@@ -450,6 +474,8 @@ public class ReprocessorTests
                 finalAction: DeadLetterFinalAction.Park,
                 parkingMessageTtl: TimeSpan.FromSeconds(2));
 
+            await WaitForDepthAsync(ch, dlqName, 1);
+
             // Act — message is parked into a queue declared with x-message-ttl = 2s
             await worker.RunCycleAsync(CancellationToken.None);
 
@@ -465,6 +491,173 @@ public class ReprocessorTests
             try { await ch.QueueDeleteAsync(queueName); } catch { }
             try { await ch.QueueDeleteAsync(dlqName); } catch { }
             try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Theory]
+    [InlineData(QueueType.Classic, "classic")]
+    [InlineData(QueueType.Quorum, "quorum")]
+    public async Task RunCycle_AppliesParkingQueueType_OnQueueCreation(QueueType parkingQueueType, string expectedType)
+    {
+        // The parking queue is created on demand with the dead-letter queue's type, whatever the broker default is.
+        var queueName = $"test-reproc-ptype-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+
+        await ch.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+
+        try
+        {
+            var permanent = new DeadLetterEnvelope
+            {
+                DateUtc = DateTime.UtcNow,
+                MessageType = "TestEvent",
+                MessageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"q1"}"""),
+                ExceptionType = "InvalidOperationException",
+                IsTransient = false,
+                ReprocessAttempts = 0
+            };
+            await ch.BasicPublishAsync("", dlqName, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(permanent, jsonOpts)));
+
+            var worker = new DeadLetterReprocessWorker(
+                NullLogger.Instance,
+                Factory(),
+                jsonOpts,
+                consumerName: "ReprocessorParkingTypeConsumer",
+                queueName: queueName,
+                maxAttempts: 3,
+                interval: TimeSpan.FromHours(1),
+                maxMessagesPerCycle: 100,
+                finalAction: DeadLetterFinalAction.Park,
+                parkingMessageTtl: null,
+                parkingQueueType: parkingQueueType);
+
+            await WaitForDepthAsync(ch, dlqName, 1);
+
+            await worker.RunCycleAsync(CancellationToken.None);
+
+            Assert.Equal(1u, await ch.MessageCountAsync(parkingName));
+            Assert.Equal(expectedType, await _fixture.GetQueueTypeAsync(parkingName));
+        }
+        finally
+        {
+            try { await ch.QueueDeleteAsync(queueName); } catch { }
+            try { await ch.QueueDeleteAsync(dlqName); } catch { }
+            try { await ch.QueueDeleteAsync(parkingName); } catch { }
+        }
+    }
+
+    [Theory]
+    [InlineData("transient")]
+    [InlineData("exhausted")]
+    [InlineData("permanent")]
+    [InlineData("malformed")]
+    public async Task RunCycle_UnroutablePublish_PreservesOriginal_AndRetriesNextCycle(string kind)
+    {
+        var queueName = $"test-reproc-return-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+        var parkingName = $"{queueName}-deadletter-parking";
+        var destination = kind == "transient" ? queueName : parkingName;
+        var jsonOpts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        var envelope = new DeadLetterEnvelope
+        {
+            MessageId = "returned-message",
+            MessageData = JsonSerializer.Deserialize<JsonElement>("""{"id":"keep-me"}"""),
+            IsTransient = kind != "permanent",
+            ReprocessAttempts = kind == "exhausted" ? 3 : 0
+        };
+        var bytes = Encoding.UTF8.GetBytes(kind == "malformed" ? "invalid-json" : JsonSerializer.Serialize(envelope, jsonOpts));
+
+        using var conn = await _fixture.CreateDirectConnectionAsync();
+        using var ch = await conn.CreateChannelAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await ch.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false);
+        await ch.QueueDeclareAsync(destination, durable: true, exclusive: false, autoDelete: false);
+        try
+        {
+            await ch.BasicPublishAsync("", dlqName, false,
+                new BasicProperties { MessageId = "original-id", CorrelationId = "original-correlation" }, bytes);
+            await WaitForDepthAsync(ch, dlqName, 1);
+
+            var logger = new ReturnedPublishLogger();
+            if (kind == "transient")
+            {
+                await ch.QueueDeleteAsync(destination);
+            }
+            else
+            {
+                // Synchronize the administrative deletion with the successful passive-declare log.
+                // A separate channel completes deletion before the worker can publish: no timing race.
+                logger.AfterParkingProbe = async () => await ch.QueueDeleteAsync(destination,
+                    cancellationToken: timeout.Token);
+            }
+
+            var worker = new DeadLetterReprocessWorker(logger, Factory(), jsonOpts,
+                "ReturnedPublishConsumer", queueName, 3, TimeSpan.FromHours(1), 100,
+                DeadLetterFinalAction.Park, null);
+            // The synchronous logging barrier runs without xUnit's synchronization context.
+            await Task.Run(() => worker.RunCycleAsync(timeout.Token));
+
+            Assert.Contains(logger.Exceptions, ex => ex is PublishException { IsReturn: true });
+            await WaitForDepthAsync(ch, dlqName, 1);
+            Assert.Equal(1u, await ch.MessageCountAsync(dlqName));
+            var retained = await ch.BasicGetAsync(dlqName, autoAck: false);
+            Assert.NotNull(retained);
+            Assert.Equal(bytes, retained!.Body.ToArray());
+            Assert.Equal("original-id", retained.BasicProperties.MessageId);
+            Assert.Equal("original-correlation", retained.BasicProperties.CorrelationId);
+            await ch.BasicNackAsync(retained.DeliveryTag, multiple: false, requeue: true);
+
+            await ch.QueueDeclareAsync(destination, durable: true, exclusive: false, autoDelete: false);
+            await WaitForDepthAsync(ch, dlqName, 1);
+            await worker.RunCycleAsync(timeout.Token);
+
+            Assert.Equal(0u, await ch.MessageCountAsync(dlqName));
+            Assert.Equal(1u, await ch.MessageCountAsync(destination));
+            var delivered = await ch.BasicGetAsync(destination, autoAck: true);
+            Assert.NotNull(delivered);
+            if (kind == "transient")
+            {
+                Assert.Equal(1, delivered!.BasicProperties.Headers![RabbitFlowHeaders.ReprocessAttempts]);
+                Assert.Equal(envelope.MessageData!.Value.GetRawText(), Encoding.UTF8.GetString(delivered.Body.Span));
+            }
+            else
+            {
+                Assert.Equal(bytes, delivered!.Body.ToArray());
+            }
+        }
+        finally
+        {
+            await ch.QueueDeleteAsync(dlqName);
+            await ch.QueueDeleteAsync(destination);
+        }
+    }
+
+    private sealed class ReturnedPublishLogger : ILogger
+    {
+        public Func<Task>? AfterParkingProbe { get; set; }
+        public List<Exception> Exceptions { get; } = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (exception != null) Exceptions.Add(exception);
+            if (formatter(state, exception).Contains("already exists; using it as-is"))
+            {
+                var callback = AfterParkingProbe;
+                AfterParkingProbe = null;
+                // ILogger is synchronous; wait for the independent administrative channel so
+                // deletion is complete before returning control to the publisher.
+                callback?.Invoke().GetAwaiter().GetResult();
+            }
         }
     }
 

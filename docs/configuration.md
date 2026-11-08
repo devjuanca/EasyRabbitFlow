@@ -59,6 +59,8 @@ If not configured, EasyRabbitFlow falls back to `JsonSerializerOptions.Web` — 
 
 ### Publisher Options
 
+`ConfigurePublisher` sets connection and channel reuse options. Message-level settings belong in the `PublishOptions` passed to each publish call, including `Mandatory` (default `false`), `DeliveryMode` and `Priority`; see [Publishing options](publishing.md#per-call-amqp-options-publishoptions).
+
 ```csharp
 cfg.ConfigurePublisher(pub =>
 {

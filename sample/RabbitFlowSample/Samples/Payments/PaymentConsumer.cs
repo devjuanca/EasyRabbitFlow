@@ -11,9 +11,11 @@ public sealed class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFl
 {
     public async Task HandleAsync(PaymentEvent message, RabbitFlowMessageContext context, CancellationToken cancellationToken)
     {
+        // MessageId, CorrelationId, Queue and Consumer already travel in the consumer's log scope; the broker's
+        // view of this delivery is what is worth printing here.
         logger.LogInformation(
-            "[Payment] Processing {PaymentId} for {Amount} {Currency} (MessageId={MessageId})",
-            message.PaymentId, message.Amount, message.Currency, context.MessageId ?? "(none)");
+            "[Payment] Processing {PaymentId} for {Amount} {Currency} (Redelivered={Redelivered}, DeliveryCount={DeliveryCount})",
+            message.PaymentId, message.Amount, message.Currency, context.Redelivered, context.DeliveryCount?.ToString() ?? "n/a");
 
         if (message.ShouldFail)
         {
@@ -27,7 +29,7 @@ public sealed class PaymentConsumer(ILogger<PaymentConsumer> logger) : IRabbitFl
             throw new ArgumentOutOfRangeException(nameof(message.Amount), "Amount must be positive.");
         }
 
-        await Task.Delay(200, cancellationToken);
+        await Task.Delay(Math.Max(0, message.ProcessingDelayMs), cancellationToken);
 
         logger.LogInformation("[Payment] {PaymentId} processed successfully.", message.PaymentId);
     }

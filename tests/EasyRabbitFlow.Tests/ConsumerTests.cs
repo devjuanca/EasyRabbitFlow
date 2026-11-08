@@ -7,6 +7,7 @@ using EasyRabbitFlow.Tests.Helpers;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using RabbitMQ.Client;
+using Xunit.Abstractions;
 
 namespace EasyRabbitFlow.Tests;
 
@@ -14,10 +15,12 @@ namespace EasyRabbitFlow.Tests;
 public class ConsumerTests
 {
     private readonly RabbitMqFixture _fixture;
+    private readonly ITestOutputHelper _output;
 
-    public ConsumerTests(RabbitMqFixture fixture)
+    public ConsumerTests(RabbitMqFixture fixture, ITestOutputHelper output)
     {
         _fixture = fixture;
+        _output = output;
     }
 
     [Fact]
@@ -139,11 +142,13 @@ public class ConsumerTests
                 cfg.AutoGenerate = true;
                 cfg.PrefetchCount = 1;
                 cfg.Timeout = TimeSpan.FromSeconds(10);
+#pragma warning disable CS0618 // in-process retries are deprecated but still supported until the next major
                 cfg.ConfigureRetryPolicy(r =>
                 {
                     r.MaxRetryCount = 3;
                     r.RetryInterval = 100;
                 });
+#pragma warning restore CS0618
                 cfg.ConfigureAutoGenerate(ag =>
                 {
                     ag.GenerateExchange = false;
@@ -775,5 +780,802 @@ public class ConsumerTests
         }
 
         await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_ResubscribesAfterBrokerCancelsConsumer()
+    {
+        // The broker cancels a consumer (basic.cancel) without closing its channel when the queue is deleted,
+        // when the node hosting the queue goes away, or — on RabbitMQ 4.3+ quorum queues — when a delivery
+        // exceeds the consumer acknowledgement timeout. The channel and connection stay open, so neither
+        // ChannelShutdownAsync nor ConnectionShutdownAsync fires: a consumer that only listens to those is left
+        // attached to a live channel that delivers nothing, until the process restarts. Deleting the queue is the
+        // deterministic way to trigger that notification on every broker version.
+        TestConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-cancel-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = true;
+                    ag.ExchangeType = EasyRabbitFlow.Settings.ExchangeType.Direct;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.DurableExchange = false;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        }, host => host.NetworkRecoveryInterval = TimeSpan.FromSeconds(1));
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+
+        // Sanity: a message flows before the cancel.
+        await publisher.PublishAsync(new TestEvent { Id = "before", Message = "before-cancel" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+        Assert.Single(TestConsumer.ReceivedMessages);
+
+        // Act - delete the queue from another connection. The broker sends basic.cancel to our consumer; its
+        // channel and connection remain open.
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeleteAsync(queueName);
+        }
+
+        // Wait for the library to notice the cancel and re-declare + re-consume. Deleting a quorum queue under a
+        // live consumer can also make the broker drop the connection (541 INTERNAL_ERROR on 4.3.x), which turns the
+        // re-subscribe into a full recovery with backoff, so poll rather than sleep.
+        uint consumers = 0;
+        string probeOutcome = "not probed";
+        var probeDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (consumers != 1 && DateTime.UtcNow < probeDeadline)
+        {
+            await Task.Delay(250);
+
+            try
+            {
+                using var probeConn = await _fixture.CreateDirectConnectionAsync();
+                using var probeCh = await probeConn.CreateChannelAsync();
+                var ok = await probeCh.QueueDeclarePassiveAsync(queueName);
+                consumers = ok.ConsumerCount;
+                probeOutcome = $"exists, consumers={consumers}";
+            }
+            catch (RabbitMQ.Client.Exceptions.OperationInterruptedException ex)
+            {
+                // Without cancel handling the queue is simply gone (404) for good.
+                probeOutcome = $"passive declare failed: {ex.ShutdownReason?.ReplyCode} {ex.ShutdownReason?.ReplyText}";
+            }
+        }
+
+        // Assert - the queue exists again with exactly one consumer and a message published after the cancel
+        // is consumed.
+        var afterResult = await publisher.PublishAsync(new TestEvent { Id = "after", Message = "after-cancel" }, queueName);
+
+        deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (TestConsumer.ReceivedMessages.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.True(
+            consumers == 1 && TestConsumer.ReceivedMessages.Any(m => m.Id == "after"),
+            $"Consumer did not re-subscribe after basic.cancel. Queue: {probeOutcome}. Received={TestConsumer.ReceivedMessages.Count}, afterPublishSuccess={afterResult.Success}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_DeadLetterQueueDeletedAtRuntime_RecreatesItAndParksTheEnvelope()
+    {
+        // The dead-letter envelope is published on a confirm channel, but a publisher confirm also acknowledges a
+        // message the broker dropped for having no route. If the dead-letter queue (and with it the binding) is gone,
+        // the consumer must not ack the original on the strength of that confirm: it re-declares the dead-letter
+        // topology and publishes the envelope again, so the failed message ends up parked and the main queue empty.
+        AlwaysFailConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-dlq-gone-{Guid.NewGuid():N}";
+        var deadLetterQueueName = EasyRabbitFlow.Settings.RabbitFlowTopologyNames.DeadLetterQueue(queueName);
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<AlwaysFailConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        // Act - remove the dead-letter queue from another connection; the broker drops its binding with it, so the
+        // dead-letter exchange has nowhere to route the envelope.
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeleteAsync(deadLetterQueueName);
+        }
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        var result = await publisher.PublishAsync(new TestEvent { Id = "boom", Message = "fails" }, queueName, messageId: "msg-dlq-gone");
+        Assert.True(result.Success);
+
+        // Assert - the envelope lands in a recreated dead-letter queue and the main queue is left empty.
+        uint parked = 0;
+        string probeOutcome = "not probed";
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (parked < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(250);
+
+            try
+            {
+                using var probeConn = await _fixture.CreateDirectConnectionAsync();
+                using var probeCh = await probeConn.CreateChannelAsync();
+                var ok = await probeCh.QueueDeclarePassiveAsync(deadLetterQueueName);
+                parked = ok.MessageCount;
+                probeOutcome = $"exists, messages={parked}";
+            }
+            catch (RabbitMQ.Client.Exceptions.OperationInterruptedException ex)
+            {
+                probeOutcome = $"passive declare failed: {ex.ShutdownReason?.ReplyCode} {ex.ShutdownReason?.ReplyText}";
+            }
+        }
+
+        Assert.True(parked == 1,
+            $"The envelope did not reach a recreated dead-letter queue. DLQ: {probeOutcome}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        Assert.Contains(EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Lines, l => l.Contains("was returned by the broker as unroutable"));
+
+        using (var probeConn = await _fixture.CreateDirectConnectionAsync())
+        using (var probeCh = await probeConn.CreateChannelAsync())
+        {
+            var main = await probeCh.QueueDeclarePassiveAsync(queueName);
+            Assert.Equal(0u, main.MessageCount);
+        }
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [SkippableFact]
+    public async Task Consumer_WithAutoGenerate_OnQuorumByDefaultBroker_GetsQuorumQueues()
+    {
+        // Guards the quorum CI leg itself: when the broker's default_queue_type is quorum, every queue the library
+        // declares without x-queue-type (main queue and dead-letter queue alike) is a quorum queue. If this fails
+        // the leg is not exercising quorum at all.
+        Skip.IfNot(RabbitMqFixture.QuorumByDefault, "Only meaningful when RABBITMQ_DEFAULT_QUEUE_TYPE=quorum.");
+
+        var queueName = $"test-qq-default-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        Assert.Equal("quorum", await _fixture.GetQueueTypeAsync(queueName));
+        Assert.Equal("quorum", await _fixture.GetQueueTypeAsync($"{queueName}-deadletter"));
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(QueueType.Classic, null, "classic", "classic")]
+    [InlineData(QueueType.Quorum, null, "quorum", "quorum")]
+    [InlineData(QueueType.Classic, QueueType.Quorum, "classic", "quorum")]
+    [InlineData(QueueType.Quorum, QueueType.Classic, "quorum", "classic")]
+    public async Task Consumer_WithQueueType_DeclaresMainAndDeadLetterQueuesWithThatType(QueueType queueType, QueueType? deadLetterQueueType, string expectedMain, string expectedDeadLetter)
+    {
+        // The explicit type is what the broker records, whatever its default_queue_type is; the DLQ follows
+        // QueueType unless DeadLetterQueueType overrides it. Dead-lettering must work across types.
+        TestConsumer.Reset();
+        AlwaysFailConsumer.Reset();
+
+        var queueName = $"test-qtype-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<AlwaysFailConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.ExtendDeadletterMessage = false;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                    ag.QueueType = queueType;
+                    ag.DeadLetterQueueType = deadLetterQueueType;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        Assert.Equal(expectedMain, await _fixture.GetQueueTypeAsync(queueName));
+        Assert.Equal(expectedDeadLetter, await _fixture.GetQueueTypeAsync($"{queueName}-deadletter"));
+
+        // A failing handler dead-letters the raw message (ExtendDeadletterMessage = false → broker nack) into a DLQ
+        // of possibly another type.
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "dl", Message = "cross-type" }, queueName);
+
+        using var probeConn = await _fixture.CreateDirectConnectionAsync();
+        using var probeCh = await probeConn.CreateChannelAsync();
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        uint dlqDepth = 0;
+        while (dlqDepth < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+            dlqDepth = await probeCh.MessageCountAsync($"{queueName}-deadletter");
+        }
+
+        Assert.Equal(1u, dlqDepth);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_WithDeadLetterQueueOfAnotherType_AdoptsItAndKeepsConsuming()
+    {
+        // A dead-letter queue that already exists with a different x-queue-type (a classic one created by an
+        // earlier version meeting QueueType = Quorum, or the reverse) must be adopted with a warning, like the
+        // main queue — not close the consumer channel and leave the consumer in a recovery loop forever.
+        TestConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-dlq-type-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeclareAsync(dlqName, durable: true, exclusive: false, autoDelete: false,
+                arguments: new Dictionary<string, object?> { ["x-queue-type"] = "classic" });
+        }
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                    ag.QueueType = QueueType.Quorum; // DLQ would follow as quorum, but it already exists as classic
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "dlq-type", Message = "adopted" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        var logs = EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump();
+
+        Assert.True(TestConsumer.ReceivedMessages.Count == 1, $"Consumer did not consume with a mismatched DLQ.\nLOGS:\n{logs}");
+        Assert.Contains($"Queue '{dlqName}' already exists with arguments that differ", logs);
+        Assert.Equal("classic", await _fixture.GetQueueTypeAsync(dlqName));
+        Assert.Equal("quorum", await _fixture.GetQueueTypeAsync(queueName));
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_WithZeroTimeout_MeansNoTimeout_AndProcessesNormally()
+    {
+        // Timeout = TimeSpan.Zero is documented as "no handler timeout" like InfiniteTimeSpan. A CancellationTokenSource
+        // built from Zero would cancel every attempt immediately, so the consumer must normalise it.
+        TestConsumer.Reset();
+
+        var queueName = $"test-zero-timeout-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.Timeout = TimeSpan.Zero;
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = true;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "zero", Message = "no-timeout" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.Single(TestConsumer.ReceivedMessages);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_WithExplicitClassic_OnExistingQueueDeclaredWithoutType_AdoptsOrMatches()
+    {
+        // Pinning QueueType = Classic on a consumer whose queue was created earlier without x-queue-type (every
+        // queue declared before 8.4.0) must not break it: on a classic-default broker the broker treats the two
+        // declarations as equivalent; on a quorum-default broker the existing queue is a quorum queue, the declare
+        // is rejected and the consumer adopts it with a warning. Either way it keeps consuming.
+        TestConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-preexisting-{Guid.NewGuid():N}";
+
+        using (var adminConn = await _fixture.CreateDirectConnectionAsync())
+        using (var adminCh = await adminConn.CreateChannelAsync())
+        {
+            await adminCh.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+        }
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TestConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                    ag.QueueType = QueueType.Classic;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "pre", Message = "pre-existing" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (TestConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        var logs = EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump();
+
+        Assert.True(TestConsumer.ReceivedMessages.Count == 1, $"Consumer did not consume from the pre-existing queue.\nLOGS:\n{logs}");
+
+        if (RabbitMqFixture.QuorumByDefault)
+        {
+            // The pre-existing queue is quorum: the explicit classic declare is a mismatch the consumer adopts.
+            Assert.Contains("already exists with arguments that differ", logs);
+        }
+        else
+        {
+            Assert.DoesNotContain("already exists with arguments that differ", logs);
+        }
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [SkippableFact]
+    [Trait("Category", "Slow")]
+    public async Task Consumer_QuorumQueue_SurvivesBrokerConsumerTimeout_AndGetsRedelivery()
+    {
+        // A delivery held unacknowledged past the queue's consumer timeout makes the broker intervene: RabbitMQ 3.x
+        // and 4.0-4.2 close the channel, 4.3+ quorum queues cancel the consumer and leave the channel open. In both
+        // cases the delivery is returned to the queue. The library must come back consuming (channel-shutdown
+        // recovery or basic.cancel re-subscribe) and receive the message again as a redelivery. The queue is
+        // declared quorum explicitly because 4.x classic queues never evaluate consumer timeouts.
+        //
+        // The handler holds the delivery far longer than the broker timeout and ignores cancellation, so the
+        // library's own watchdog (Timeout + 30s) is kept above the broker timeout: Args pins x-consumer-timeout to
+        // the 60s minimum while Timeout is 120s. Expect roughly 60-150s of waiting.
+        //
+        // Not part of CI: whether the broker fires the quorum consumer timeout at all turned out to depend on the
+        // broker, not on the library — on 4.3.2 and 4.3.7 Testcontainers the cancel arrived at exactly 60s in some
+        // runs and never within 200s in others, with identical queue arguments. The deterministic coverage of the
+        // same library path (basic.cancel → re-subscribe) is Consumer_ResubscribesAfterBrokerCancelsConsumer. Run
+        // this one by hand against the broker version you deploy to, repeating it if it fails on the first try.
+        Skip.IfNot(Environment.GetEnvironmentVariable("RABBITFLOW_BROKER_TIMEOUT_TESTS") == "1", "Set RABBITFLOW_BROKER_TIMEOUT_TESTS=1 to run the broker-dependent consumer timeout test (minutes, not deterministic across broker builds).");
+
+        StuckConsumer.Reset();
+        StuckConsumer.HoldFor = TimeSpan.FromMinutes(5);
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-qq-timeout-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<StuckConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(120);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                    ag.Args = new Dictionary<string, object?>
+                    {
+                        ["x-queue-type"] = "quorum",
+                        ["x-consumer-timeout"] = 60_000L
+                    };
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "stuck", Message = "held-past-consumer-timeout" }, queueName);
+
+        // First delivery reaches the handler, which then holds it.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (StuckConsumer.Deliveries.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+        Assert.Single(StuckConsumer.Deliveries);
+
+        // Act/Assert - the broker's consumer timeout fires (60s + its check interval); the library comes back and
+        // the same message is delivered again, flagged as redelivered. Observed on 4.3.7 / 4.4.0: cancel at exactly
+        // 60s, redelivery ~90s later (the returned delivery waits for the queue's next evaluation).
+        deadline = DateTime.UtcNow + TimeSpan.FromSeconds(200);
+        while (StuckConsumer.Deliveries.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(500);
+        }
+
+        uint consumers;
+        using (var probeConn = await _fixture.CreateDirectConnectionAsync())
+        using (var probeCh = await probeConn.CreateChannelAsync())
+        {
+            consumers = (await probeCh.QueueDeclarePassiveAsync(queueName)).ConsumerCount;
+        }
+
+        var deliveries = StuckConsumer.Deliveries.OrderBy(d => d.ReceivedUtc).ToList();
+
+        // Timeline for the record: which path the broker took (basic.cancel vs channel close) and how long it waited.
+        _output.WriteLine($"Deliveries: {string.Join(", ", deliveries.Select(d => $"{d.ReceivedUtc:HH:mm:ss.fff} redelivered={d.Redelivered}"))}");
+        _output.WriteLine(EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump());
+
+        Assert.True(
+            deliveries.Count >= 2 && deliveries[1].Redelivered && consumers == 1,
+            $"Consumer did not come back after the broker consumer timeout. Deliveries={deliveries.Count}, redelivered={(deliveries.Count > 1 ? deliveries[1].Redelivered : (bool?)null)}, consumers={consumers}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+        var stopStarted = DateTime.UtcNow;
+
+        await hostedService.StopAsync(CancellationToken.None);
+
+        _output.WriteLine($"StopAsync took {(DateTime.UtcNow - stopStarted).TotalSeconds:F1}s");
+    }
+
+    [Fact]
+    public async Task Consumer_HandlerFailure_IsLoggedAtError_WithMessageIdAndException()
+    {
+        // A dead-lettered message must leave a log line that names the message, the consumer and the exception:
+        // without it, a failing handler is invisible unless the handler logs by itself (the envelope in the DLQ is
+        // not a log).
+        AlwaysFailConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-faillog-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<AlwaysFailConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        var result = await publisher.PublishAsync(new TestEvent { Id = "boom", Message = "fails" }, queueName, messageId: "msg-fail-1", correlationId: "corr-fail-1");
+        Assert.True(result.Success);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Lines.Any(l => l.Contains("failed for AlwaysFailConsumer")) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        var line = EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Lines.FirstOrDefault(l => l.Contains("failed for AlwaysFailConsumer"));
+
+        Assert.True(line != null, $"No terminal failure log line.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+        Assert.Contains("Error:", line);
+        Assert.Contains("msg-fail-1", line);
+        Assert.Contains("(handler_error)", line);
+        Assert.Contains("dead-lettering it", line);
+        Assert.Contains("InvalidOperationException", line);
+        Assert.Contains("CorrelationId=corr-fail-1", line);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_HandlerLogs_CarryTheMessageScope()
+    {
+        // The consumer opens a log scope with the queue, consumer and message identity around the handler, so a
+        // handler's own log lines can be tied to the message without a tracer.
+        LoggingConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-scope-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<LoggingConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.Timeout = TimeSpan.FromSeconds(10);
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = true;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "scoped", Message = "scoped" }, queueName, messageId: "msg-scope-1", correlationId: "corr-scope-1");
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (LoggingConsumer.ReceivedMessages.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        var line = EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Lines.FirstOrDefault(l => l.Contains("handler-log scoped"));
+
+        Assert.True(line != null, $"Handler log line not captured.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+        Assert.Contains($"Queue={queueName}", line);
+        Assert.Contains("Consumer=LoggingConsumer", line);
+        Assert.Contains("MessageId=msg-scope-1", line);
+        Assert.Contains("CorrelationId=corr-scope-1", line);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Consumer_QuorumQueue_GivesUpOnAMessageTheBrokerKeepsReturning()
+    {
+        // A quorum queue counts every time the broker takes a delivery back (x-delivery-count). The library gives
+        // up on a message once that count reaches MaxBrokerDeliveries: the handler is not invoked and the message
+        // is dead-lettered as a permanent failure (RabbitFlowPoisonMessageException), so it stops going back to the
+        // head of the queue. The broker is made to return the delivery by dropping every connection while the
+        // handler holds it; the library's recovery then re-subscribes and the broker redelivers.
+        TokenHonoringHoldConsumer.Reset();
+        EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Reset();
+
+        var queueName = $"test-poison-{Guid.NewGuid():N}";
+        var dlqName = $"{queueName}-deadletter";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<TokenHonoringHoldConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 4; // the previous, still-cancelling attempt must not hold the slot of the redelivery
+                cfg.Timeout = TimeSpan.FromSeconds(5);
+                cfg.MaxBrokerDeliveries = 2;
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = true;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                    ag.QueueType = QueueType.Quorum;
+                });
+            });
+        }, host => host.NetworkRecoveryInterval = TimeSpan.FromSeconds(1));
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "poison", Message = "always-returned" }, queueName);
+
+        // Deliveries 1 and 2 (x-delivery-count 0 and 1) reach the handler; after each one the connection is dropped
+        // while the delivery is unacknowledged, so the broker returns it with the count incremented.
+        for (var expected = 1; expected <= 2; expected++)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (TokenHonoringHoldConsumer.Deliveries.Count < expected && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+
+            Assert.True(TokenHonoringHoldConsumer.Deliveries.Count == expected,
+                $"Expected delivery #{expected}. Deliveries={TokenHonoringHoldConsumer.Deliveries.Count}.\nLOGS:\n{EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump()}");
+
+            await Task.Delay(300);
+
+            Assert.Equal(0, await _fixture.CloseAllConnectionsAsync());
+        }
+
+        // Delivery 3 arrives with x-delivery-count = 2 = MaxBrokerDeliveries: dead-lettered, handler not called.
+        BasicGetResult? dlqResult = null;
+        var dlqDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        using (var probeConn = await _fixture.CreateDirectConnectionAsync())
+        using (var probeCh = await probeConn.CreateChannelAsync())
+        {
+            while (dlqResult == null && DateTime.UtcNow < dlqDeadline)
+            {
+                dlqResult = await probeCh.BasicGetAsync(dlqName, autoAck: true);
+                if (dlqResult == null) await Task.Delay(200);
+            }
+        }
+
+        var logs = EasyRabbitFlow.Tests.Helpers.MemoryLogSink.Dump();
+
+        Assert.True(dlqResult != null, $"Poison message never reached the DLQ. Deliveries={TokenHonoringHoldConsumer.Deliveries.Count}.\nQUEUES:\n{await _fixture.DumpQueuesAsync(queueName)}\nLOGS:\n{logs}");
+
+        var envelope = JsonSerializer.Deserialize<DeadLetterEnvelope>(dlqResult!.Body.Span, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+
+        Assert.NotNull(envelope);
+        Assert.Equal(nameof(EasyRabbitFlow.Exceptions.RabbitFlowPoisonMessageException), envelope!.ExceptionType);
+        Assert.False(envelope.IsTransient);
+
+        // The handler saw exactly the two deliveries below the limit, with the broker's count on the second.
+        var deliveries = TokenHonoringHoldConsumer.Deliveries.ToList();
+        Assert.Equal(2, deliveries.Count);
+        Assert.Contains(deliveries, d => d.Redelivered && d.DeliveryCount == 1);
+
+        await hostedService.StopAsync(CancellationToken.None);
+    }
+
+    [SkippableFact]
+    [Trait("Category", "Slow")]
+    public async Task Consumer_StopAsync_IsBounded_WhenADeliveryWaitsForAPrefetchSlotHeldByAStuckHandler()
+    {
+        // PrefetchCount = 1, a handler that ignores cancellation holds the only slot, and a second delivery is
+        // waiting for it on the client's consumer dispatcher. Closing the channel waits for that dispatcher, so
+        // without cancelling the wait StopAsync would hang until the watchdog abandons the stuck handler
+        // (Timeout + 30s). Expected: the bounded 30s drain, then shutdown.
+        Skip.IfNot(Environment.GetEnvironmentVariable("RABBITFLOW_SLOW_TESTS") == "1", "Set RABBITFLOW_SLOW_TESTS=1 to run the minutes-long shutdown tests.");
+
+        StuckConsumer.Reset();
+        StuckConsumer.HoldFor = TimeSpan.FromMinutes(5);
+
+        var queueName = $"test-stop-bounded-{Guid.NewGuid():N}";
+
+        var sp = _fixture.BuildServiceProviderWithConsumers(settings =>
+        {
+            settings.AddConsumer<StuckConsumer>(queueName, cfg =>
+            {
+                cfg.AutoGenerate = true;
+                cfg.PrefetchCount = 1;
+                cfg.Timeout = TimeSpan.FromSeconds(120); // watchdog at 150s, well past the 30s drain
+                cfg.ConfigureAutoGenerate(ag =>
+                {
+                    ag.GenerateExchange = false;
+                    ag.GenerateDeadletterQueue = false;
+                    ag.DurableQueue = true;
+                    ag.AutoDeleteQueue = false;
+                });
+            });
+        });
+
+        var hostedService = sp.GetServices<IHostedService>().First();
+        await hostedService.StartAsync(CancellationToken.None);
+        await Task.Delay(500);
+
+        var publisher = sp.GetRequiredService<IRabbitFlowPublisher>();
+        await publisher.PublishAsync(new TestEvent { Id = "first", Message = "holds-the-slot" }, queueName);
+        await publisher.PublishAsync(new TestEvent { Id = "second", Message = "waits-for-the-slot" }, queueName);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (StuckConsumer.Deliveries.Count < 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+        Assert.Single(StuckConsumer.Deliveries);
+
+        // The second message has been delivered to the channel (prefetch 1 = one unacked + the next one buffered
+        // by the client) and is parked on the semaphore.
+        await Task.Delay(1000);
+
+        var stopStarted = DateTime.UtcNow;
+
+        await hostedService.StopAsync(CancellationToken.None);
+
+        var took = DateTime.UtcNow - stopStarted;
+
+        _output.WriteLine($"StopAsync took {took.TotalSeconds:F1}s");
+
+        Assert.True(took < TimeSpan.FromSeconds(45), $"StopAsync took {took.TotalSeconds:F1}s; expected the bounded 30s drain, not the handler watchdog.");
     }
 }
