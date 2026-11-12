@@ -548,8 +548,14 @@ Notes:
   whatever is ambient when each element is produced.
 - `LinkedRoot` detaches the handler from the caller's ambient activity even when nothing listens to the
   `EasyRabbitFlow` source, so the handler's own spans (HTTP, database) never pile up under the caller's span.
-  Register the source (`AddSource(RabbitFlowDiagnostics.ActivitySourceName)`) to get the message span that
-  groups them; without it each of those calls starts a trace of its own.
+  Register the source to get the message span that groups them and carries the link to the caller; without
+  it each of those calls starts a trace of its own, with nothing leading back to the operation that started
+  the run:
+
+  ```csharp
+  builder.Services.AddOpenTelemetry()
+      .WithTracing(tracing => tracing.AddSource(RabbitFlowDiagnostics.ActivitySourceName));
+  ```
 - With `Child` and no listener nothing changes: the handler sees the caller's ambient activity, as before.
 - Messages that never reach a handler (a publish failure, a deserialization failure) have no span; they are
   reported in `TemporaryRunResult.Errors`.

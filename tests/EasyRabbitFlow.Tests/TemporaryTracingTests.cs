@@ -105,6 +105,17 @@ public class TemporaryTracingTests
         var stopped = new ConcurrentBag<Activity>();
         using var listener = Listen(prefix, stopped);
 
+        // Stands in for an instrumented HTTP or database call made by the handler.
+        using var downstreamSource = new ActivitySource($"downstream-{prefix}");
+        var downstream = new ConcurrentBag<Activity>();
+        using var downstreamListener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == downstreamSource.Name,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = downstream.Add
+        };
+        ActivitySource.AddActivityListener(downstreamListener);
+
         var temporary = _fixture.BuildServiceProvider().GetRequiredService<IRabbitFlowTemporary>();
         var traceByMessage = new ConcurrentDictionary<string, ActivityTraceId>();
         var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -121,6 +132,8 @@ public class TemporaryTracingTests
                 await Task.Yield();
                 // Still the message's own trace after asynchronous work, with other messages running beside it.
                 traceByMessage[msg.Id] = Activity.Current!.TraceId;
+                using var call = downstreamSource.StartActivity("downstream call", ActivityKind.Client);
+                await Task.Delay(20, ct);
             },
             options: new RunTemporaryOptions { QueuePrefixName = prefix, PrefetchCount = 6, TracingMode = TemporaryTracingMode.LinkedRoot });
 
@@ -148,6 +161,99 @@ public class TemporaryTracingTests
         Assert.Equal(
             stopped.Select(s => s.TraceId.ToString()).OrderBy(id => id),
             traceByMessage.Values.Select(id => id.ToString()).OrderBy(id => id));
+
+        // Each downstream span hangs from a different message span, in that message's trace, not the caller's.
+        Assert.Equal(6, downstream.Count);
+        Assert.Equal(
+            stopped.Select(s => s.SpanId.ToString()).OrderBy(id => id),
+            downstream.Select(d => d.ParentSpanId.ToString()).OrderBy(id => id));
+        Assert.All(downstream, d =>
+        {
+            Assert.NotEqual(rootContext.TraceId, d.TraceId);
+            Assert.Equal(stopped.Single(s => s.SpanId == d.ParentSpanId).TraceId, d.TraceId);
+        });
+    }
+
+    [Fact]
+    public async Task Child_DownstreamSpans_AreChildrenOfTheMessageSpan()
+    {
+        var prefix = $"trace-child-down-{Guid.NewGuid():N}";
+        var stopped = new ConcurrentBag<Activity>();
+        using var listener = Listen(prefix, stopped);
+
+        using var downstreamSource = new ActivitySource($"downstream-{prefix}");
+        var downstream = new ConcurrentBag<Activity>();
+        using var downstreamListener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == downstreamSource.Name,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = downstream.Add
+        };
+        ActivitySource.AddActivityListener(downstreamListener);
+
+        var temporary = _fixture.BuildServiceProvider().GetRequiredService<IRabbitFlowTemporary>();
+
+        using var root = StartRoot();
+
+        var result = await temporary.RunAsync<TestEvent>(
+            Messages(4),
+            async (_, ct) =>
+            {
+                using var call = downstreamSource.StartActivity("downstream call", ActivityKind.Client);
+                await Task.Delay(20, ct);
+            },
+            options: new RunTemporaryOptions { QueuePrefixName = prefix, PrefetchCount = 4 });
+
+        // The run does not touch the caller's ambient activity.
+        Assert.Same(root, Activity.Current);
+        root.Stop();
+
+        Assert.True(result.Success);
+        Assert.Equal(4, downstream.Count);
+        Assert.All(downstream, d => Assert.Equal(root.TraceId, d.TraceId));
+        Assert.Equal(
+            stopped.Select(s => s.SpanId.ToString()).OrderBy(id => id),
+            downstream.Select(d => d.ParentSpanId.ToString()).OrderBy(id => id));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PerMessageTimeout_IsATimeout_WhicheverCancellationExceptionTheHandlerThrows(bool throwsBaseType)
+    {
+        var prefix = $"trace-timeout-{Guid.NewGuid():N}";
+        var stopped = new ConcurrentBag<Activity>();
+        using var listener = Listen(prefix, stopped);
+
+        var temporary = _fixture.BuildServiceProvider().GetRequiredService<IRabbitFlowTemporary>();
+
+        var result = await temporary.RunAsync<TestEvent>(
+            Messages(1),
+            async (_, ct) =>
+            {
+                if (!throwsBaseType)
+                {
+                    // Task.Delay throws TaskCanceledException.
+                    await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                    return;
+                }
+
+                // A handler that polls the token throws the base OperationCanceledException.
+                while (true)
+                {
+                    await Task.Delay(20, CancellationToken.None);
+                    ct.ThrowIfCancellationRequested();
+                }
+            },
+            options: new RunTemporaryOptions { QueuePrefixName = prefix, Timeout = TimeSpan.FromMilliseconds(300) });
+
+        Assert.Equal(1, result.FailedMessages);
+        var error = Assert.Single(result.Errors);
+        Assert.Equal(TemporaryRunErrorStage.Timeout, error.Stage);
+
+        var span = Assert.Single(stopped);
+        Assert.Equal(ActivityStatusCode.Error, span.Status);
+        Assert.Equal(typeof(TimeoutException).FullName, span.GetTagItem("error.type"));
     }
 
     [Fact]
@@ -245,16 +351,22 @@ public class TemporaryTracingTests
 
         using var root = StartRoot();
 
-        ActivityTraceId? childTrace = null;
-        var childResult = await temporary.RunAsync<TestEvent>(
-            Messages(1),
-            (_, _) => { childTrace = Activity.Current?.TraceId; return Task.CompletedTask; });
-
+        // LinkedRoot first: clearing the ambient activity for its handlers must not reach the caller
+        // nor the Child run that follows.
         var linkedSawActivity = true;
         var linkedResult = await temporary.RunAsync<TestEvent>(
             Messages(1),
             (_, _) => { linkedSawActivity = Activity.Current != null; return Task.CompletedTask; },
             options: new RunTemporaryOptions { TracingMode = TemporaryTracingMode.LinkedRoot });
+
+        Assert.Same(root, Activity.Current);
+
+        ActivityTraceId? childTrace = null;
+        var childResult = await temporary.RunAsync<TestEvent>(
+            Messages(1),
+            (_, _) => { childTrace = Activity.Current?.TraceId; return Task.CompletedTask; });
+
+        Assert.Same(root, Activity.Current);
 
         root.Stop();
 

@@ -597,7 +597,10 @@ namespace EasyRabbitFlow.Services
 
                                 CompleteProcessed(true);
                             }
-                            catch (TaskCanceledException) when (timeoutCts != null && timeoutCts.Token.IsCancellationRequested)
+                            // OperationCanceledException, not only its TaskCanceledException subclass: a handler that
+                            // observes the token through ThrowIfCancellationRequested, a semaphore or a channel
+                            // throws the base type, and that is a timeout as well.
+                            catch (OperationCanceledException) when (timeoutCts != null && timeoutCts.Token.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Timeout, $"Message processing timed out after {timeout}.", _queue, ea.DeliveryTag));
                                 // Per-message outcomes of a run are Warnings: the run's result reports them; an Error is
