@@ -140,6 +140,15 @@ namespace EasyRabbitFlow.Settings
         /// </summary>
         public string? QueuePrefixName { get; set; }
 
+        /// <summary>
+        /// How the span started for each message relates to the trace context that was ambient when
+        /// <c>RunAsync</c> was called. <see cref="TemporaryTracingMode.Child"/> (default) keeps every message in
+        /// the caller's trace; <see cref="TemporaryTracingMode.LinkedRoot"/> gives each message its own trace,
+        /// linked back to the caller, which is the shape to use for large or fire-and-forget batches.
+        /// The handler runs inside that span, so <c>Activity.Current?.SetTag(...)</c> in the handler tags it.
+        /// </summary>
+        public TemporaryTracingMode TracingMode { get; set; } = TemporaryTracingMode.Child;
+
         public static RunTemporaryOptions Default => new RunTemporaryOptions();
 
     }

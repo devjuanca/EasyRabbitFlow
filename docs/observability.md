@@ -1,6 +1,6 @@
 ## Observability
 
-EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Activity creation depends on listeners and their sampling decisions; logging, header propagation and instrumentation checks still have a cost. Instrumentation covers publishing, consuming, and the dead-letter path; [temporary batch runs](temporary-processing.md) are the exception — they emit no spans or metrics, and report through their `TemporaryRunResult` instead.
+EasyRabbitFlow is OpenTelemetry-ready out of the box: spans through an `ActivitySource` and metrics through a `Meter`, both named `EasyRabbitFlow`, plus a native health check. Activity creation depends on listeners and their sampling decisions; logging, header propagation and instrumentation checks still have a cost. Instrumentation covers publishing, consuming, and the dead-letter path. [Temporary batch runs](temporary-processing.md#tracing-tracingmode) emit one span per message (v8.4.1) but no metrics; their counters come from the `TemporaryRunResult`.
 
 ```csharp
 builder.Services.AddOpenTelemetry()
@@ -21,6 +21,7 @@ What you get:
 
 - **`{destination} publish`** (`Producer` span) per `PublishAsync` / `PublishBatchAsync`, tagged with `messaging.system=rabbitmq`, destination, routing key, `messaging.message.id`, and `messaging.message.conversation_id` (the correlation id). Failed publishes set error status.
 - **`{queue} process`** (`Consumer` span) per delivered message, parented to the publisher's remote context extracted from the `traceparent` header. Your handler runs inside this span, so any spans you create (HTTP calls, DB queries) nest under it. Exhausted retries set error status.
+- **`{prefix}-temp-queue process`** (`Consumer` span) per message of a [temporary run](temporary-processing.md#tracing-tracingmode) (v8.4.1). `RunTemporaryOptions.TracingMode` chooses between a child of the span that called `RunAsync` (`Child`, default) and a new trace per message linked to it (`LinkedRoot`, for large or fire-and-forget batches). Handler exceptions, timeouts and cancellations set error status. `LinkedRoot` detaches the handler from the caller's ambient activity whether or not this source is registered, so it needs `AddSource(RabbitFlowDiagnostics.ActivitySourceName)` as above: without it there is no message span and no link, and each instrumented call made by the handler starts an unrelated trace.
 
 Notes:
 
