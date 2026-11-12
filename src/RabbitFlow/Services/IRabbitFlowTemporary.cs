@@ -6,6 +6,7 @@ using RabbitMQ.Client.Events;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -344,6 +345,14 @@ namespace EasyRabbitFlow.Services
             if (onCompletedAsync is null) throw new ArgumentNullException(nameof(onCompletedAsync));
             options ??= new RunTemporaryOptions();
 
+            // Trace context of the caller, captured before any internal work. Handlers run long after this point
+            // (and, in fire-and-forget runs, after the caller's span has ended), so the relation to the caller is
+            // built from this snapshot instead of from whatever happens to be ambient where the handler starts.
+            var callerContext = Activity.Current?.Context ?? default;
+            var linkedRoot = options.TracingMode == TemporaryTracingMode.LinkedRoot;
+            // One link array for the whole run: every message links to the same caller context.
+            var callerLinks = linkedRoot && callerContext != default ? new[] { new ActivityLink(callerContext) } : null;
+
             // Opt-in backpressure, asynchronous sources only: bounds the elements pulled from the source that have not
             // reached a terminal state. Collection runs ignore it — their input already lives in memory, so bounding
             // the broker-side backlog gains nothing.
@@ -376,7 +385,10 @@ namespace EasyRabbitFlow.Services
 
             var eventName = typeof(T).Name.ToLower();
 
-            var _queue = $"{queuePrefixName ?? eventName}-temp-queue-{executionId}";
+            // Stable across runs: names the spans, where the per-run suffix would be high-cardinality.
+            var traceDestination = $"{queuePrefixName ?? eventName}-temp-queue";
+
+            var _queue = $"{traceDestination}-{executionId}";
 
             // effectiveCt = caller token + optional whole-run timeout; governs handlers and every internal wait.
             using var runTimeoutCts = options.RunTimeout.HasValue ? new CancellationTokenSource(options.RunTimeout.Value) : null;
@@ -555,6 +567,19 @@ namespace EasyRabbitFlow.Services
                     Interlocked.Increment(ref activeHandlers);
                     var processingTask = Task.Run(async () =>
                     {
+                        // This task has its own execution context, so nothing set here leaks to other messages.
+                        // A new root needs the ambient activity cleared: StartActivity falls back to it when no
+                        // parent is given. It is cleared even without a listener, so the handler's own spans
+                        // (HTTP, database) never pile up under the caller's span in LinkedRoot mode.
+                        if (linkedRoot)
+                        {
+                            Activity.Current = null;
+                        }
+
+                        using var activity = RabbitFlowDiagnostics.StartTemporaryProcess(
+                            traceDestination, _queue, correlationId, ea.DeliveryTag,
+                            linkedRoot ? default : callerContext, callerLinks);
+
                         try
                         {
                             using var timeoutCts = timeout.HasValue ? new CancellationTokenSource(timeout.Value) : null;
@@ -578,6 +603,7 @@ namespace EasyRabbitFlow.Services
                                 // Per-message outcomes of a run are Warnings: the run's result reports them; an Error is
                                 // reserved for a handler that throws.
                                 _logger.LogWarning("[RABBIT-FLOW]: Message processing timed out after {Timeout}. CorrelationId: {correlationId}", timeout, correlationId);
+                                RabbitFlowDiagnostics.RecordFailure(activity, new TimeoutException($"Message processing timed out after {timeout}."));
                                 await InvokeOnErrorAsync(onError, message, cancellationToken, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
@@ -585,20 +611,24 @@ namespace EasyRabbitFlow.Services
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Timeout, $"Message processing was canceled because the run timed out after {options.RunTimeout}.", _queue, ea.DeliveryTag));
                                 _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled because the run timed out after {RunTimeout}. CorrelationId: {correlationId}", options.RunTimeout, correlationId);
+                                RabbitFlowDiagnostics.RecordFailure(activity, new TimeoutException($"Message processing was canceled because the run timed out after {options.RunTimeout}."));
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
-                            catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
+                            catch (TaskCanceledException ex) when (cancellationToken.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Cancellation, "Message processing was canceled by main Cancellation Token.", _queue, ea.DeliveryTag));
                                 _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled by main Cancellation Token. CorrelationId: {correlationId}", correlationId);
+                                // A canceled message counts as failed in the run result, so its span says the same.
+                                RabbitFlowDiagnostics.RecordFailure(activity, ex);
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
-                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromMessage(TemporaryRunErrorStage.Cancellation, "Message processing was canceled.", _queue, ea.DeliveryTag));
                                 _logger.LogWarning("[RABBIT-FLOW]: Message processing was canceled. CorrelationId: {correlationId}", correlationId);
+                                RabbitFlowDiagnostics.RecordFailure(activity, ex);
                                 await InvokeOnErrorAsync(onError, message, CancellationToken.None, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
@@ -606,6 +636,7 @@ namespace EasyRabbitFlow.Services
                             {
                                 runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Process, ex, _queue, ea.DeliveryTag));
                                 _logger.LogError(ex, "[RABBIT-FLOW]: Error while processing the message. CorrelationId: {correlationId}", correlationId);
+                                RabbitFlowDiagnostics.RecordFailure(activity, ex);
                                 await InvokeOnErrorAsync(onError, message, cancellationToken, _logger, correlationId);
                                 CompleteProcessed(false);
                             }
@@ -614,6 +645,7 @@ namespace EasyRabbitFlow.Services
                         {
                             runErrors.Enqueue(TemporaryRunError.FromException(TemporaryRunErrorStage.Process, ex, _queue, ea.DeliveryTag));
                             _logger.LogError(ex, "[RABBIT-FLOW]: Unhandled exception in processing task. CorrelationId: {correlationId}", correlationId);
+                            RabbitFlowDiagnostics.RecordFailure(activity, ex);
                             CompleteProcessed(false);
                         }
                         finally

@@ -152,6 +152,37 @@ namespace EasyRabbitFlow.Services
         }
 
         /// <summary>
+        /// Starts the consumer span of one message of a temporary run. <paramref name="destination"/> is the
+        /// stable name (no per-run suffix) used for the span name and <c>messaging.destination.name</c>, so
+        /// neither is high-cardinality; the real queue name travels as a plain attribute.
+        /// With a default <paramref name="parentContext"/> the span is parented to <see cref="Activity.Current"/>,
+        /// so a caller that wants a new root must clear it first.
+        /// </summary>
+        internal static Activity? StartTemporaryProcess(string destination, string queueName, string? correlationId, ulong deliveryTag, ActivityContext parentContext, ActivityLink[]? links)
+        {
+            var activity = Source.StartActivity($"{destination} process", ActivityKind.Consumer, parentContext, tags: null, links: links);
+
+            if (activity != null)
+            {
+                activity.SetTag("messaging.system", "rabbitmq");
+                activity.SetTag("messaging.operation", "process");
+                activity.SetTag("messaging.operation.type", "process");
+                activity.SetTag("messaging.operation.name", "process");
+                activity.SetTag("messaging.destination.name", destination);
+                activity.SetTag("messaging.destination.temporary", true);
+                activity.SetTag("easyrabbitflow.temporary.queue", queueName);
+                activity.SetTag("messaging.rabbitmq.message.delivery_tag", deliveryTag);
+
+                if (correlationId != null)
+                {
+                    activity.SetTag("messaging.message.conversation_id", correlationId);
+                }
+            }
+
+            return activity;
+        }
+
+        /// <summary>
         /// Marks the activity as failed the way tracing backends expect: error status, the <c>error.type</c>
         /// attribute and an <c>exception</c> event carrying type, message and stack trace. Uses
         /// <see cref="ActivityEvent"/> rather than newer helpers so it behaves identically on netstandard2.1 and net8.0.

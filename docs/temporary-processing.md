@@ -476,7 +476,7 @@ How it is called:
 ```
 
 `TemporaryRunResult` exposes `TotalMessages`, `PublishedMessages`, `ProcessedMessages`,
-`SucceededMessages`, `FailedMessages`, `SourceCompleted`, `Success`, `StartedUtc`, `CompletedUtc`, `Duration`, and `Errors`. `RunTemporaryOptions` exposes `PrefetchCount`, `Timeout`, `RunTimeout`, `MaxInFlightMessages`, `OnProgress`, `ProgressInterval`, `QueuePrefixName` and `CorrelationId`. Each entry in
+`SucceededMessages`, `FailedMessages`, `SourceCompleted`, `Success`, `StartedUtc`, `CompletedUtc`, `Duration`, and `Errors`. `RunTemporaryOptions` exposes `PrefetchCount`, `Timeout`, `RunTimeout`, `MaxInFlightMessages`, `OnProgress`, `ProgressInterval`, `QueuePrefixName`, `CorrelationId` and `TracingMode`. Each entry in
 `Errors` records the run stage where the failure happened (`Publish`, `Deserialize`, `Process`,
 `Timeout`, `Cancellation`, `Completion`, `ConnectionLost`, `Enumeration`); publish-stage errors also carry the `MessageIndex`
 of the failed input message. The `RunAsync<T, TResult>` overload returns
@@ -494,12 +494,70 @@ and rely on `onCompleted` / `onCompletedAsync` for background bookkeeping.
 | `ProgressInterval` | TimeSpan | `5 s` | How often `OnProgress` is called. Must be positive |
 | `QueuePrefixName` | string? | `null` | Custom prefix for the temp queue name. The queue is named `{prefix}-temp-queue-{guid}`; when `null`, the prefix defaults to the lowercased event type name |
 | `CorrelationId` | string? | `Guid` | Correlation ID for tracing/logging |
+| `TracingMode` | `TemporaryTracingMode` | `Child` | How each message span relates to the caller's trace: `Child` (same trace) or `LinkedRoot` (a new trace per message, linked to the caller). See [Tracing](#tracing-tracingmode) |
 
 The run also ends early — instead of waiting forever — if the underlying connection or channel
 is shut down mid-run (broker restart, network failure): in-flight handlers are drained, the
 undelivered messages are reported as failed with a `ConnectionLost` error entry, and the
 partial result is returned.
 
-> **No telemetry:** temporary runs are not instrumented — they emit no `ActivitySource` spans and don't
-> count toward the [`EasyRabbitFlow` metrics](observability.md). The `TemporaryRunResult` counters are the
-> observability surface for these runs.
+### Tracing (`TracingMode`)
+
+Each message is processed inside its own `Consumer` span from the `EasyRabbitFlow`
+[`ActivitySource`](observability.md#distributed-tracing) (v8.4.1). The span covers the handler and, on failure,
+the `onError` callback; it is named `{prefix}-temp-queue process`, where `{prefix}` is `QueuePrefixName` or the
+lowercased event type name — never the full queue name, whose per-run suffix would make every run a different
+span name. A handler that throws, times out (`Timeout` or `RunTimeout`) or is canceled sets the span status to
+error, matching the message's `Failed` count in the result.
+
+`RunTemporaryOptions.TracingMode` decides how that span relates to the trace that was active when `RunAsync`
+was called:
+
+| Mode | Trace | Sampling | Use it for |
+|------|-------|----------|------------|
+| `Child` (default) | Every message span is a child of the caller's span: the whole run is one trace | One decision for the whole run, inherited from the caller | Small runs the caller awaits |
+| `LinkedRoot` | Every message starts its own trace, with a span link back to the caller's span | Decided per message | Large batches, long runs, fire-and-forget fan-out |
+
+```csharp
+// Fan-out from a consumer or a request, not awaited: thousands of items, each making its own HTTP calls.
+_ = temporary.RunAsync<Booking>(
+    bookings,
+    async (booking, ct) =>
+    {
+        // The handler runs inside the message span, so this tags it.
+        Activity.Current?.SetTag("booking.id", booking.Id);
+        await syncService.SyncAsync(booking, ct);
+    },
+    options: new RunTemporaryOptions
+    {
+        QueuePrefixName = "booking-sync",
+        PrefetchCount = 8,
+        TracingMode = TemporaryTracingMode.LinkedRoot
+    });
+```
+
+With `Child`, a fire-and-forget run of a few thousand items puts every span of every item (and of the services
+they call) into the caller's trace: one trace with tens of thousands of spans that lasts as long as the batch,
+under a parent span that ended in seconds, and sampled all-or-nothing. `LinkedRoot` turns each item into a small,
+complete trace that the backend can sample and display on its own, and the link still leads back to the
+operation that started the run.
+
+Notes:
+
+- The caller's context is captured once, when `RunAsync` is called — also for `IAsyncEnumerable<T>` sources,
+  whatever is ambient when each element is produced.
+- `LinkedRoot` detaches the handler from the caller's ambient activity even when nothing listens to the
+  `EasyRabbitFlow` source, so the handler's own spans (HTTP, database) never pile up under the caller's span.
+  Register the source (`AddSource(RabbitFlowDiagnostics.ActivitySourceName)`) to get the message span that
+  groups them; without it each of those calls starts a trace of its own.
+- With `Child` and no listener nothing changes: the handler sees the caller's ambient activity, as before.
+- Messages that never reach a handler (a publish failure, a deserialization failure) have no span; they are
+  reported in `TemporaryRunResult.Errors`.
+- Span attributes: the `messaging.*` set used by regular consumers, with `messaging.destination.name` set to
+  the stable `{prefix}-temp-queue`, plus `messaging.destination.temporary = true`,
+  `messaging.message.conversation_id` (the run's `CorrelationId`) and `easyrabbitflow.temporary.queue` (the
+  real queue name, the same value as `TemporaryRunResult.QueueName`).
+
+> **No metrics:** temporary runs don't count toward the [`EasyRabbitFlow` metrics](observability.md#metrics).
+> The `TemporaryRunResult` counters, and the duration and status of each message span, are the observability
+> surface for these runs.
